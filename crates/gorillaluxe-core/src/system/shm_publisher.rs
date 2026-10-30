@@ -210,9 +210,10 @@ mod tests {
 
     #[test]
     fn sixty_1080p_frames_under_60ms() {
-        let mut pub_ = ShmPublisher::create(0xFACE, PIXELS_1080P_RGBA).unwrap();
-        assert_eq!(pub_.map_name, "Global\\GorillaLuxe_Frame_61260");
-        let reader = ShmReader::open(0xFACE, PIXELS_1080P_RGBA).unwrap();
+        let mut pub_ = ShmPublisher::create(0, PIXELS_1080P_RGBA).unwrap();
+        assert_eq!(pub_.map_name, "Global\\GorillaLuxe_Frame_0");
+        assert_eq!(pub_.event_name, "Global\\GorillaLuxe_Event_0");
+        let reader = ShmReader::open(0, PIXELS_1080P_RGBA).unwrap();
         let mut frame = vec![0xABu8; PIXELS_1080P_RGBA];
         let mut sink = vec![0u8; PIXELS_1080P_RGBA];
         let t = Instant::now();
