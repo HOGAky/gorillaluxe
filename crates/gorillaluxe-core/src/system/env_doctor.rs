@@ -32,7 +32,11 @@ pub fn diagnose_host() -> HostReport {
             elevated,
         },
         Ok(w) => match w.hypervisor_present() {
-            Ok(true) => HostReport { whpx_ok: true, detail: None, elevated },
+            Ok(true) => HostReport {
+                whpx_ok: true,
+                detail: None,
+                elevated,
+            },
             Ok(false) => HostReport {
                 whpx_ok: false,
                 detail: Some("hypervisor_not_present".into()),
@@ -95,8 +99,7 @@ pub fn launch_elevated_setup() -> Result<(), String> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("current_exe: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let exe_w: Vec<u16> = exe.to_string_lossy().encode_utf16().chain([0]).collect();
     unsafe {
         let r = ShellExecuteW(
@@ -123,8 +126,26 @@ pub fn run_elevated_setup() -> Result<String, String> {
         return Err("setup must run elevated".into());
     }
     let cmds: &[(&str, &[&str])] = &[
-        ("dism.exe", &["/Online", "/Enable-Feature", "/FeatureName:HypervisorPlatform", "/All", "/NoRestart"]),
-        ("dism.exe", &["/Online", "/Enable-Feature", "/FeatureName:VirtualMachinePlatform", "/All", "/NoRestart"]),
+        (
+            "dism.exe",
+            &[
+                "/Online",
+                "/Enable-Feature",
+                "/FeatureName:HypervisorPlatform",
+                "/All",
+                "/NoRestart",
+            ],
+        ),
+        (
+            "dism.exe",
+            &[
+                "/Online",
+                "/Enable-Feature",
+                "/FeatureName:VirtualMachinePlatform",
+                "/All",
+                "/NoRestart",
+            ],
+        ),
         ("bcdedit.exe", &["/set", "hypervisorlaunchtype", "auto"]),
     ];
     let mut log = String::new();

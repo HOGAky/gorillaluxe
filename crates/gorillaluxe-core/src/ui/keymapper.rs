@@ -32,8 +32,12 @@ impl WidgetKind {
         }
     }
     /// Palette ordering for Zone C.
-    pub const PALETTE: [WidgetKind; 4] =
-        [WidgetKind::Tap, WidgetKind::Wasd, WidgetKind::FpsAim, WidgetKind::Macro];
+    pub const PALETTE: [WidgetKind; 4] = [
+        WidgetKind::Tap,
+        WidgetKind::Wasd,
+        WidgetKind::FpsAim,
+        WidgetKind::Macro,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,7 +70,12 @@ impl Keymapper {
     }
 
     pub fn place(&mut self, kind: WidgetKind, x: f32, y: f32) -> usize {
-        let w = Widget { kind, x: x.clamp(0.02, 0.98), y: y.clamp(0.02, 0.98), key: None };
+        let w = Widget {
+            kind,
+            x: x.clamp(0.02, 0.98),
+            y: y.clamp(0.02, 0.98),
+            key: None,
+        };
         self.widgets.push(w);
         self.widgets.len() - 1
     }
@@ -119,7 +128,9 @@ impl Keymapper {
                 w.kind.code(),
                 w.x,
                 w.y,
-                w.key.map(|k| k.to_string()).unwrap_or_else(|| "null".into())
+                w.key
+                    .map(|k| k.to_string())
+                    .unwrap_or_else(|| "null".into())
             ));
         }
         s.push_str("\n  ]\n}\n");
@@ -130,13 +141,21 @@ impl Keymapper {
     /// our own emitted format).
     pub fn from_json(text: &str) -> Keymapper {
         let mut km = Keymapper::default();
-        let Some(a) = text.find("\"widgets\"") else { return km };
-        let Some(start) = text[a..].find('[').map(|i| a + i) else { return km };
-        let Some(end) = text[start..].find(']').map(|i| start + i) else { return km };
+        let Some(a) = text.find("\"widgets\"") else {
+            return km;
+        };
+        let Some(start) = text[a..].find('[').map(|i| a + i) else {
+            return km;
+        };
+        let Some(end) = text[start..].find(']').map(|i| start + i) else {
+            return km;
+        };
         let body = &text[start + 1..end];
         let mut rest = body;
         while let Some(ob) = rest.find('{') {
-            let Some(cb) = rest[ob..].find('}').map(|i| ob + i) else { break };
+            let Some(cb) = rest[ob..].find('}').map(|i| ob + i) else {
+                break;
+            };
             let obj = &rest[ob + 1..cb];
             let kind = get_str(obj, "kind").and_then(WidgetKind::from_code);
             let x = get_num(obj, "x").unwrap_or(0.5) as f32;
@@ -180,7 +199,9 @@ fn get_num(obj: &str, key: &str) -> Option<f64> {
         return None;
     }
     let end = tail
-        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E'))
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E')
+        })
         .unwrap_or(tail.len());
     tail[..end].parse().ok()
 }

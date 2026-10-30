@@ -55,13 +55,25 @@ pub struct NoiseGen {
 
 impl NoiseGen {
     pub fn accel(seed: u64) -> Self {
-        NoiseGen { seed, freq: 1.7, amp: 0.002 }
+        NoiseGen {
+            seed,
+            freq: 1.7,
+            amp: 0.002,
+        }
     }
     pub fn gyro(seed: u64) -> Self {
-        NoiseGen { seed, freq: 0.9, amp: 0.0004 }
+        NoiseGen {
+            seed,
+            freq: 0.9,
+            amp: 0.0004,
+        }
     }
     pub fn light(seed: u64) -> Self {
-        NoiseGen { seed, freq: 0.05, amp: 4.0 }
+        NoiseGen {
+            seed,
+            freq: 0.05,
+            amp: 4.0,
+        }
     }
     /// Sample at 100 Hz tick `n`.
     pub fn at(&self, n: u64) -> f32 {

@@ -6,7 +6,9 @@
 pub mod android_runtime;
 pub mod cpu_pinning;
 pub mod device_profile;
+pub mod downloader;
 pub mod env_doctor;
+pub mod logger;
 pub mod manifest;
 pub mod selftest;
 pub mod sensors;

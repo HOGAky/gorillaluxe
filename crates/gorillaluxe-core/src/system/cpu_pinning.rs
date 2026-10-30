@@ -14,8 +14,7 @@ use windows::Win32::System::SystemInformation::{
 };
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
 
-const RELATION_PROCESSOR_CORE: LOGICAL_PROCESSOR_RELATIONSHIP =
-    LOGICAL_PROCESSOR_RELATIONSHIP(0);
+const RELATION_PROCESSOR_CORE: LOGICAL_PROCESSOR_RELATIONSHIP = LOGICAL_PROCESSOR_RELATIONSHIP(0);
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -110,9 +109,7 @@ fn enumerate_cpu_sets() -> Result<Vec<CpuSet>, String> {
         }
         let mut buf = vec![0u8; len as usize];
         let mut got: u32 = 0;
-        if GetSystemCpuSetInformation(buf.as_mut_ptr(), len, &mut got, HANDLE::default(), 0)
-            == 0
-        {
+        if GetSystemCpuSetInformation(buf.as_mut_ptr(), len, &mut got, HANDLE::default(), 0) == 0 {
             return Err("GetSystemCpuSetInformation failed".into());
         }
         let mut sets = Vec::new();
@@ -216,7 +213,12 @@ pub fn describe(topo: &CoreTopology) -> String {
             .iter()
             .filter(|c| c.efficiency_class == topo.best_class)
             .count();
-        format!("{} cores ({} P / {} E)", topo.cores.len(), p, topo.cores.len() - p)
+        format!(
+            "{} cores ({} P / {} E)",
+            topo.cores.len(),
+            p,
+            topo.cores.len() - p
+        )
     } else {
         format!("{} cores (uniform)", topo.cores.len())
     }

@@ -49,6 +49,7 @@ impl CasPass {
 
     /// Record the CAS dispatch. Caller guarantees: `src` is in
     /// NON_PIXEL_SHADER_RESOURCE, `dst` in UNORDERED_ACCESS.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         dx: &Dx12,
@@ -64,7 +65,9 @@ impl CasPass {
                 .device
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             let cpu0 = self.heap.GetCPUDescriptorHandleForHeapStart();
-            let cpu1 = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu0.ptr + incr as usize };
+            let cpu1 = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: cpu0.ptr + incr as usize,
+            };
             let gpu = self.heap.GetGPUDescriptorHandleForHeapStart();
 
             dx.device.CreateShaderResourceView(
@@ -122,13 +125,25 @@ impl CasPass {
 // ---------------------------------------------------------------------------
 
 fn clamp3(v: [f32; 3]) -> [f32; 3] {
-    [v[0].clamp(0.0, 1.0), v[1].clamp(0.0, 1.0), v[2].clamp(0.0, 1.0)]
+    [
+        v[0].clamp(0.0, 1.0),
+        v[1].clamp(0.0, 1.0),
+        v[2].clamp(0.0, 1.0),
+    ]
 }
 fn min3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
-    [a[0].min(b[0].min(c[0])), a[1].min(b[1].min(c[1])), a[2].min(b[2].min(c[2]))]
+    [
+        a[0].min(b[0].min(c[0])),
+        a[1].min(b[1].min(c[1])),
+        a[2].min(b[2].min(c[2])),
+    ]
 }
 fn max3(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
-    [a[0].max(b[0].max(c[0])), a[1].max(b[1].max(c[1])), a[2].max(b[2].max(c[2]))]
+    [
+        a[0].max(b[0].max(c[0])),
+        a[1].max(b[1].max(c[1])),
+        a[2].max(b[2].max(c[2])),
+    ]
 }
 fn minv(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])]
@@ -140,7 +155,11 @@ fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 fn add4(a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0] + c[0] + d[0], a[1] + b[1] + c[1] + d[1], a[2] + b[2] + c[2] + d[2]]
+    [
+        a[0] + b[0] + c[0] + d[0],
+        a[1] + b[1] + c[1] + d[1],
+        a[2] + b[2] + c[2] + d[2],
+    ]
 }
 fn mul(a: [f32; 3], s: [f32; 3]) -> [f32; 3] {
     [a[0] * s[0], a[1] * s[1], a[2] * s[2]]
@@ -159,18 +178,15 @@ fn src_px(img: &[u8], w: u32, h: u32, x: i32, y: i32) -> [f32; 3] {
     let cx = x.clamp(0, w as i32 - 1) as u32;
     let cy = y.clamp(0, h as i32 - 1) as u32;
     let o = ((cy * w + cx) * 4) as usize;
-    [img[o] as f32 / 255.0, img[o + 1] as f32 / 255.0, img[o + 2] as f32 / 255.0]
+    [
+        img[o] as f32 / 255.0,
+        img[o + 1] as f32 / 255.0,
+        img[o + 2] as f32 / 255.0,
+    ]
 }
 
 /// Reference CAS output (RGB8), same math as `CAS_SRC`.
-pub fn cas_reference(
-    src: &[u8],
-    sw: u32,
-    sh: u32,
-    dw: u32,
-    dh: u32,
-    sharpness: f32,
-) -> Vec<u8> {
+pub fn cas_reference(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, sharpness: f32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh * 4) as usize];
     for oy in 0..dh {
         for ox in 0..dw {
@@ -195,11 +211,10 @@ pub fn cas_reference(
             for i in 0..3 {
                 wv[i] = peak * sat(mn[i].min(2.0 - mx[i]) / mx[i]).sqrt();
             }
-            let col = div(add(e, mul(add4(b, d, f, hh), wv)), [
-                1.0 + 4.0 * wv[0],
-                1.0 + 4.0 * wv[1],
-                1.0 + 4.0 * wv[2],
-            ]);
+            let col = div(
+                add(e, mul(add4(b, d, f, hh), wv)),
+                [1.0 + 4.0 * wv[0], 1.0 + 4.0 * wv[1], 1.0 + 4.0 * wv[2]],
+            );
             let col = clamp3(col);
             let o = ((oy * dw + ox) * 4) as usize;
             out[o] = (col[0] * 255.0).round() as u8;

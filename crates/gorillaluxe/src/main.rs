@@ -20,6 +20,7 @@ use gorillaluxe_core::gfx::swapchain::SwapChain;
 use gorillaluxe_core::i18n::{current_lang, set_lang, tr, Lang};
 use gorillaluxe_core::input::infinite_swipe::InfiniteSwipe;
 use gorillaluxe_core::input::raw;
+use gorillaluxe_core::system::downloader::DlEvent;
 use gorillaluxe_core::system::{android_runtime, env_doctor};
 use gorillaluxe_core::ui::atlas;
 use gorillaluxe_core::ui::keymapper::WidgetKind;
@@ -28,25 +29,26 @@ use gorillaluxe_core::ui::scene::{
     build_frame, hit, Frame, HudStats, Onboard, Region, RegionId, UiState, WhpxBanner,
 };
 use gorillaluxe_core::ui::settings_panel::{FPS_PRESETS, RES_PRESETS};
-use gorillaluxe_core::ui::theme::FONT_UI;
 use gorillaluxe_core::APP_NAME;
 use windows::core::w;
-use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
-};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
     D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, FillRect, SetBkMode, SetTextColor,
-    TextOutW, UpdateWindow, HDC, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, EndPaint, FillRect, SetBkMode, SetTextColor, TextOutW,
+    UpdateWindow, HDC, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForSystem, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
 };
@@ -110,6 +112,10 @@ struct App {
     /// Last Infinite-Swipe position forwarded via adb.
     last_swipe_pos: Option<(i32, i32)>,
     last_swipe_tick: u64,
+    /// Persistent `adb shell` stdin pipe (<5 ms input forwarding).
+    shell: Option<android_runtime::AdbShell>,
+    /// WHPX readiness for the Zone B status pill.
+    whpx_ok: bool,
 }
 
 fn app_cell() -> &'static OnceLock<Mutex<App>> {
@@ -118,7 +124,9 @@ fn app_cell() -> &'static OnceLock<Mutex<App>> {
 }
 
 fn app() -> &'static Mutex<App> {
-    app_cell().get().expect("APP initialized before window creation")
+    app_cell()
+        .get()
+        .expect("APP initialized before window creation")
 }
 
 /// Slot the resolver thread drops the spawned `DownloadJob` into —
@@ -129,15 +137,17 @@ fn dl_slot() -> &'static Mutex<Option<Result<android_runtime::DownloadJob, Strin
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Zone D → start the Google repository resolve + chunked download.
+/// Slot the adb-ready thread drops the persistent shell into.
+fn shell_slot() -> &'static Mutex<Option<android_runtime::AdbShell>> {
+    static SLOT: OnceLock<Mutex<Option<android_runtime::AdbShell>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Zone D → resolve Google manifests, then start the native download.
 fn start_android_download(a: &mut App) {
     let slot = dl_slot();
     *slot.lock().unwrap() = None;
-    a.ui.onboard = Onboard::Downloading {
-        progress: 0.0,
-        mb_done: 0.0,
-        mb_total: 0.0,
-    };
+    a.ui.onboard = Onboard::CheckingEnvironment;
     std::thread::spawn(move || {
         let r = android_runtime::resolve_runtime_urls()
             .and_then(|urls| android_runtime::DownloadJob::start(&urls));
@@ -147,15 +157,28 @@ fn start_android_download(a: &mut App) {
 
 /// Zone D → launch the headless emulator + start the frame pump.
 fn start_android(a: &mut App) {
-    a.ui.onboard = Onboard::Booting;
+    a.ui.onboard = Onboard::StartingEmulator;
     let profile = &gorillaluxe_core::system::device_profile::PRESETS[0];
-    let gpu = if a.cfg.ci_software_gpu { "swiftshader_indirect" } else { "host" };
-    match android_runtime::launch(profile, gpu) {
+    let gpu = if a.cfg.ci_software_gpu {
+        "swiftshader_indirect"
+    } else {
+        "host"
+    };
+    // Try hardware acceleration first, fall back to `-accel auto`.
+    let res = android_runtime::launch(profile, gpu, "whpx").or_else(|e| {
+        android_runtime::log_line(&format!("whpx launch failed ({e}); retry accel=auto"));
+        android_runtime::launch(profile, gpu, "auto")
+    });
+    match res {
         Ok(emu) => {
             a.emu = Some(emu);
+            a.ui.onboard = Onboard::WaitingForBoot {
+                elapsed_s: 0,
+                log: "engine spawned — waiting for guest framebuffer".to_string(),
+            };
             let (tx, rx) = mpsc::channel();
             a.frame_rx = Some(rx);
-            // Frame bridge: adb screencap → RGBA at ~15 fps.
+            // Frame bridge: raw `exec-out screencap` → RGBA upload.
             std::thread::spawn(move || loop {
                 match android_runtime::grab_frame() {
                     Ok(f) => {
@@ -165,22 +188,54 @@ fn start_android(a: &mut App) {
                     }
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(300)),
                 }
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                std::thread::sleep(std::time::Duration::from_millis(33));
+            });
+            // Persistent low-latency input shell once the guest is up.
+            std::thread::spawn(move || {
+                if android_runtime::wait_for_device() {
+                    match android_runtime::AdbShell::open() {
+                        Ok(sh) => {
+                            android_runtime::log_line("persistent adb shell attached");
+                            *shell_slot().lock().unwrap() = Some(sh);
+                        }
+                        Err(e) => android_runtime::log_line(&format!("adb shell: {e}")),
+                    }
+                }
             });
         }
         Err(e) => {
-            toast(a, format!("Android: {e}"));
-            a.ui.onboard = Onboard::Ready;
+            android_runtime::log_line(&format!("emulator launch failed: {e}"));
+            a.ui.onboard = Onboard::failed(e);
         }
     }
 }
 
+/// Write one line into the persistent guest shell (<5 ms). Returns
+/// `false` when no shell is attached so the caller can fall back to a
+/// one-shot adb process.
+fn shell_cmd(a: &mut App, cmd: &str) -> bool {
+    if let Some(sh) = &mut a.shell {
+        if sh.cmd(cmd).is_ok() {
+            return true;
+        }
+        android_runtime::log_line("adb shell pipe lost — reopening");
+        a.shell = None;
+    }
+    false
+}
+
 /// Whether a live Android guest is attached.
 fn android_running(a: &mut App) -> bool {
-    a.emu.as_mut().is_some_and(|e| android_runtime::alive(e))
+    a.emu.as_mut().is_some_and(android_runtime::alive)
 }
 
 fn main() {
+    // CRITICAL: declare Per-Monitor-V2 DPI awareness BEFORE any HWND,
+    // font, or DXGI object exists — everything after this runs in
+    // physical pixels with zero DWM bitmap stretching.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let mut cfg = Config::load();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -228,8 +283,14 @@ unsafe fn run_app(cfg: Config) {
     let ui = UiState {
         lang: cfg.lang,
         sharpness: cfg.cas_sharpness,
-        fps_idx: FPS_PRESETS.iter().position(|&f| f == cfg.fps_cap).unwrap_or(1),
-        res_idx: RES_PRESETS.iter().position(|&r| r == (cfg.res_w, cfg.res_h)).unwrap_or(0),
+        fps_idx: FPS_PRESETS
+            .iter()
+            .position(|&f| f == cfg.fps_cap)
+            .unwrap_or(1),
+        res_idx: RES_PRESETS
+            .iter()
+            .position(|&r| r == (cfg.res_w, cfg.res_h))
+            .unwrap_or(0),
         ..Default::default()
     };
     let _ = app_cell().set(Mutex::new(App {
@@ -249,6 +310,8 @@ unsafe fn run_app(cfg: Config) {
         android_dims: None,
         last_swipe_pos: None,
         last_swipe_tick: 0,
+        shell: None,
+        whpx_ok: false,
     }));
 
     let hinst = HINSTANCE::from(GetModuleHandleW(None).unwrap_or_default());
@@ -263,13 +326,32 @@ unsafe fn run_app(cfg: Config) {
         hInstance: hinst,
         hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-        hbrBackground: CreateSolidBrush(COLORREF(LUXE_BG)).into(),
+        hbrBackground: CreateSolidBrush(COLORREF(LUXE_BG)),
         lpszMenuName: windows::core::PCWSTR::null(),
         lpszClassName: class_name,
         hIconSm: Default::default(),
     };
     RegisterClassExW(&wc);
 
+    // Physical-pixel window: with PMv2 awareness the values below are
+    // raw device pixels. Adjust the window rect so the CLIENT area is
+    // exactly 1600x900 physical px — the swapchain will match it 1:1.
+    const CLIENT_W: i32 = 1600;
+    const CLIENT_H: i32 = 900;
+    let dpi = GetDpiForSystem();
+    let mut wr = RECT {
+        left: 0,
+        top: 0,
+        right: CLIENT_W,
+        bottom: CLIENT_H,
+    };
+    let _ = AdjustWindowRectExForDpi(
+        &mut wr,
+        WS_OVERLAPPEDWINDOW,
+        false,
+        WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
+        dpi,
+    );
     let hwnd = CreateWindowExW(
         WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
         class_name,
@@ -277,8 +359,8 @@ unsafe fn run_app(cfg: Config) {
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1280,
-        720,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
         None,
         None,
         Some(hinst),
@@ -312,6 +394,7 @@ unsafe fn run_app(cfg: Config) {
     {
         let report = env_doctor::diagnose_host();
         let mut a = app().lock().unwrap();
+        a.whpx_ok = report.whpx_ok;
         a.ui.banner = if report.whpx_ok {
             WhpxBanner::Hidden
         } else if env_doctor::setup_completed() {
@@ -323,9 +406,14 @@ unsafe fn run_app(cfg: Config) {
         a.ui.keymap = gorillaluxe_core::ui::keymapper::Keymapper::load();
         // Zone D first-boot onboarding: card state from install state.
         a.ui.onboard = match android_runtime::install_state() {
-            android_runtime::InstallState::Ready { .. } => Onboard::Ready,
-            _ => Onboard::Missing,
+            android_runtime::InstallState::Ready { .. } => Onboard::Stopped,
+            android_runtime::InstallState::Partial(m) => {
+                android_runtime::log_line(&format!("runtime incomplete: {m}"));
+                Onboard::MissingRuntime
+            }
+            android_runtime::InstallState::Missing => Onboard::MissingRuntime,
         };
+        a.ui.status = engine_status(a.whpx_ok, &a.ui.onboard);
     }
 
     let _ = ShowWindow(hwnd, SW_SHOW);
@@ -341,12 +429,31 @@ unsafe fn run_app(cfg: Config) {
     }
 }
 
+/// Real production status line for the Zone B pill — replaces the
+/// MVP "Phase 2" placeholder with live engine state.
+fn engine_status(whpx_ok: bool, onboard: &Onboard) -> String {
+    let a13 = match onboard {
+        Onboard::Running | Onboard::Hidden => "Running",
+        Onboard::Stopped => "Ready",
+        Onboard::StartingEmulator | Onboard::WaitingForBoot { .. } => "Booting",
+        Onboard::Failed { .. } => "Error",
+        _ => "Missing",
+    };
+    format!(
+        "GorillaLuxe Engine | WHPX: {} | Android 13: {a13}",
+        if whpx_ok { "Ready" } else { "Off" }
+    )
+}
+
 fn client_size(hwnd: HWND) -> (u32, u32) {
     let mut rc = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut rc);
     }
-    ((rc.right - rc.left).max(1) as u32, (rc.bottom - rc.top).max(1) as u32)
+    (
+        (rc.right - rc.left).max(1) as u32,
+        (rc.bottom - rc.top).max(1) as u32,
+    )
 }
 
 fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
@@ -354,7 +461,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
     let (mut win_w, mut win_h) = client_size(hwnd);
     let mut swap = SwapChain::new(&dx, hwnd, win_w, win_h)?;
     let comp = Composite::new(&dx)?;
-    let atlas = atlas::build(FONT_UI)?;
+    let atlas = atlas::build_ui_atlases()?;
     let ui = UiRenderer::new(&dx, &atlas)?;
 
     // Guest framebuffer analog at the compositor resolution preset.
@@ -444,48 +551,134 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 if matches!(a.ui.banner, WhpxBanner::Missing(_)) && env_doctor::setup_completed() {
                     a.ui.banner = WhpxBanner::RestartReady;
                 }
-                // ---- Phase 4: bootstrapper + emulator state machine -------
+                // ---- Android runtime state machine (spec §5.1) ------
                 if let Some(r) = dl_slot().lock().unwrap().take() {
                     match r {
-                        Ok(job) => a.dl = Some(job),
+                        Ok(job) => {
+                            a.dl = Some(job);
+                            a.ui.onboard = Onboard::Downloading {
+                                step: "connecting dl.google.com".into(),
+                                progress: 0.0,
+                                mb_done: 0.0,
+                                mb_total: 0.0,
+                                mbps: 0.0,
+                            };
+                        }
                         Err(e) => {
-                            toast(&mut a, format!("DL: {e}"));
-                            a.ui.onboard = Onboard::Missing;
+                            android_runtime::log_line(&format!("resolve failed: {e}"));
+                            a.ui.onboard = Onboard::failed(e);
                         }
                     }
                 }
-                if let Some(job) = &mut a.dl {
-                    let (done, total) = job.progress();
-                    let finished = job.finished_ok();
-                    let lang = a.ui.lang;
-                    a.ui.onboard = Onboard::Downloading {
-                        progress: if total > 0 { done as f32 / total as f32 } else { 0.0 },
-                        mb_done: done as f32 / 1048576.0,
-                        mb_total: total as f32 / 1048576.0,
-                    };
-                    if let Some(ok) = finished {
-                        a.dl = None;
-                        match (ok, android_runtime::install_state()) {
-                            (true, android_runtime::InstallState::Ready { .. }) => {
-                                a.ui.onboard = Onboard::Ready;
-                                toast(&mut a, tr(lang, "ui.onboard.ready").to_string());
+                if let Some(job) = &a.dl {
+                    let events = job.poll();
+                    let mut finished: Option<Result<(), String>> = None;
+                    for ev in events {
+                        match ev {
+                            DlEvent::Step { step, of, label } => {
+                                android_runtime::log_line(&format!("step {step}/{of}: {label}"));
+                                a.ui.onboard = Onboard::Downloading {
+                                    step: format!("{step}/{of}  {label}"),
+                                    progress: 0.0,
+                                    mb_done: 0.0,
+                                    mb_total: 0.0,
+                                    mbps: 0.0,
+                                };
                             }
-                            _ => {
-                                a.ui.onboard = Onboard::Missing;
-                                toast(&mut a, "Android download failed".into());
+                            DlEvent::Progress {
+                                done,
+                                total,
+                                speed_bps,
+                            } => {
+                                let step = match &a.ui.onboard {
+                                    Onboard::Downloading { step, .. } => step.clone(),
+                                    _ => String::new(),
+                                };
+                                a.ui.onboard = Onboard::Downloading {
+                                    step,
+                                    progress: if total > 0 {
+                                        done as f32 / total as f32
+                                    } else {
+                                        0.0
+                                    },
+                                    mb_done: done as f32 / 1048576.0,
+                                    mb_total: total as f32 / 1048576.0,
+                                    mbps: speed_bps as f32 / 1048576.0,
+                                };
+                            }
+                            DlEvent::Verifying { label } => {
+                                a.ui.onboard = Onboard::VerifyingArchive { step: label };
+                            }
+                            DlEvent::Extracting { label } => {
+                                a.ui.onboard = Onboard::Extracting {
+                                    step: format!("4/4  {label}"),
+                                };
+                            }
+                            DlEvent::Log(l) => android_runtime::log_line(&l),
+                            DlEvent::Finished(r) => finished = Some(r),
+                        }
+                    }
+                    if let Some(r) = finished {
+                        a.dl = None;
+                        match (r, android_runtime::install_state()) {
+                            (Ok(()), android_runtime::InstallState::Ready { .. }) => {
+                                android_runtime::log_line("runtime install complete");
+                                a.ui.onboard = Onboard::CreatingAvd;
+                                // Auto-transition straight into boot.
+                                start_android(&mut a);
+                            }
+                            (Err(e), _) => {
+                                android_runtime::log_line(&format!("download failed: {e}"));
+                                a.ui.onboard = Onboard::failed(e);
+                            }
+                            (Ok(()), st) => {
+                                let e = match st {
+                                    android_runtime::InstallState::Partial(m) => {
+                                        format!("missing files: {m}")
+                                    }
+                                    _ => "install validation failed".to_string(),
+                                };
+                                android_runtime::log_line(&format!("validation failed: {e}"));
+                                a.ui.onboard = Onboard::failed(e);
                             }
                         }
                     }
+                }
+                // Boot-elapsed tick + emulator liveness.
+                let boot_elapsed = a
+                    .emu
+                    .as_ref()
+                    .map(|e| e.launched_at.elapsed().as_secs() as u32);
+                if let (Some(secs), Onboard::WaitingForBoot { elapsed_s, .. }) =
+                    (boot_elapsed, &mut a.ui.onboard)
+                {
+                    *elapsed_s = secs;
                 }
                 if a.emu.is_some() && !android_running(&mut a) {
+                    let was_booting = matches!(
+                        a.ui.onboard,
+                        Onboard::WaitingForBoot { .. } | Onboard::StartingEmulator
+                    );
                     a.emu = None;
                     a.frame_rx = None;
                     a.android_dims = None;
-                    if matches!(a.ui.onboard, Onboard::Booting | Onboard::Hidden) {
-                        a.ui.onboard = Onboard::Ready;
+                    a.shell = None;
+                    if was_booting {
+                        a.ui.onboard =
+                            Onboard::failed("emulator exited during boot — see gorillaluxe.log");
+                    } else {
+                        a.ui.onboard = Onboard::Stopped;
                         toast(&mut a, "Android exited".into());
                     }
                 }
+                // Attach the persistent shell when the waiter delivers it.
+                if a.shell.is_none() {
+                    if let Some(sh) = shell_slot().lock().unwrap().take() {
+                        a.shell = Some(sh);
+                    }
+                }
+                let status = engine_status(a.whpx_ok, &a.ui.onboard);
+                a.ui.status = status;
                 sw = a.win.0;
                 sh = a.win.1;
             }
@@ -501,16 +694,16 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 }
                 if let Some((_, w, h)) = &latest {
                     a.android_dims = Some((*w, *h));
-                    if matches!(a.ui.onboard, Onboard::Booting) {
-                        a.ui.onboard = Onboard::Hidden;
+                    if matches!(a.ui.onboard, Onboard::WaitingForBoot { .. }) {
+                        android_runtime::log_line("first guest frame received — boot OK");
+                        a.ui.onboard = Onboard::Running;
                     }
                 }
             }
 
             // FPS cap pacing (plus the swapchain latency waitable).
-            let frame_target = std::time::Duration::from_secs_f64(
-                1.0 / app().lock().unwrap().fps_cap as f64,
-            );
+            let frame_target =
+                std::time::Duration::from_secs_f64(1.0 / app().lock().unwrap().fps_cap as f64);
             let _ = WaitForSingleObject(swap.latency_event, 500);
             let now = std::time::Instant::now();
             if now < frame_deadline {
@@ -574,7 +767,11 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
             let stats = HudStats {
                 fps,
                 frame_ms: if fps > 0 { 1000.0 / fps as f32 } else { 0.0 },
-                backend: if dx.is_warp { "DX12 Zero-Copy | WARP" } else { "DX12 Zero-Copy" },
+                backend: if dx.is_warp {
+                    "DX12 Zero-Copy | WARP"
+                } else {
+                    "DX12 Zero-Copy"
+                },
             };
             let frame: Frame = {
                 let a = app().lock().unwrap();
@@ -611,9 +808,11 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
         }
     }
 
-    // Persist UI choices on clean exit.
+    // Graceful engine teardown + persist UI choices on clean exit.
     {
         let mut a = app().lock().unwrap();
+        a.emu = None; // Drop → child.kill() + Job close (no orphans)
+        a.shell = None;
         a.cfg.lang = current_lang();
         a.cfg.cas_sharpness = a.ui.sharpness;
         a.cfg.fps_cap = a.fps_cap;
@@ -641,7 +840,11 @@ fn toast(a: &mut App, title: String) {
 fn on_lbutton_down(a: &mut App, x: f32, y: f32) {
     match hit(&a.regions, x, y) {
         Some(RegionId::DockLang) => {
-            let next = if current_lang() == Lang::Ru { Lang::En } else { Lang::Ru };
+            let next = if current_lang() == Lang::Ru {
+                Lang::En
+            } else {
+                Lang::Ru
+            };
             set_lang(next);
             a.ui.lang = next;
             sync_guest_locale(a, next);
@@ -690,9 +893,14 @@ fn sync_guest_locale(a: &mut App, lang: Lang) {
         return;
     }
     let locale = if lang == Lang::Ru { "ru-RU" } else { "en-US" };
-    std::thread::spawn(move || {
-        let _ = android_runtime::set_locale(locale);
-    });
+    let l = locale.split('-').next().unwrap_or("en");
+    if !shell_cmd(a, &format!("setprop persist.sys.locale {locale}"))
+        || !shell_cmd(a, &format!("setprop persist.sys.language {l}"))
+    {
+        std::thread::spawn(move || {
+            let _ = android_runtime::set_locale(locale);
+        });
+    }
 }
 
 fn apply_slider(a: &mut App, x: f32) {
@@ -726,17 +934,20 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
     }
     a.drag = Drag::None;
     // Forward the tap into the running Android guest when the click
-    // landed on the game surface (no UI region hit).
+    // landed on the game surface (no UI region hit). Persistent shell
+    // first (<5 ms), one-shot adb spawn as fallback.
     if android_running(a)
-        && matches!(a.ui.onboard, Onboard::Hidden)
+        && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
         && hit(&a.regions, x, y).is_none()
     {
         if let Some((dw, dh)) = a.android_dims {
             let gx = (x / a.win.0 * dw as f32) as u32;
             let gy = (y / a.win.1 * dh as f32) as u32;
-            std::thread::spawn(move || {
-                let _ = android_runtime::send_tap(gx, gy);
-            });
+            if !shell_cmd(a, &format!("input tap {gx} {gy}")) {
+                std::thread::spawn(move || {
+                    let _ = android_runtime::send_tap(gx, gy);
+                });
+            }
         }
     }
 }
@@ -744,7 +955,7 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
 fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
     if let Some(i) = a.ui.keymap.selected {
         // Any key binds the selected widget; ESC removes it.
-        if vk == VK_ESCAPE.0 as u16 {
+        if vk == VK_ESCAPE.0 {
             a.ui.keymap.remove(i);
         } else {
             a.ui.keymap.bind(i, vk);
@@ -753,38 +964,44 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
         return;
     }
     // Bound keys forward Zone C taps into the running guest.
-    if android_running(a) && a.ui.keymap.open == false {
+    if android_running(a) && !a.ui.keymap.open {
         if let Some((dw, dh)) = a.android_dims {
-            for w in &a.ui.keymap.widgets {
-                if w.key == Some(vk) && w.kind == WidgetKind::Tap {
-                    let gx = (w.x * dw as f32) as u32;
-                    let gy = (w.y * dh as f32) as u32;
+            let tap_pos = a.ui.keymap.widgets.iter().find_map(|w| {
+                (w.key == Some(vk) && w.kind == WidgetKind::Tap)
+                    .then_some(((w.x * dw as f32) as u32, (w.y * dh as f32) as u32))
+            });
+            if let Some((gx, gy)) = tap_pos {
+                if !shell_cmd(a, &format!("input tap {gx} {gy}")) {
                     std::thread::spawn(move || {
                         let _ = android_runtime::send_tap(gx, gy);
                     });
-                    return;
                 }
+                return;
             }
         }
     }
     match vk {
-        k if k == VK_F1.0 as u16 => a.ui.keymap.toggle(),
-        k if k == VK_F2.0 as u16 => a.ui.settings.toggle(),
-        k if k == VK_F3.0 as u16 => a.ui.hud_visible = !a.ui.hud_visible,
-        k if k == VK_F4.0 as u16 => {
-            let next = if current_lang() == Lang::Ru { Lang::En } else { Lang::Ru };
+        k if k == VK_F1.0 => a.ui.keymap.toggle(),
+        k if k == VK_F2.0 => a.ui.settings.toggle(),
+        k if k == VK_F3.0 => a.ui.hud_visible = !a.ui.hud_visible,
+        k if k == VK_F4.0 => {
+            let next = if current_lang() == Lang::Ru {
+                Lang::En
+            } else {
+                Lang::Ru
+            };
             set_lang(next);
             a.ui.lang = next;
             sync_guest_locale(a, next);
         }
-        k if k == VK_F5.0 as u16 => {
+        k if k == VK_F5.0 => {
             if matches!(a.ui.banner, WhpxBanner::Missing(_)) {
                 if let Err(e) = env_doctor::launch_elevated_setup() {
                     toast(a, format!("{}: {e}", tr(a.ui.lang, "ui.whpx.uac_denied")));
                 }
             }
         }
-        k if k == VK_F6.0 as u16 => {
+        k if k == VK_F6.0 => {
             a.ui.fps_mode = !a.ui.fps_mode;
             if a.ui.fps_mode {
                 a.swipe.begin(a.tick);
@@ -792,7 +1009,7 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
                 a.swipe.end(a.tick);
             }
         }
-        k if k == VK_ESCAPE.0 as u16 => unsafe {
+        k if k == VK_ESCAPE.0 => unsafe {
             let _ = DestroyWindow(hwnd);
         },
         _ => {}
@@ -816,10 +1033,7 @@ fn on_drop_files(a: &mut App, lparam: LPARAM) {
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or(path.clone());
-                toast(
-                    a,
-                    format!("{} {}", tr(a.ui.lang, "ui.apk.dropped"), name),
-                );
+                toast(a, format!("{} {}", tr(a.ui.lang, "ui.apk.dropped"), name));
                 // Phase 4: install straight into the running guest.
                 if android_running(a) {
                     let p = PathBuf::from(&path);
@@ -890,18 +1104,17 @@ unsafe extern "system" fn wnd_proc(
                 if a.ui.fps_mode {
                     a.swipe.feed(dx as f32, dy as f32, tick);
                     // Forward FPS aim as adb swipes (~16 Hz throttle).
-                    if android_running(&mut a)
-                        && tick.saturating_sub(a.last_swipe_tick) > 60
-                    {
+                    if android_running(&mut a) && tick.saturating_sub(a.last_swipe_tick) > 60 {
                         a.last_swipe_tick = tick;
                         let pos = a.swipe.pos();
                         if let Some(prev) = a.last_swipe_pos {
                             let (x1, y1) = prev;
                             let (x2, y2) = pos;
-                            std::thread::spawn(move || {
-                                let _ =
-                                    android_runtime::send_swipe(x1, y1, x2, y2, 60);
-                            });
+                            if !shell_cmd(&mut a, &format!("input swipe {x1} {y1} {x2} {y2} 60")) {
+                                std::thread::spawn(move || {
+                                    let _ = android_runtime::send_swipe(x1, y1, x2, y2, 60);
+                                });
+                            }
                         }
                         a.last_swipe_pos = Some(pos);
                     }
@@ -938,7 +1151,11 @@ unsafe extern "system" fn wnd_proc(
             let welcome = utf16(tr(lang, "ui.welcome"));
             let _ = TextOutW(hdc, 24, 64, &welcome);
             SetTextColor(hdc, LUXE_DIM);
-            let phase = utf16(&format!("{} · {}", tr(lang, "ui.phase1"), tr(lang, "ui.phase2")));
+            let phase = utf16(&format!(
+                "{} · {}",
+                tr(lang, "ui.phase1"),
+                tr(lang, "ui.phase2")
+            ));
             let _ = TextOutW(hdc, 24, 92, &phase);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)

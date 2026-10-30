@@ -17,9 +17,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt gate
+        run: cargo fmt --all -- --check
+
+      - name: clippy gate (zero warnings)
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
 
       - name: Check WHPX availability on runner
         shell: pwsh
@@ -71,13 +78,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "PHASE3-CI: RU locale run exited 0"
 
-      - name: Phase 4 acceptance — long mode, profiles, shm, snapshots, manifests
+      - name: Phase 4 acceptance — long mode, downloader, AVD, shm, manifests
         shell: pwsh
         run: |
           # Automated Verification Test 4: 64-bit Long Mode WHPX guest,
-          # device profiles + Perlin sensor variance + locale sync,
-          # 60x1080p named-shm frames <60ms, LZ4 snapshot roundtrip,
-          # P/E-core pinning, Google manifest URL resolver.
+          # live dl.google.com manifest resolve (emulator + platform-tools
+          # + api-33 x86_64 sysimg), native ureq+zip real-archive download,
+          # AVD/config.ini strict validation, raw screencap header parse,
+          # atlas streak check, profiles/sensors/shm/lz4/cpu-pinning.
           .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang en
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "PHASE4-CI: gorillaluxe-cli --self-test-phase4 exited 0"
@@ -91,7 +99,10 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\gorillaluxe.exe, target\release\gorillaluxe-cli.exe dist\
           Copy-Item README.md, SPECIFICATION.txt, ARCHITECTURE.md dist\
-          Copy-Item scripts\fetch-android-image.ps1 dist\
+          # Integrity manifest so users can verify the binaries.
+          Get-FileHash dist\gorillaluxe.exe, dist\gorillaluxe-cli.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Out-File dist\SHA256SUMS.txt -Encoding ascii
           Compress-Archive -Path dist\* -DestinationPath GorillaLuxe-Win64.zip
           $size = (Get-Item GorillaLuxe-Win64.zip).Length / 1MB
           Write-Host ("GorillaLuxe-Win64.zip: {0:N1} MB" -f $size)

@@ -66,9 +66,7 @@ struct GuestRam(*mut c_void);
 
 impl GuestRam {
     fn alloc() -> Result<Self, VmError> {
-        let ptr = unsafe {
-            VirtualAlloc(None, MEM_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-        };
+        let ptr = unsafe { VirtualAlloc(None, MEM_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         if ptr.is_null() {
             return Err(VmError::Memory("VirtualAlloc failed".into()));
         }
@@ -108,7 +106,7 @@ fn build_guest_image(mem: &GuestRam) {
         mem.w64(GDT_GPA, 0);
         mem.w64(GDT_GPA + 8, 0x00AF_9B00_0000_FFFF); // 64-bit code, L=1
         mem.w64(GDT_GPA + 16, 0x008F_9300_0000_FFFF); // data
-        // Payload: mov rax, MAGIC; mov rcx, MAILBOX; mov [rcx], rax; hlt.
+                                                      // Payload: mov rax, MAGIC; mov rcx, MAILBOX; mov [rcx], rax; hlt.
         let mut code = Vec::new();
         code.extend_from_slice(&[0x48, 0xB8]);
         code.extend_from_slice(&LM64_MAGIC.to_le_bytes());
@@ -138,18 +136,18 @@ fn setup_long_mode(part: &Partition, vp: u32) -> Result<(), VmError> {
         WHvX64RegisterRsp,
     ];
     let values = [
-        reg64(CODE_GPA),                     // Rip
-        reg64(0x2),                          // Rflags
-        reg64(0x8000_0031),                  // CR0: PG|PE|ET|MP
-        reg64(PML4_GPA),                     // CR3 -> PML4
-        reg64(0x20),                         // CR4: PAE
-        reg64(0x500),                        // EFER: LME|LMA
-        table(GDT_GPA, 0x17),                // GDTR
+        reg64(CODE_GPA),      // Rip
+        reg64(0x2),           // Rflags
+        reg64(0x8000_0031),   // CR0: PG|PE|ET|MP
+        reg64(PML4_GPA),      // CR3 -> PML4
+        reg64(0x20),          // CR4: PAE
+        reg64(0x500),         // EFER: LME|LMA
+        table(GDT_GPA, 0x17), // GDTR
         segment(SEG_ATTR_CODE64, 0x08),
         segment(SEG_ATTR_DATA64, 0x10),
         segment(SEG_ATTR_DATA64, 0x10),
         segment(SEG_ATTR_DATA64, 0x10),
-        reg64(0x7000),                       // Rsp
+        reg64(0x7000), // Rsp
     ];
     part.set_registers(vp, &names, &values)?;
     Ok(())
@@ -172,25 +170,24 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
     let part = api.create_partition(1)?;
     let mem = GuestRam::alloc()?;
     build_guest_image(&mem);
-    part.map_gpa_range(
-        mem.0,
-        0,
-        MEM_SIZE as u32,
-        WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
-    )?;
+    unsafe {
+        part.map_gpa_range(
+            mem.0,
+            0,
+            MEM_SIZE as u32,
+            WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
+        )?;
+    }
 
     const VP: u32 = 0;
     part.create_vcpu(VP)?;
     setup_long_mode(&part, VP)?;
 
-    let mut halted = false;
-    for _ in 0..64 {
-        let mut exit = WHV_RUN_VP_EXIT_CONTEXT::default();
-        part.run(VP, &mut exit)?;
-        if exit.ExitReason == WHvRunVpExitReasonX64Halt {
-            halted = true;
-            break;
-        }
+    // Straight 64-bit payload → a single run must reach HLT; any
+    // other exit reason (MMIO/PIO/triple fault) is a hard error.
+    let mut exit = WHV_RUN_VP_EXIT_CONTEXT::default();
+    part.run(VP, &mut exit)?;
+    if exit.ExitReason != WHvRunVpExitReasonX64Halt {
         return Err(VmError::Exit {
             reason: exit.ExitReason.0,
             detail: format!(
@@ -198,9 +195,6 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
                 exit.VpContext.Rip
             ),
         });
-    }
-    if !halted {
-        return Err(VmError::GuestProtocol("no HLT within exit budget".into()));
     }
 
     let regs = part.get_registers(
@@ -212,9 +206,8 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
     let rax = unsafe { regs[0].Reg64 };
     let cs_attr = unsafe { regs[1].Segment.Anonymous.Attributes };
     let efer = unsafe { regs[2].Reg64 };
-    let mailbox = unsafe {
-        std::slice::from_raw_parts((mem.0 as *const u8).add(MAILBOX_GPA as usize), 8)
-    };
+    let mailbox =
+        unsafe { std::slice::from_raw_parts((mem.0 as *const u8).add(MAILBOX_GPA as usize), 8) };
     let sig_ok = rax == LM64_MAGIC && mailbox == b"GLX-LM64";
     let long_ok = cs_attr & 0x2000 != 0 && efer & 0x500 == 0x500;
 

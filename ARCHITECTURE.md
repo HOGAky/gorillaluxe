@@ -111,6 +111,13 @@ Zero CPU pixel copies in steady state
   `GetLogicalProcessorInformationEx` + `GetSystemCpuSetInformation`,
   `SetThreadSelectedCpuSets` P-core pinning.
   Гибридная топология P/E-ядер и закрепление потоков.
+- **`downloader.rs`** — native resumable downloader (ureq+Schannel,
+  `.part` resume + HTTP Range, 3 attempts, manifest SHA-256/SHA-1
+  verify, traversal-safe ZIP extract via `enclosed_name`, throttled
+  `DlEvent` progress). Нативный загрузчик с докачкой и SHA-256.
+- **`logger.rs`** — leveled runtime log at
+  `%LOCALAPPDATA%\GorillaLuxe\logs\gorillaluxe.log`, 5 MiB rotation.
+  Логирование с ротацией.
 - **`selftest.rs`** — Automated Verification Test 4 runner/report.
 
 ### `vmm/long_mode.rs` (Phase 4 / Фаза 4)
@@ -121,11 +128,15 @@ Zero CPU pixel copies in steady state
 - 64-bit payload proof: `mov r64,imm64` + qword mailbox + HLT,
   verified `RAX` signature + CS L-bit under WHPX.
 
-### `scripts/fetch-android-image.ps1` (Phase 4 / Фаза 4)
-Resumable chunked downloader (`HttpWebRequest` + HTTP Range, 8 MiB
-chunks, `.part` resume, `.dl_progress` file for GUI polling) +
-auto-extract into `runtime\{emulator,platform-tools,system-images}`.
-Возобновляемая загрузка пакетов Google с прогрессом для GUI.
+### Android runtime state machine / Машина состояний
+`CheckingEnvironment → MissingRuntime → Downloading{step,MB,MB/s} →
+VerifyingArchive → Extracting → CreatingAvd → StartingEmulator →
+WaitingForBoot{elapsed_s} → Running → Stopped`, `Failed{ru,en}` + Retry.
+Downloads are native Rust (`system/downloader.rs`) — the PowerShell
+bootstrapper was removed; `emulator.exe` runs inside a Job Object with
+`KILL_ON_JOB_CLOSE` (no orphan qemu), input flows through a persistent
+`adb shell` stdin pipe (<5 ms), and frames arrive as raw `screencap`
+(12-byte header + RGBA8888 — no PNG/GDI+).
 
 ### `i18n` + `config`
 - **`i18n.rs`** — atomic `set_lang`/`current_lang`, `tr()` table for
@@ -151,15 +162,18 @@ wnd_proc ──► App (Mutex) ──► build_frame(state) ──► Frame{inst
 - `WM_SIZE` → `swapchain.resize()` + CAS/UI viewport update.
 - Hotkeys: F1 keymapper, F2 settings, F3 HUD, F4 RU/EN (+ guest locale
   sync), F5 WHPX setup, F6 FPS aim (adb swipe forward), ESC quit.
-- Zone D onboarding: `install_state()` → Download (resumable
-  bootstrapper + progress bar) / Launch Android → headless emulator →
-  `exec-out screencap` frames → `android_tex` → CAS → swapchain.
-  Clicks on the game surface forward as `input tap` mapped to guest
-  display dims.
+- Zone D onboarding: `install_state()` → Download (native ureq+zip
+  with SHA-256 + step labels) / Launch Android → Job-bound headless
+  emulator → raw `exec-out screencap` (12B header + RGBA8888) frames →
+  `android_tex` → CAS → swapchain. Clicks forward through the
+  persistent `adb shell` pipe (<5 ms).
 
 ## CI pipeline / Конвейер CI
 
-`windows-latest` (MSVC): `cargo test` → Phase 1 `--self-test` →
-Phase 2 `--self-test-gfx --ci-software-gpu` → Phase 3
-`--self-test-input` → Phase 4 `--self-test-phase4` (EN + RU) →
-`GorillaLuxe-Win64.zip` artifact (< 35 MB budget).
+`windows-latest` (MSVC): `cargo fmt --check` + `cargo clippy -D
+warnings` → `cargo build/test --release --locked` → Phase 1
+`--self-test` → Phase 2 `--self-test-gfx --ci-software-gpu` → Phase 3
+`--self-test-input` → Phase 4 `--self-test-phase4` (EN + RU; live
+manifest resolve + real-archive download + AVD validation + raw
+screencap + atlas streak checks) → `GorillaLuxe-Win64.zip` +
+`SHA256SUMS.txt` (< 35 MB budget).

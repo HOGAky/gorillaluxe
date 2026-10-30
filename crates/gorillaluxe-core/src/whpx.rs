@@ -102,10 +102,11 @@ impl Whpx {
 
         unsafe fn sym<T>(lib: HMODULE, name: &'static [u8]) -> Result<T, WhpxError> {
             let pcstr = windows::core::PCSTR(name.as_ptr());
-            let proc = unsafe { GetProcAddress(lib, pcstr) }
-                .ok_or(WhpxError::MissingExport(
-                    std::str::from_utf8(name).unwrap_or("?").trim_end_matches('\0').into(),
-                ))?;
+            let proc = unsafe { GetProcAddress(lib, pcstr) }.ok_or(WhpxError::MissingExport(
+                std::str::from_utf8(name)
+                    .unwrap_or("?")
+                    .trim_end_matches('\0'),
+            ))?;
             Ok(unsafe { std::mem::transmute_copy(&proc) })
         }
 
@@ -193,7 +194,10 @@ impl Partition {
         self.handle
     }
 
-    pub fn map_gpa_range(
+    /// # Safety
+    /// `host_addr` must point at `size` bytes of valid host memory for
+    /// the lifetime of the GPA mapping.
+    pub unsafe fn map_gpa_range(
         &self,
         host_addr: *const c_void,
         gpa: u64,
@@ -240,7 +244,10 @@ impl Partition {
             )
         };
         if hr.is_err() {
-            return Err(WhpxError::ApiFailed("WHvSetVirtualProcessorRegisters", hr.0));
+            return Err(WhpxError::ApiFailed(
+                "WHvSetVirtualProcessorRegisters",
+                hr.0,
+            ));
         }
         Ok(())
     }
@@ -261,17 +268,16 @@ impl Partition {
             )
         };
         if hr.is_err() {
-            return Err(WhpxError::ApiFailed("WHvGetVirtualProcessorRegisters", hr.0));
+            return Err(WhpxError::ApiFailed(
+                "WHvGetVirtualProcessorRegisters",
+                hr.0,
+            ));
         }
         Ok(values)
     }
 
     /// Run vCPU once; fills `exit` with the exit context on VM-exit.
-    pub fn run(
-        &self,
-        vp: u32,
-        exit: &mut WHV_RUN_VP_EXIT_CONTEXT,
-    ) -> Result<(), WhpxError> {
+    pub fn run(&self, vp: u32, exit: &mut WHV_RUN_VP_EXIT_CONTEXT) -> Result<(), WhpxError> {
         let hr = unsafe {
             (self.api.run_virtual_processor)(
                 self.handle,

@@ -15,8 +15,8 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::buffers::{
-    barrier, close_handle, create_shared_handle, create_texture_rgba,
-    open_shared_handle, read_texture_rgba,
+    barrier, close_handle, create_shared_handle, create_texture_rgba, open_shared_handle,
+    read_texture_rgba,
 };
 use super::cas::{cas_reference, ssim};
 use super::composite::Composite;
@@ -54,6 +54,9 @@ pub struct Report {
     /// Phase 3: glyph cells must be letter shapes, not solid blocks.
     pub glyph_cells: usize,
     pub glyph_fill_bad: usize,
+    /// Production: zero ClearType vertical streaks in the multi-size
+    /// ANTIALIASED_QUALITY atlas.
+    pub glyph_streak_bad: usize,
     pub steady_bytes: u64,
     pub verification_bytes: u64,
 }
@@ -70,6 +73,7 @@ impl Report {
             && self.ui_nonblack
             && self.glyph_cells > 0
             && self.glyph_fill_bad == 0
+            && self.glyph_streak_bad == 0
             && self.steady_bytes == 0
     }
 }
@@ -243,7 +247,9 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
     )?;
     let nonblack = frame
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
         .count()
         > 1000;
@@ -253,7 +259,7 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
     let ssim_v = ssim(&frame, &reference);
 
     // ---- UI overlay render into an offscreen render target -------------
-    let atlas = atlas::build(crate::ui::theme::FONT_UI)?;
+    let atlas = atlas::build_ui_atlases()?;
     let ui = UiRenderer::new(&host, &atlas)?;
     let (_rtv_heap, rtv) = rtv_heap1(&host)?;
     let ui_rt = create_texture_rgba(
@@ -265,10 +271,13 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         false,
     )?;
     unsafe {
-        host.device
-            .CreateRenderTargetView(&ui_rt, None, rtv);
+        host.device.CreateRenderTargetView(&ui_rt, None, rtv);
     }
-    let stats_h = HudStats { fps: 240, frame_ms: 4.2, backend: "DX12 Zero-Copy | WARP" };
+    let stats_h = HudStats {
+        fps: 240,
+        frame_ms: 4.2,
+        backend: "DX12 Zero-Copy | WARP",
+    };
     let mut ui_state = UiState::default();
     let instances = build_frame(DW as f32, DH as f32, &ui_state, &atlas, &stats_h).instances;
     let (_ua, ulist) = host.cmd()?;
@@ -297,7 +306,9 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
     host.submit_wait(&ulist)?;
     let ui_frame = read_texture_rgba(&host, &ui_rt, DW, DH, D3D12_RESOURCE_STATE_COPY_SOURCE)?;
     let ui_nonblack = ui_frame
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
         .count()
         > 1000;
@@ -311,6 +322,9 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
     // ---- (3b) Glyph cells must be letter shapes, not solid blocks -----
     let (glyph_cells, glyph_bad) = atlas::glyph_fill_violations(&atlas);
     let glyph_fill_bad = glyph_bad.len();
+    // Production QA: no ClearType vertical streaks anywhere in the
+    // multi-size ANTIALIASED_QUALITY atlas.
+    let glyph_streak_bad = atlas::streak_violations(&atlas).len();
 
     // ---- (4) RU<->EN hot-swap < 1 ms -----------------------------------
     let t0 = Instant::now();
@@ -325,8 +339,8 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
 
     // ---- (5) Flip swapchain present via hidden window ------------------
     let presented = hidden_window()
-        .map(|hwnd| {
-            match super::swapchain::SwapChain::new(&host, hwnd, DW, DH) {
+        .map(
+            |hwnd| match super::swapchain::SwapChain::new(&host, hwnd, DW, DH) {
                 Ok(sc) => {
                     let idx = sc.current_index();
                     let rt = &sc.buffers[idx as usize];
@@ -355,8 +369,8 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
                     ok && host.submit_wait(&plist).is_ok() && sc.present().is_ok()
                 }
                 Err(_) => false,
-            }
-        })
+            },
+        )
         .unwrap_or(false);
 
     let s = stats();
@@ -376,7 +390,10 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         ui_nonblack,
         glyph_cells,
         glyph_fill_bad,
-        steady_bytes: s.steady_state_cpu_copy_bytes.load(std::sync::atomic::Ordering::SeqCst),
+        glyph_streak_bad,
+        steady_bytes: s
+            .steady_state_cpu_copy_bytes
+            .load(std::sync::atomic::Ordering::SeqCst),
         verification_bytes: s
             .verification_copy_bytes
             .load(std::sync::atomic::Ordering::SeqCst),

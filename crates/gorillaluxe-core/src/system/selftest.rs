@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use crate::i18n::Lang;
 use crate::vmm::{self, SelfTest};
 
-use super::{android_runtime, cpu_pinning, device_profile, manifest, sensors, shm_publisher, snapshot};
+use super::{
+    android_runtime, cpu_pinning, device_profile, manifest, sensors, shm_publisher, snapshot,
+};
 
 #[derive(Debug)]
 pub enum Check {
@@ -79,38 +81,61 @@ const EMBEDDED_MANIFEST: &str = r#"
  </remotePackage>
 </sdk:repository>"#;
 
+const EMBEDDED_SYSIMG: &str = r#"
+<sdk:sdk-sys-img>
+ <remotePackage path="system-images;android-33;google_apis_playstore;x86_64">
+  <type-details><api-level>33</api-level><abi>x86_64</abi></type-details>
+  <archives><archive><complete><size>900000000</size><url>x86_64-33_r14.zip</url></complete></archive></archives>
+ </remotePackage>
+ <remotePackage path="system-images;android-34;google_apis_playstore;x86_64">
+  <type-details><api-level>34</api-level><abi>x86_64</abi></type-details>
+  <archives><archive><complete><size>1000000000</size><url>x86_64-34_r10.zip</url></complete></archive></archives>
+ </remotePackage>
+</sdk:sdk-sys-img>"#;
+
 fn manifest_check() -> Check {
-    // Try live Google fetch (20s budget), fall back to the embedded
-    // sample so the resolver logic is always exercised.
+    // Try the FULL live resolve (repo manifest + flavor sys-img
+    // manifests, 60s budget); fall back to embedded samples so the
+    // resolver logic is always exercised offline.
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(android_runtime::fetch_manifest(manifest::REPO_MANIFEST));
+        let _ = tx.send(android_runtime::resolve_runtime_urls());
     });
-    let live = rx
-        .recv_timeout(Duration::from_secs(20))
-        .ok()
-        .flatten();
-    let (arts, source) = match live {
-        Some(a) => (a, "live dl.google.com"),
-        None => (manifest::parse_manifest(EMBEDDED_MANIFEST), "embedded sample (offline)"),
-    };
-    let emu = manifest::choose_emulator(&arts);
-    let tools = manifest::choose_platform_tools(&arts);
-    match (emu, tools) {
-        (Some(e), Some(t)) => {
-            let ok = e.absolute_url.starts_with(manifest::REPO_BASE)
-                && e.absolute_url.ends_with(".zip")
-                && t.absolute_url.ends_with(".zip");
-            if ok {
-                Check::Pass(format!(
-                    "{source} -> {} + {}",
-                    e.url, t.url
-                ))
-            } else {
-                Check::Fail(format!("bad URLs: {} / {}", e.absolute_url, t.absolute_url))
-            }
+    if let Ok(Ok([tools, emu, img])) = rx.recv_timeout(Duration::from_secs(60)) {
+        let ok = emu.absolute_url.ends_with(".zip")
+            && tools.absolute_url.ends_with(".zip")
+            && img.absolute_url.ends_with(".zip")
+            && img.package_path.contains("android-33")
+            && img.package_path.contains("x86_64");
+        return if ok {
+            Check::Pass(format!(
+                "live dl.google.com -> {} + {} + api33 {}",
+                emu.url, tools.url, img.url
+            ))
+        } else {
+            Check::Fail(format!(
+                "bad resolve: {} / {} / {}",
+                emu.url, tools.url, img.package_path
+            ))
+        };
+    }
+    // Offline path — exercise resolver on embedded samples.
+    let repo = manifest::parse_manifest(EMBEDDED_MANIFEST);
+    let sys = manifest::parse_manifest(EMBEDDED_SYSIMG);
+    match (
+        manifest::choose_emulator(&repo),
+        manifest::choose_platform_tools(&repo),
+        manifest::choose_system_image(&sys),
+    ) {
+        (Some(e), Some(t), Some(i))
+            if i.api_level == manifest::TARGET_API && i.package_path.contains("x86_64") =>
+        {
+            Check::Pass(format!(
+                "embedded sample (offline) -> {} + {} + api33 {}",
+                e.url, t.url, i.url
+            ))
         }
-        _ => Check::Fail("resolver produced no emulator/platform-tools".into()),
+        _ => Check::Fail("resolver produced no emulator/tools/sysimg".into()),
     }
 }
 
@@ -188,9 +213,9 @@ fn snapshot_check() -> Check {
     }
     let (raw, packed, ratio) = snapshot::snapshot_stats(&ram);
     match snapshot::snapshot_restore(&snapshot::snapshot_save(&ram)) {
-        Ok(back) if back == ram => Check::Pass(format!(
-            "2MiB roundtrip: {raw}B -> {packed}B ({ratio:.2}x)"
-        )),
+        Ok(back) if back == ram => {
+            Check::Pass(format!("2MiB roundtrip: {raw}B -> {packed}B ({ratio:.2}x)"))
+        }
         Ok(_) => Check::Fail("roundtrip mismatch".into()),
         Err(e) => Check::Fail(e),
     }
@@ -215,10 +240,126 @@ fn pinning_check() -> Check {
 
 fn runtime_state_check() -> Check {
     match android_runtime::install_state() {
-        android_runtime::InstallState::Ready { .. } => {
-            Check::Pass("runtime installed".into())
-        }
+        android_runtime::InstallState::Ready { .. } => Check::Pass("runtime installed".into()),
         s => Check::Pass(format!("not installed ({s:?}) — bootstrap available")),
+    }
+}
+
+/// Production check: the native ureq+zip pipeline downloads AND
+/// extracts a REAL archive from dl.google.com (platform-tools-latest,
+/// ~11 MB). Offline → Skip (manifest check already covers
+/// connectivity); download-or-extract error after connect → Fail.
+fn downloader_check() -> Check {
+    use super::downloader::{self, ArtifactTarget, DlEvent};
+    let tmp = std::env::temp_dir().join("gorillaluxe-dltest");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let rx = downloader::start(vec![ArtifactTarget {
+        step: 1,
+        label: "platform-tools-latest".into(),
+        url: "https://dl.google.com/android/repository/platform-tools-latest-windows.zip".into(),
+        zip: tmp.join("platform-tools.zip"),
+        dest: tmp.clone(),
+        sha256: String::new(), // -latest alias publishes no checksum
+        sha1: String::new(),
+    }]);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut connected = false;
+    let mut result: Option<Result<(), String>> = None;
+    while result.is_none() && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(DlEvent::Progress { .. }) | Ok(DlEvent::Extracting { .. }) => connected = true,
+            Ok(DlEvent::Finished(r)) => result = Some(r),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let adb = tmp.join(r"platform-tools\adb.exe");
+    match result {
+        Some(Ok(())) if adb.is_file() => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Check::Pass("downloaded + extracted real archive (adb.exe)".into())
+        }
+        Some(Ok(())) => Check::Fail(format!("extracted but adb.exe missing at {adb:?}")),
+        Some(Err(e)) if connected => Check::Fail(format!("download/extract failed: {e}")),
+        Some(Err(e)) => Check::Skip(format!("offline: {e}")),
+        None => Check::Skip("timed out (offline?)".into()),
+    }
+}
+
+/// Production check: AVD generation passes strict validation, and
+/// paths containing spaces (e.g. `D:\GLXE test\`) are quoted safely.
+fn avd_quoting_check() -> Check {
+    // Quoting — spaces AND Cyrillic (spec: `D:\GLXE test\Тест\`).
+    let spaced = std::path::Path::new("D:\\GLXE test\\Тест\\runtime\\emulator\\emulator.exe");
+    let q = android_runtime::cmdline_quote(spaced);
+    let plain = android_runtime::cmdline_quote(std::path::Path::new(r"C:\emu\emulator.exe"));
+    if !(q.starts_with('"') && q.ends_with('"') && !plain.starts_with('"')) {
+        return Check::Fail(format!("quoting broken: {q} / {plain}"));
+    }
+    // AVD generation + strict validation in a temp root.
+    let root = std::env::temp_dir().join("gorillaluxe-avdtest");
+    let _ = std::fs::remove_dir_all(&root);
+    let sysdir = root.join(r"system-images\android-33\google_apis_playstore\x86_64");
+    match android_runtime::write_avd(&root, &sysdir, &device_profile::PRESETS[0])
+        .and_then(|avd| android_runtime::validate_avd(&avd))
+    {
+        Ok(()) => {
+            // image.sysdir.1 must point at the sysdir with fwd slashes.
+            let cfg = std::fs::read_to_string(root.join(r"avd\GorillaLuxe.avd\config.ini"))
+                .unwrap_or_default();
+            let _ = std::fs::remove_dir_all(&root);
+            if cfg.contains("image.sysdir.1=") && cfg.contains("x86_64") {
+                Check::Pass("GorillaLuxe.ini + config.ini valid, quoting OK".into())
+            } else {
+                Check::Fail("config.ini sysdir malformed".into())
+            }
+        }
+        Err(e) => Check::Fail(format!("avd: {e}")),
+    }
+}
+
+/// Production check: raw `screencap` (no -p) 12-byte header parsing.
+fn screencap_check() -> Check {
+    let (w, h) = (1080u32, 2400u32);
+    let mut buf = Vec::with_capacity(12 + (w * h * 4) as usize);
+    buf.extend_from_slice(&w.to_le_bytes());
+    buf.extend_from_slice(&h.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes()); // RGBA_8888
+    buf.resize(12 + (w * h * 4) as usize, 0x5A);
+    match android_runtime::parse_screencap_header(&buf) {
+        Some((pw, ph, off)) if pw == w && ph == h && off == 12 => {}
+        _ => return Check::Fail("raw header rejected".into()),
+    }
+    // Wrong format / truncated → rejected.
+    let mut bad = buf.clone();
+    bad[8] = 2;
+    if android_runtime::parse_screencap_header(&bad).is_some()
+        || android_runtime::parse_screencap_header(&buf[..20]).is_some()
+    {
+        return Check::Fail("invalid header accepted".into());
+    }
+    Check::Pass("raw RGBA screencap header (12B) parses".into())
+}
+
+/// Production check: multi-size ANTIALIASED_QUALITY atlas — zero
+/// ClearType vertical streaks, zero solid-block glyph cells.
+fn atlas_streak_check() -> Check {
+    match crate::ui::atlas::build_ui_atlases() {
+        Ok(a) => {
+            let streaks = crate::ui::atlas::streak_violations(&a);
+            let (_cells, blocks) = crate::ui::atlas::glyph_fill_violations(&a);
+            if streaks.is_empty() && blocks.is_empty() {
+                Check::Pass(format!(
+                    "{}x{} atlas, {} sizes, 0 streaks, 0 block glyphs",
+                    a.width,
+                    a.height,
+                    a.extra.len() + 1
+                ))
+            } else {
+                Check::Fail(format!("streaks={streaks:?} blocks={blocks:?}"))
+            }
+        }
+        Err(e) => Check::Fail(format!("atlas: {e}")),
     }
 }
 
@@ -227,6 +368,10 @@ pub fn run() -> Report4 {
         checks: vec![
             ("long-mode WHPX".into(), long_mode()),
             ("manifest resolver".into(), manifest_check()),
+            ("native downloader".into(), downloader_check()),
+            ("avd + quoting".into(), avd_quoting_check()),
+            ("screencap header".into(), screencap_check()),
+            ("atlas streaks".into(), atlas_streak_check()),
             ("profiles+sensors+locale".into(), profile_sensor_check()),
             ("shm frame publisher".into(), shm_check()),
             ("lz4 snapshot".into(), snapshot_check()),

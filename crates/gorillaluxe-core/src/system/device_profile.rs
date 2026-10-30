@@ -45,7 +45,8 @@ pub const ROG7: DeviceProfile = DeviceProfile {
     device: "AI2205",
     board: "kalama",
     hardware: "qcom",
-    fingerprint: "asus/WW_AI2205/ASUS_AI2205_A:13/TKQ1.221013.002/33.0820.0810.17:user/release-keys",
+    fingerprint:
+        "asus/WW_AI2205/ASUS_AI2205_A:13/TKQ1.221013.002/33.0820.0810.17:user/release-keys",
     dpi: 480,
     mac_address: "04:92:26:A5:22:0A",
     soc: "Snapdragon 8 Gen 2",
@@ -75,7 +76,9 @@ fn valid_mac(p: &DeviceProfile) -> String {
         m.to_string()
     } else {
         // Deterministic fallback from the device name.
-        let h: u64 = m.bytes().fold(0xC0FFEE, |a, b| a.wrapping_mul(33).wrapping_add(b as u64));
+        let h: u64 = m
+            .bytes()
+            .fold(0xC0FFEE, |a, b| a.wrapping_mul(33).wrapping_add(b as u64));
         format!(
             "02:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
             (h >> 32) & 0xFF,

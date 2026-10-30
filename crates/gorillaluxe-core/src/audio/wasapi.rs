@@ -50,14 +50,7 @@ impl AudioOutput {
             // Try the requested 10 ms period first, then fall back to
             // the engine's minimum supported device period.
             let mut period = PERIOD_HNS;
-            let init = client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                0,
-                period,
-                0,
-                fmt,
-                None,
-            );
+            let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, period, 0, fmt, None);
             if init.is_err() {
                 let mut min = 0i64;
                 client
@@ -89,6 +82,10 @@ impl AudioOutput {
 
     /// Start the stream (guest audio frames arrive later phases).
     pub fn start(&self) -> Result<(), String> {
-        unsafe { self.client.Start().map_err(|e| format!("IAudioClient::Start: {e}")) }
+        unsafe {
+            self.client
+                .Start()
+                .map_err(|e| format!("IAudioClient::Start: {e}"))
+        }
     }
 }

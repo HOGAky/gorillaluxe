@@ -61,17 +61,12 @@ impl ShmPublisher {
                 let _ = CloseHandle(map);
                 return Err("MapViewOfFile failed".into());
             }
-            let event = CreateEventW(
-                None,
-                false,
-                false,
-                PCWSTR(wide(&event_name).as_ptr()),
-            )
-            .map_err(|e| {
-                let _ = UnmapViewOfFile(view);
-                let _ = CloseHandle(map);
-                format!("CreateEventW: {e}")
-            })?;
+            let event = CreateEventW(None, false, false, PCWSTR(wide(&event_name).as_ptr()))
+                .map_err(|e| {
+                    let _ = UnmapViewOfFile(view);
+                    let _ = CloseHandle(map);
+                    format!("CreateEventW: {e}")
+                })?;
             Ok(ShmPublisher {
                 map,
                 event,
@@ -136,27 +131,19 @@ impl ShmReader {
         let map_name = format!("Global\\GorillaLuxe_Frame_{id}");
         let event_name = format!("Global\\GorillaLuxe_Event_{id}");
         unsafe {
-            let map = OpenFileMappingW(
-                FILE_MAP_READ.0,
-                false,
-                PCWSTR(wide(&map_name).as_ptr()),
-            )
-            .map_err(|e| format!("OpenFileMappingW: {e}"))?;
+            let map = OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(wide(&map_name).as_ptr()))
+                .map_err(|e| format!("OpenFileMappingW: {e}"))?;
             let view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, FRAME_HEADER + payload_bytes);
             if view.Value.is_null() {
                 let _ = CloseHandle(map);
                 return Err("MapViewOfFile(read) failed".into());
             }
-            let event = OpenEventW(
-                EVENT_ALL_ACCESS,
-                false,
-                PCWSTR(wide(&event_name).as_ptr()),
-            )
-            .map_err(|e| {
-                let _ = UnmapViewOfFile(view);
-                let _ = CloseHandle(map);
-                format!("OpenEventW: {e}")
-            })?;
+            let event = OpenEventW(EVENT_ALL_ACCESS, false, PCWSTR(wide(&event_name).as_ptr()))
+                .map_err(|e| {
+                    let _ = UnmapViewOfFile(view);
+                    let _ = CloseHandle(map);
+                    format!("OpenEventW: {e}")
+                })?;
             Ok(ShmReader {
                 map,
                 event,

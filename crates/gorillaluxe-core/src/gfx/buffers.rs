@@ -16,7 +16,8 @@ use super::{hr, GResult};
 pub fn write_upload(buf: &ID3D12Resource, data: &[u8]) -> GResult<()> {
     unsafe {
         let mut ptr = std::ptr::null_mut();
-        buf.Map(0, None, Some(&mut ptr)).map_err(|e| hr("Map(upload)", e))?;
+        buf.Map(0, None, Some(&mut ptr))
+            .map_err(|e| hr("Map(upload)", e))?;
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
         Ok(())
     }
@@ -54,7 +55,10 @@ pub fn tex_desc(
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
         Flags: flags,
     }
@@ -69,7 +73,10 @@ pub fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: DXGI_FORMAT_UNKNOWN,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: D3D12_RESOURCE_FLAG_NONE,
     }
@@ -155,10 +162,7 @@ where
 
 /// Zero-copy import: open a shared NT handle as a device object.
 /// No pixel data crosses the CPU (spec §2.1 step 4).
-pub fn open_shared_handle<T: windows::core::Interface>(
-    dx: &Dx12,
-    handle: HANDLE,
-) -> GResult<T> {
+pub fn open_shared_handle<T: windows::core::Interface>(dx: &Dx12, handle: HANDLE) -> GResult<T> {
     unsafe {
         let mut res: Option<T> = None;
         dx.device
@@ -229,7 +233,9 @@ pub fn upload_texture(
         let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
             pResource: ManuallyDrop::new(Some(dst.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
         };
         let src_loc = D3D12_TEXTURE_COPY_LOCATION {
             pResource: ManuallyDrop::new(Some(upload.clone())),
@@ -301,7 +307,9 @@ pub fn read_texture_rgba(
         let src_loc = D3D12_TEXTURE_COPY_LOCATION {
             pResource: ManuallyDrop::new(Some(src.clone())),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
         };
         list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
         dx.submit_wait(&list)?;
@@ -309,8 +317,12 @@ pub fn read_texture_rgba(
         super::count_verification_bytes((w as u64) * (h as u64) * 4);
 
         let mut ptr: *mut c_void = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: total as usize };
-        rb.Map(0, Some(&range), Some(&mut ptr)).map_err(|e| hr("Map(readback)", e))?;
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: total as usize,
+        };
+        rb.Map(0, Some(&range), Some(&mut ptr))
+            .map_err(|e| hr("Map(readback)", e))?;
         let pitch = footprint.Footprint.RowPitch as usize;
         let mut out = vec![0u8; (w * h * 4) as usize];
         for row in 0..h as usize {

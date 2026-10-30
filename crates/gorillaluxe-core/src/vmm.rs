@@ -66,14 +66,7 @@ struct GuestMemory {
 
 impl GuestMemory {
     fn alloc(size: usize) -> Result<Self, VmError> {
-        let ptr = unsafe {
-            VirtualAlloc(
-                None,
-                size,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        };
+        let ptr = unsafe { VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         if ptr.is_null() {
             return Err(VmError::Memory("VirtualAlloc failed".into()));
         }
@@ -174,12 +167,14 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
             guest::SMOKE_PAYLOAD.len(),
         );
     }
-    part.map_gpa_range(
-        mem.ptr,
-        0,
-        mem.size as u32,
-        WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
-    )?;
+    unsafe {
+        part.map_gpa_range(
+            mem.ptr,
+            0,
+            mem.size as u32,
+            WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
+        )?;
+    }
 
     const VP: u32 = 0;
     part.create_vcpu(VP)?;
@@ -222,7 +217,10 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
             let next_rip = exit.VpContext.Rip + io.InstructionByteCount as u64;
             part.set_registers(VP, &[WHvX64RegisterRip], &[reg64(next_rip)])?;
         } else if reason == WHvRunVpExitReasonX64Halt {
-            trace.push(format!("reason={} HLT rip=0x{:X}", reason.0, exit.VpContext.Rip));
+            trace.push(format!(
+                "reason={} HLT rip=0x{:X}",
+                reason.0, exit.VpContext.Rip
+            ));
             halted = true;
             break;
         } else if reason == WHvRunVpExitReasonMemoryAccess {
@@ -275,8 +273,7 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
         )
     };
     let mailbox_ok = mailbox == guest::MAGIC_MSG;
-    let regs_ok =
-        rax == guest::MAGIC_REG && rsi == guest::MAGIC_SI && rdi == guest::MAGIC_DI;
+    let regs_ok = rax == guest::MAGIC_REG && rsi == guest::MAGIC_SI && rdi == guest::MAGIC_DI;
 
     let text = String::from_utf8_lossy(mailbox);
     if regs_ok && mailbox_ok {

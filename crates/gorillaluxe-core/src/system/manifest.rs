@@ -8,7 +8,21 @@
 
 pub const REPO_BASE: &str = "https://dl.google.com/android/repository/";
 pub const REPO_MANIFEST: &str = "repository2-1.xml";
-pub const SYSIMG_MANIFEST: &str = "sys-img2-1.xml";
+
+/// System-image manifests live under flavor subdirectories (the
+/// flat `sys-img2-1.xml` path at the repository root is a 404).
+/// Ordered by preference: Play Store > Google APIs > AOSP default.
+pub const SYSIMG_MANIFESTS: &[(&str, &str)] = &[
+    (
+        "google_apis_playstore",
+        "sys-img/google_apis_playstore/sys-img2-1.xml",
+    ),
+    ("google_apis", "sys-img/google_apis/sys-img2-1.xml"),
+    ("android", "sys-img/android/sys-img2-1.xml"),
+];
+
+/// Android 13 = API 33 — the Phase-4 target.
+pub const TARGET_API: u32 = 33;
 
 /// One downloadable archive resolved from a manifest.
 #[derive(Debug, Clone)]
@@ -26,6 +40,21 @@ pub struct Artifact {
     pub size: u64,
     /// `api-level` attribute when present (system images only).
     pub api_level: u32,
+    /// `<checksum type="sha256">` hex (empty when absent).
+    pub sha256: String,
+    /// `<checksum type="sha1">` hex fallback.
+    pub sha1: String,
+}
+
+/// `<checksum type="sha256">hex</checksum>` inside one archive block —
+/// Google emits sha256 for newer packages, sha1 for legacy.
+fn checksum_of(arch: &str, kind: &str) -> Option<String> {
+    let open = format!("<checksum type=\"{kind}\">");
+    arch.split(&open)
+        .nth(1)
+        .and_then(|s| s.split("</checksum>").next())
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
 }
 
 fn attr(tag: &str, name: &str) -> String {
@@ -104,6 +133,8 @@ pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
                 url,
                 size,
                 api_level: api,
+                sha256: checksum_of(arch, "sha256").unwrap_or_default(),
+                sha1: checksum_of(arch, "sha1").unwrap_or_default(),
             });
         }
     }
@@ -114,9 +145,7 @@ pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
 /// filter) with URL-level fallbacks (`-win.zip` for platform-tools,
 /// `windows_x64` for the emulator).
 fn is_windows(a: &Artifact) -> bool {
-    a.host_os == "windows"
-        || a.url.contains("windows")
-        || a.url.ends_with("-win.zip")
+    a.host_os == "windows" || a.url.contains("windows") || a.url.ends_with("-win.zip")
 }
 
 /// Pick the Windows x64 headless emulator package.
@@ -127,27 +156,41 @@ pub fn choose_emulator(arts: &[Artifact]) -> Option<Artifact> {
         .cloned()
 }
 
-/// Pick the best Android x86_64 system image with ARM64 translation:
-/// prefer the highest API level offering an x86_64 flavor.
+/// Pick the best Android x86_64 system image with ARM64 translation
+/// inside ONE flavor's manifest: prefer the target API (Android 13),
+/// else the highest available.
 pub fn choose_system_image(arts: &[Artifact]) -> Option<Artifact> {
-    arts.iter()
+    choose_image_api(arts, TARGET_API)
+}
+
+/// API-preferring variant — `pref==0` means "highest available".
+pub fn choose_image_api(arts: &[Artifact], pref: u32) -> Option<Artifact> {
+    let pool: Vec<&Artifact> = arts
+        .iter()
         .filter(|a| {
             a.package_path.contains("system-images;android-")
                 && a.package_path.contains(";x86_64")
                 && a.url.ends_with(".zip")
         })
-        .max_by_key(|a| a.api_level)
-        .cloned()
+        .collect();
+    if pref > 0 {
+        if let Some(a) = pool
+            .iter()
+            .filter(|a| a.api_level == pref)
+            .max_by_key(|a| a.size)
+        {
+            return Some((*a).clone());
+        }
+    }
+    pool.into_iter().max_by_key(|a| a.api_level).cloned()
 }
 
 /// Pick the Windows platform-tools package (adb.exe) — Google names
 /// it `platform-tools_r*-win.zip`, not `windows`.
 pub fn choose_platform_tools(arts: &[Artifact]) -> Option<Artifact> {
     arts.iter()
-        .filter(|a| a.package_path == "platform-tools" && is_windows(a) && a.url.ends_with(".zip"))
+        .find(|a| a.package_path == "platform-tools" && is_windows(a) && a.url.ends_with(".zip"))
         .cloned()
-        .into_iter()
-        .next()
 }
 
 #[cfg(test)]
@@ -225,10 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn prefers_highest_api() {
+    fn prefers_target_api_then_highest() {
         let a = parse_manifest(IMG);
+        // TARGET_API (33) present → wins over the newer 34 image.
         let img = choose_system_image(&a).unwrap();
-        assert_eq!(img.api_level, 34);
+        assert_eq!(img.api_level, TARGET_API);
         assert!(img.package_path.contains("x86_64"));
+        // Ask for an absent API → falls back to highest.
+        let img2 = choose_image_api(&a, 99).unwrap();
+        assert_eq!(img2.api_level, 34);
     }
 }

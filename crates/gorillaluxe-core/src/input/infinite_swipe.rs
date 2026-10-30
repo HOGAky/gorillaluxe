@@ -18,7 +18,10 @@ enum State {
     Idle,
     Tracking,
     /// Released at `at_tick`; re-touch + apply `carry` on tick > at_tick.
-    PendingReset { carry: (f32, f32), at_tick: u64 },
+    PendingReset {
+        carry: (f32, f32),
+        at_tick: u64,
+    },
 }
 
 pub struct InfiniteSwipe {
@@ -70,7 +73,8 @@ impl InfiniteSwipe {
         self.x = self.x0;
         self.y = self.y0;
         self.state = State::Tracking;
-        self.touch.touch_down(SLOT, self.x as i32, self.y as i32, tick);
+        self.touch
+            .touch_down(SLOT, self.x as i32, self.y as i32, tick);
         self.touch.drain()
     }
 
@@ -90,7 +94,8 @@ impl InfiniteSwipe {
             if tick > at_tick {
                 // Spec step 3: new TRACKING_ID at anchor on the next 1 ms
                 // tick, then apply the carried-over delta.
-                self.touch.touch_down(SLOT, self.x0 as i32, self.y0 as i32, tick);
+                self.touch
+                    .touch_down(SLOT, self.x0 as i32, self.y0 as i32, tick);
                 self.last_reset_gap = tick - at_tick;
                 self.x = self.x0;
                 self.y = self.y0;
@@ -118,7 +123,10 @@ impl InfiniteSwipe {
             self.x = bx;
             self.y = by;
             self.reset_count += 1;
-            self.state = State::PendingReset { carry: (nx - bx, ny - by), at_tick: tick };
+            self.state = State::PendingReset {
+                carry: (nx - bx, ny - by),
+                at_tick: tick,
+            };
         } else {
             self.touch.touch_move(SLOT, nx as i32, ny as i32);
             self.x = nx;
@@ -149,11 +157,18 @@ mod tests {
         let mut resets = 0;
         for t in 1..=200u64 {
             let ev = s.feed(60.0, 0.0, t);
-            if ev.iter().any(|e| e.code == ABS_MT_TRACKING_ID && e.value == TRACKING_ID_RELEASE) {
+            if ev
+                .iter()
+                .any(|e| e.code == ABS_MT_TRACKING_ID && e.value == TRACKING_ID_RELEASE)
+            {
                 resets += 1;
             }
         }
         assert!(resets > 0);
-        assert!(s.last_reset_gap <= 2, "slot reset took {} ticks", s.last_reset_gap);
+        assert!(
+            s.last_reset_gap <= 2,
+            "slot reset took {} ticks",
+            s.last_reset_gap
+        );
     }
 }

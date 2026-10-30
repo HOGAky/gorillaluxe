@@ -50,7 +50,7 @@ impl Lang {
 }
 
 /// Translate `key` for `lang`. Falls back to English, then to the key itself.
-pub fn tr<'a>(lang: Lang, key: &'a str) -> &'a str {
+pub fn tr(lang: Lang, key: &str) -> &str {
     let pair = STRINGS.iter().find(|(k, _, _)| *k == key);
     match (lang, pair) {
         (_, Some((_, en, _))) if lang == Lang::En => en,
@@ -122,6 +122,16 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("ui.onboard.ready", "Android environment ready", "Среда Android готова"),
     ("ui.onboard.downloading", "Downloading Android 13 Environment...",
      "Загрузка среды Android 13..."),
+    ("ui.onboard.extracting", "Extracting archives...",
+     "Распаковка архивов..."),
+    ("ui.onboard.verifying", "Verifying SHA-256 checksums...",
+     "Проверка контрольных сумм SHA-256..."),
+    ("ui.onboard.avd", "Creating GorillaLuxe AVD...",
+     "Создание AVD GorillaLuxe..."),
+    ("ui.onboard.starting", "Starting headless engine...",
+     "Запуск фонового движка..."),
+    ("ui.onboard.failed", "Setup failed", "Ошибка установки"),
+    ("ui.onboard.retry", "Retry Download", "Повторить загрузку"),
     ("cli.setup_android", "Setting up Android runtime (emulator + system image)...",
      "Установка среды Android (эмулятор + образ системы)..."),
 ];
@@ -142,7 +152,10 @@ mod tests {
     fn lang_codes() {
         assert_eq!(Lang::from_code("RU"), Some(Lang::Ru));
         assert_eq!(Lang::from_code("en"), Some(Lang::En));
-        assert_eq!(tr(Lang::Ru, "app.tagline"), "Высокопроизводительная виртуализация Android");
+        assert_eq!(
+            tr(Lang::Ru, "app.tagline"),
+            "Высокопроизводительная виртуализация Android"
+        );
         assert_eq!(tr(Lang::En, "missing.key"), "missing.key");
     }
 }

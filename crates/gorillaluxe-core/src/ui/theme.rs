@@ -1,7 +1,12 @@
 //! "Luxe Dark" design tokens, spec §3.6 — Deep Obsidian + Luxe Amber Gold.
 
 const fn rgba(r: u8, g: u8, b: u8, a: u8) -> [f32; 4] {
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0]
+    [
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ]
 }
 
 /// Background Primary — Deep Obsidian `#0D0E12` (alpha 242/255).
@@ -44,6 +49,8 @@ pub const DOCK_MARGIN: f32 = 8.0;
 // Zone B HUD pill.
 pub const HUD_HEIGHT: f32 = 30.0;
 
-// Font sizes (px): 16 UI, 22 headers (spec §3.5).
-pub const FONT_UI: i32 = 16;
-pub const FONT_HEADER: i32 = 22;
+// Font sizes (px) — production multi-size atlas (spec §3.5):
+// 18px body, 24px headers/titles, 15px HUD.
+pub const FONT_UI: i32 = 18;
+pub const FONT_HEADER: i32 = 24;
+pub const FONT_HUD: i32 = 15;

@@ -74,7 +74,12 @@ impl PatternPass {
                     NodeMask: 0,
                 })
                 .map_err(|e| hr("CreateDescriptorHeap(pattern)", e))?;
-            Ok(PatternPass { root, pso, ambient_pso, heap })
+            Ok(PatternPass {
+                root,
+                pso,
+                ambient_pso,
+                heap,
+            })
         }
     }
 
@@ -102,7 +107,11 @@ impl PatternPass {
             );
             list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             list.SetComputeRootSignature(&self.root);
-            list.SetPipelineState(if ambient { &self.ambient_pso } else { &self.pso });
+            list.SetPipelineState(if ambient {
+                &self.ambient_pso
+            } else {
+                &self.pso
+            });
             list.SetComputeRootDescriptorTable(0, gpu);
             let consts: [u32; 4] = [w, h, 0, 0];
             list.SetComputeRoot32BitConstants(1, 4, consts.as_ptr() as *const _, 0);
@@ -138,6 +147,7 @@ impl PatternPass {
 }
 
 /// Record: transition dst -> UAV, dispatch pattern, back to `after`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_guest_frame(
     dx: &Dx12,
     pass: &PatternPass,
@@ -152,6 +162,7 @@ pub fn render_guest_frame(
 }
 
 /// Record the Luxe Dark ambient backdrop into `dst` (live GUI path).
+#[allow(clippy::too_many_arguments)]
 pub fn render_ambient_frame(
     dx: &Dx12,
     pass: &PatternPass,
@@ -165,6 +176,7 @@ pub fn render_ambient_frame(
     render_frame_impl(dx, pass, list, dst, w, h, before, after, true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_frame_impl(
     dx: &Dx12,
     pass: &PatternPass,

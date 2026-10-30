@@ -36,7 +36,11 @@ pub struct EvDevEvent {
 
 impl EvDevEvent {
     pub const fn new(ev_type: u16, code: u16, value: i32) -> Self {
-        EvDevEvent { ev_type, code, value }
+        EvDevEvent {
+            ev_type,
+            code,
+            value,
+        }
     }
     pub const fn syn() -> Self {
         EvDevEvent::new(EV_SYN, SYN_REPORT, 0)
@@ -59,18 +63,12 @@ impl EvDevEvent {
 }
 
 /// One MT-B contact slot.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MtSlot {
     /// `None` = free; `Some(id)` = active tracking ID.
     pub tracking_id: Option<i32>,
     pub x: i32,
     pub y: i32,
-}
-
-impl Default for MtSlot {
-    fn default() -> Self {
-        MtSlot { tracking_id: None, x: 0, y: 0 }
-    }
 }
 
 /// Multi-touch slot tracker (Type B semantics).
@@ -172,7 +170,9 @@ mod tests {
         t.touch_up(0, 1);
         let ev = t.drain();
         assert!(ev.contains(&EvDevEvent::tracking(TRACKING_ID_RELEASE)));
-        assert!(ev.iter().any(|e| e.code == ABS_MT_TRACKING_ID && e.value > 0));
+        assert!(ev
+            .iter()
+            .any(|e| e.code == ABS_MT_TRACKING_ID && e.value > 0));
         assert_eq!(t.tracking_id_of(0), None);
     }
 }

@@ -78,6 +78,7 @@ impl Composite {
     /// Record CAS: `guest` (NON_PIXEL_SHADER_RESOURCE) -> `out`
     /// (transitioned COMMON/other -> UNORDERED_ACCESS -> PIXEL_SHADER_RESOURCE).
     /// `out_before` is `out`'s current state.
+    #[allow(clippy::too_many_arguments)]
     pub fn sharpen(
         &self,
         dx: &Dx12,
@@ -90,10 +91,21 @@ impl Composite {
         out_before: D3D12_RESOURCE_STATES,
     ) -> GResult<()> {
         unsafe {
-            list.ResourceBarrier(&[barrier(out, out_before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.ResourceBarrier(&[barrier(
+                out,
+                out_before,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
         }
-        self.cas
-            .dispatch(dx, list, guest, out, src_wh, dst_wh, sharpness.clamp(0.0, 1.0))?;
+        self.cas.dispatch(
+            dx,
+            list,
+            guest,
+            out,
+            src_wh,
+            dst_wh,
+            sharpness.clamp(0.0, 1.0),
+        )?;
         unsafe {
             list.ResourceBarrier(&[barrier(
                 out,
@@ -106,6 +118,7 @@ impl Composite {
 
     /// Record: blit sharpened frame + UI instances onto `rt`
     /// (must be in RENDER_TARGET state already).
+    #[allow(clippy::too_many_arguments)]
     pub fn present_frame(
         &self,
         dx: &Dx12,

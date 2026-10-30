@@ -36,7 +36,10 @@ pub fn data_dir() -> PathBuf {
         return PathBuf::from(p).join("GorillaLuxe");
     }
     if let Ok(p) = std::env::var("USERPROFILE") {
-        return PathBuf::from(p).join("AppData").join("Local").join("GorillaLuxe");
+        return PathBuf::from(p)
+            .join("AppData")
+            .join("Local")
+            .join("GorillaLuxe");
     }
     PathBuf::from(".").join("GorillaLuxe")
 }
@@ -62,20 +65,34 @@ impl Config {
     }
 
     pub fn load() -> Config {
+        Self::load_from(&Self::path())
+    }
+
+    /// Load from an explicit path. Malformed/garbage lines are skipped
+    /// line-by-line so a truncated write can never crash startup —
+    /// worst case the user gets defaults (corrupt-file recovery).
+    pub fn load_from(path: &std::path::Path) -> Config {
         // Autodetect first; the saved file overrides below.
-        let mut cfg = Config { lang: detect_os_lang(), ..Default::default() };
-        let Ok(text) = std::fs::read_to_string(Self::path()) else {
+        let mut cfg = Config {
+            lang: detect_os_lang(),
+            ..Default::default()
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
             return cfg;
         };
         for line in text.lines() {
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             match (k.trim(), v.trim()) {
                 ("lang", v) => {
                     if let Some(l) = Lang::from_code(v) {
                         cfg.lang = l;
                     }
                 }
-                ("ci_software_gpu", v) => cfg.ci_software_gpu = v == "1" || v.eq_ignore_ascii_case("true"),
+                ("ci_software_gpu", v) => {
+                    cfg.ci_software_gpu = v == "1" || v.eq_ignore_ascii_case("true")
+                }
                 ("cas_sharpness", v) => {
                     if let Ok(f) = v.parse::<f32>() {
                         cfg.cas_sharpness = f.clamp(0.0, 1.0);
@@ -114,7 +131,18 @@ impl Config {
             self.res_h,
             self.fps_cap
         );
-        std::fs::write(Self::path(), text)
+        // Atomic-ish save: write a temp file, then rename over the
+        // target — a crash mid-write can never leave a truncated
+        // config.cfg. MoveFileEx-without-replace semantics means we
+        // remove the destination first on retry (worst case one
+        // lost save, never a corrupt one).
+        let tmp = Self::path().with_extension("cfg.tmp");
+        std::fs::write(&tmp, text)?;
+        if std::fs::rename(&tmp, Self::path()).is_err() {
+            let _ = std::fs::remove_file(Self::path());
+            std::fs::rename(&tmp, Self::path())?;
+        }
+        Ok(())
     }
 }
 
@@ -127,5 +155,31 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.lang, Lang::En);
         assert!((c.cas_sharpness - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn corrupt_file_recovers_to_defaults() {
+        let p = std::env::temp_dir().join("gorillaluxe-badcfg.cfg");
+        std::fs::write(&p, b"\x00\x01\x02garbage\xFF\xFE===\nlang=zz\nres=-1x0\n").unwrap();
+        let c = Config::load_from(&p);
+        // Bad values rejected → defaults (lang falls back to OS detect).
+        assert!((320..=8192).contains(&c.res_w) && c.res_w == 1920);
+        assert!(c.fps_cap >= 30);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn roundtrip_load_from() {
+        let p = std::env::temp_dir().join("gorillaluxe-goodcfg.cfg");
+        std::fs::write(
+            &p,
+            "lang=en\nfps_cap=240\ncas_sharpness=0.9\nres=2560x1440\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&p);
+        assert_eq!(loaded.fps_cap, 240);
+        assert!((loaded.cas_sharpness - 0.9).abs() < 1e-4);
+        assert_eq!((loaded.res_w, loaded.res_h), (2560, 1440));
+        let _ = std::fs::remove_file(&p);
     }
 }

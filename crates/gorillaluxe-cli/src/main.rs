@@ -172,10 +172,34 @@ fn run_gfx_test(lang: Lang, allow_software: bool) -> i32 {
     println!("{}", tr(lang, "gfx.init"));
     match selftest::run(allow_software) {
         Ok(r) => {
-            println!("{}: {} | {}", tr(lang, "gfx.adapter"), r.host_adapter, if r.is_warp { "WARP" } else { "HW" });
-            println!("{}: {}", tr(lang, "gfx.zerocopy.ok"), tr(lang, "gfx.steady.zero"));
-            println!("{}: SSIM={:.4} non-black={} presented={}", tr(lang, "gfx.cas.ok"), r.ssim, r.nonblack, r.presented);
-            println!("{}: cyr={} glyphs, coverage={}", tr(lang, "gfx.atlas.ok"), r.cyr_glyphs, r.cyr_coverage);
+            println!(
+                "{}: {} | {}",
+                tr(lang, "gfx.adapter"),
+                r.host_adapter,
+                if r.is_warp { "WARP" } else { "HW" }
+            );
+            println!(
+                "{}: {}",
+                tr(lang, "gfx.zerocopy.ok"),
+                tr(lang, "gfx.steady.zero")
+            );
+            println!(
+                "{}: SSIM={:.4} non-black={} presented={}",
+                tr(lang, "gfx.cas.ok"),
+                r.ssim,
+                r.nonblack,
+                r.presented
+            );
+            println!(
+                "{}: cyr={} glyphs, coverage={}",
+                tr(lang, "gfx.atlas.ok"),
+                r.cyr_glyphs,
+                r.cyr_coverage
+            );
+            println!(
+                "glyph cells={} block_bad={} streak_bad={}",
+                r.glyph_cells, r.glyph_fill_bad, r.glyph_streak_bad
+            );
             println!("{}: {:.1} us", tr(lang, "gfx.hotswap.ok"), r.hotswap_us);
             if r.passed() {
                 println!("{}", tr(lang, "selftest.pass"));
@@ -209,7 +233,10 @@ fn run_input_test(lang: Lang) -> i32 {
     );
     println!("keymap.json roundtrip: {}", r.keymap_roundtrip);
     if r.wasapi_ready {
-        println!("WASAPI shared mode: ready ({} | period {:.1} ms)", r.wasapi_detail, r.wasapi_period_ms);
+        println!(
+            "WASAPI shared mode: ready ({} | period {:.1} ms)",
+            r.wasapi_detail, r.wasapi_period_ms
+        );
     } else {
         println!("WASAPI shared mode: fallback ({})", r.wasapi_detail);
     }
@@ -239,12 +266,16 @@ fn run_phase4_test(lang: Lang) -> i32 {
 /// resumable downloader synchronously (CLI mode).
 fn run_setup_android(lang: Lang) -> i32 {
     println!("{}", tr(lang, "cli.setup_android"));
-    match android_runtime::install_state() {
-        android_runtime::InstallState::Ready { emulator, sysimg, .. } => {
-            println!("already installed: {} | {}", emulator.display(), sysimg.display());
-            return 0;
-        }
-        _ => {}
+    if let android_runtime::InstallState::Ready {
+        emulator, sysimg, ..
+    } = android_runtime::install_state()
+    {
+        println!(
+            "already installed: {} | {}",
+            emulator.display(),
+            sysimg.display()
+        );
+        return 0;
     }
     match android_runtime::resolve_runtime_urls() {
         Ok(urls) => {
@@ -252,24 +283,55 @@ fn run_setup_android(lang: Lang) -> i32 {
                 println!("  -> {}", a.absolute_url);
             }
             match android_runtime::DownloadJob::start(&urls) {
-                Ok(mut job) => {
-                    let mut last = 0u64;
-                    while job.alive() {
-                        let (done, total) = job.progress();
-                        if done != last {
-                            print!("\r  {:.1} / {:.1} MB   ", done as f64 / 1048576.0, total as f64 / 1048576.0);
-                            last = done;
+                Ok(job) => {
+                    use gorillaluxe_core::system::downloader::DlEvent;
+                    let mut done_all: Option<Result<(), String>> = None;
+                    while done_all.is_none() {
+                        for ev in job.poll() {
+                            match ev {
+                                DlEvent::Step { step, of, label } => {
+                                    println!("\n[{step}/{of}] {label}");
+                                }
+                                DlEvent::Progress {
+                                    done,
+                                    total,
+                                    speed_bps,
+                                } => {
+                                    print!(
+                                        "\r  {:.1} / {:.1} MB ({:.1} MB/s)   ",
+                                        done as f64 / 1048576.0,
+                                        total as f64 / 1048576.0,
+                                        speed_bps / 1048576.0
+                                    );
+                                }
+                                DlEvent::Verifying { label } => {
+                                    println!("\n  verifying {label}...");
+                                }
+                                DlEvent::Extracting { label } => {
+                                    println!("\n  extracting {label}...");
+                                }
+                                DlEvent::Log(l) => println!("  {l}"),
+                                DlEvent::Finished(r) => done_all = Some(r),
+                            }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        std::thread::sleep(std::time::Duration::from_millis(120));
                     }
                     println!();
-                    match (job.finished_ok(), android_runtime::install_state()) {
-                        (Some(true), android_runtime::InstallState::Ready { .. }) => {
+                    match (done_all, android_runtime::install_state()) {
+                        (Some(Ok(())), android_runtime::InstallState::Ready { .. }) => {
                             println!("{}", tr(lang, "ui.onboard.ready"));
                             0
                         }
-                        _ => {
-                            eprintln!("download finished but runtime incomplete");
+                        (Some(Err(e)), _) => {
+                            eprintln!("download failed: {e}");
+                            1
+                        }
+                        (_, st) => {
+                            let m = match st {
+                                android_runtime::InstallState::Partial(m) => m,
+                                _ => "unknown".into(),
+                            };
+                            eprintln!("download finished but runtime incomplete: {m}");
                             1
                         }
                     }

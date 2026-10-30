@@ -34,8 +34,12 @@ impl Dx12 {
 
             // Hardware adapters first (always preferred).
             for i in 0..32u32 {
-                let Ok(adapter) = factory.EnumAdapters1(i) else { break };
-                let Ok(desc) = adapter.GetDesc1() else { continue };
+                let Ok(adapter) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
                     continue;
                 }
@@ -56,8 +60,9 @@ impl Dx12 {
                 }
             }
 
-            let (adapter, desc, is_warp) = chosen
-                .ok_or_else(|| "no usable D3D12 adapter (need HW GPU or --ci-software-gpu)".to_string())?;
+            let (adapter, desc, is_warp) = chosen.ok_or_else(|| {
+                "no usable D3D12 adapter (need HW GPU or --ci-software-gpu)".to_string()
+            })?;
             let device = Self::try_device(&adapter)
                 .ok_or_else(|| "D3D12CreateDevice failed on chosen adapter".to_string())?;
 

@@ -42,11 +42,10 @@ pub fn compile(src: &str, entry: &'static str, target: &'static str) -> GResult<
     }
     let blob = code.ok_or_else(|| "D3DCompile returned no code".to_string())?;
     unsafe {
-        Ok(std::slice::from_raw_parts(
-            blob.GetBufferPointer() as *const u8,
-            blob.GetBufferSize(),
+        Ok(
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
+                .to_vec(),
         )
-        .to_vec())
     }
 }
 

@@ -43,7 +43,9 @@ pub fn reset_steady_state_counter() {
 
 #[allow(dead_code)] // hot path must never call this — spec metric stays 0
 pub(crate) fn count_steady_state_bytes(n: u64) {
-    STATS.steady_state_cpu_copy_bytes.fetch_add(n, Ordering::SeqCst);
+    STATS
+        .steady_state_cpu_copy_bytes
+        .fetch_add(n, Ordering::SeqCst);
 }
 
 pub(crate) fn count_verification_bytes(n: u64) {

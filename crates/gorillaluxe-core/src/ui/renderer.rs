@@ -105,7 +105,10 @@ impl BlitPass {
                         NumRenderTargets: 1,
                         RTVFormats: rtv_fmt,
                         DSVFormat: DXGI_FORMAT_UNKNOWN,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
                         ..Default::default()
                     },
                 )
@@ -119,7 +122,11 @@ impl BlitPass {
                     NodeMask: 0,
                 })
                 .map_err(|e| hr("CreateDescriptorHeap(blit)", e))?;
-            Ok(BlitPass { root, pso, srv_heap })
+            Ok(BlitPass {
+                root,
+                pso,
+                srv_heap,
+            })
         }
     }
 
@@ -171,7 +178,7 @@ impl BlitPass {
                 right: w as i32,
                 bottom: h as i32,
             }]);
-            list.OMSetRenderTargets(1, Some(&rtv), false.into(), None);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.SetGraphicsRootDescriptorTable(0, gpu);
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             list.DrawInstanced(3, 1, 0, 0);
@@ -221,7 +228,10 @@ impl UiRenderer {
                         NumRenderTargets: 1,
                         RTVFormats: rtv_fmt,
                         DSVFormat: DXGI_FORMAT_UNKNOWN,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
                         ..Default::default()
                     },
                 )
@@ -285,10 +295,18 @@ impl UiRenderer {
                         },
                     },
                 }),
-                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + incr },
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: base.ptr + incr,
+                },
             );
 
-            Ok(UiRenderer { root, pso, srv_heap, inst_buf, _atlas_tex: atlas_tex })
+            Ok(UiRenderer {
+                root,
+                pso,
+                srv_heap,
+                inst_buf,
+                _atlas_tex: atlas_tex,
+            })
         }
     }
 
@@ -304,7 +322,11 @@ impl UiRenderer {
         h: u32,
     ) -> GResult<()> {
         if instances.len() > INST_CAP {
-            return Err(format!("too many UI instances: {} > {}", instances.len(), INST_CAP));
+            return Err(format!(
+                "too many UI instances: {} > {}",
+                instances.len(),
+                INST_CAP
+            ));
         }
         unsafe {
             write_upload(
@@ -353,7 +375,7 @@ impl UiRenderer {
                 right: w as i32,
                 bottom: h as i32,
             }]);
-            list.OMSetRenderTargets(1, Some(&rtv), false.into(), None);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
             let scr: [f32; 2] = [w as f32, h as f32];
             list.SetGraphicsRoot32BitConstants(1, 2, scr.as_ptr() as *const _, 0);
             list.SetGraphicsRootDescriptorTable(0, gpu0);
