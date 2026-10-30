@@ -162,7 +162,7 @@ mod tests {
             let s = p.props_script();
             assert!(s.contains("ro.product.model") && s.contains("ro.sf.lcd_density"));
         }
-        let (a, b) = binfmt_descriptors();
+        let [a, b] = binfmt_descriptors();
         assert!(a.contains("aarch64") && b.contains("armv7l"));
         let (loc_ru, _) = locale_sync_cmds(Lang::Ru);
         assert!(loc_ru.contains("ru-RU"));

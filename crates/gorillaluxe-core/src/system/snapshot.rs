@@ -39,9 +39,11 @@ mod tests {
         for b in ram.iter_mut().skip(512 * 1024) {
             *b = 0;
         }
-        let (raw, packed, ratio) = snapshot_stats(&ram);
+        let packed = snapshot_save(&ram);
+        let (raw, packed_len, ratio) = snapshot_stats(&ram);
         assert_eq!(raw, ram.len());
-        assert!(packed < raw);
+        assert_eq!(packed.len(), packed_len);
+        assert!(packed_len < raw);
         let back = snapshot_restore(&packed).unwrap();
         assert_eq!(back, ram);
         assert!(ratio > 1.0);
