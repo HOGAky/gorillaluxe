@@ -131,4 +131,149 @@ implement a lightweight Post-Processing Compute Pass (< 0.2ms GPU time):
     1. Immediately inject `ABS_MT_SLOT = 0`, `ABS_MT_TRACKING_ID = -1`, `SYN_REPORT`.
     2. Reset (X_curr, Y_curr) = (X0, Y0).
     3. On the next 1ms tick, inject new `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X = X0`, 
-       `ABS_MT_POSI
+       `ABS_MT_POSITION_Y = Y0`, `SYN_REPORT` and apply remaining delta.
+
+3.3. Device Profile Management & Hardware Sensor Simulation
+Implement a configurable Device Profile subsystem for app compatibility testing:
+1. Dynamic System Properties: Pass device profile JSON (`model`, `brand`, `board`, 
+   `hardware`, `dpi`, `mac_address`) from Host to Guest `init` via kernel cmdline / 
+   `virtio-vsock` early-boot daemon to populate Android system properties cleanly.
+2. High-Precision Virtual Sensor HAL (`sensors.gorillaluxe.so`):
+   - Emulate Accelerometer, Gyroscope, Magnetometer, and Ambient Light sensors.
+   - Implement a realistic physics & micro-variance generator (1D Perlin noise 
+     +/- 0.002 m/s^2 at 100Hz) so applications requiring active sensor polling 
+     operate without stalling.
+   - Support dynamic battery state simulation (charging/discharging curves) via 
+     Goldfish/VirtIO battery sysfs nodes.
+3. ARM64 Binary Translation Bridge:
+   - Configure `binfmt_misc` in the guest kernel to route `aarch64` (`0x7f454c46...0xb7`) 
+     and `armv7l` binaries through the prebuilt NDK translation bridge (`libndk_translation`).
+
+3.4. High-Speed Headless & Automation API
+Expose a local gRPC server on the Host (`127.0.0.1:<port>`):
+- `rpc InjectTouch`, `rpc InjectKey`, `rpc ExecShell` (via `virtio-vsock`).
+- `rpc SubscribeFrames(FrameSubRequest) returns (FrameShmInfo)`:
+  - ZERO-OVERHEAD FRAME CAPTURE: Host DX12 Compositor copies the rendered frame into 
+    a DX12 Readback Heap mapped to Windows Named Shared Memory (`Global\GorillaLuxe_Frame_<ID>`) 
+    and signals a Named Event (`Global\GorillaLuxe_Event_<ID>`).
+
+3.5. Bilingual Localization Engine (Russian & English Hot-Swap)
+- Supported Languages: Russian (`ru-RU`) and English (`en-US`).
+- Auto-Detection & Persistence: On first launch, detect the Host Windows UI language 
+  via `GetUserDefaultUILanguage()` (if primary language is `LANG_RUSSIAN`, default 
+  to `RU`, otherwise `EN`). Save user preference in `%LOCALAPPDATA%\GorillaLuxe\config.json`.
+- Zero-Restart UI Switching:
+  - Implement a thread-safe `I18nManager` in Rust holding embedded translation 
+    dictionaries (`locales/ru.json` and `locales/en.json`) covering 100% of UI strings, 
+    tooltips, keymapper controls, telemetry HUD, and CLI help messages.
+  - Provide a prominent `[ RU | EN ]` pill-toggle button in the top bar of the 
+    GorillaLuxe UI that switches all text immediately on the next frame.
+- Cyrillic Font Rendering in DirectX 12 (CRITICAL):
+  - Load clean sans-serif typography (`C:\Windows\Fonts\segoeui.ttf` with embedded fallback) 
+    at 16px (UI) and 22px (Headers) with Cyrillic glyph ranges (`U+0400`..`U+052F`) 
+    so Russian text renders crisply without `???` replacement characters.
+- Guest Android Locale Synchronization:
+  - When the user switches the language in GorillaLuxe UI, automatically synchronize 
+    the Guest Android OS locale (`persist.sys.locale` set to `ru-RU` or `en-US` via `vsock`).
+
+3.6. Modern "Luxe Dark" UI/UX & Intuitive Design System (CRITICAL)
+Do NOT use the default Dear ImGui classic/dark style. Implement a custom `apply_gorilla_luxe_theme()` 
+function and intuitive user flows:
+1. "Luxe Dark" Color Palette & Geometry:
+   - Background Primary (Deep Obsidian): `#0D0E12` (RGBA: `13, 14, 18, 242` - glassmorphism effect).
+   - Background Surface / Cards (Elevated Charcoal): `#161821` (`22, 24, 33, 255`).
+   - Primary Accent (Luxe Amber Gold): `#F5A623` (Hover: `#FFB84D`, Active: `#D48806`).
+   - Status Indicators: Emerald Green `#2ECC71` (120+ FPS / Active), Crimson `#E74C3C` (Warning).
+   - Text Primary: Crisp White `#F3F4F6`; Text Muted: Cool Gray `#9CA3AF`.
+   - Modern Rounded Geometry:
+     * `WindowRounding = 12.0f`, `ChildRounding = 10.0f`, `PopupRounding = 10.0f`
+     * `FrameRounding = 8.0f`, `GrabRounding = 6.0f`, `TabRounding = 8.0f`
+     * `WindowPadding = (16.0, 16.0)`, `FramePadding = (12.0, 8.0)`, `ItemSpacing = (10.0, 10.0)`
+     * `WindowBorderSize = 1.0f` with subtle border color `#262936`.
+2. Intuitive 3-Zone User Interface (Zero Clutter):
+   - Zone A: Sleek Collapsible Right Sidebar (Dock):
+     * A slim, modern vertical dock on the right edge (48px wide, auto-hiding in fullscreen) 
+       with icon buttons + smooth hover tooltips:
+       1. `Keymapper (F1)`
+       2. `Quick Settings (F2)` (Resolution: 1080p/2K/4K presets, FPS: 60/120/240, CAS Sharpness slider)
+       3. `Install APK` (Also support native Windows **Drag-and-Drop (`WM_DROPFILES`)**: 
+          dropping an `.apk` or `.xapk` file anywhere onto the window shows a modern animated 
+          progress toast and installs it automatically!).
+       4. `Screenshot` & `Multi-Instance Manager`
+       5. `RU | EN` instant language pill toggle.
+   - Zone B: Minimalist Floating Performance Pill (Top-Left HUD):
+     * A compact, semi-transparent pill badge (`120 FPS | 6.2 ms | DX12 Zero-Copy | P-Cores`) 
+       that can be toggled with `F3`.
+   - Zone C: Visual Drag-and-Drop Keymapper Canvas:
+     * When `F1` is pressed, dim the game background by 40% and show a floating palette 
+       of intuitive control widgets (`Tap Key`, `WASD D-Pad`, `FPS Aim Crosshair`, `Macro`). 
+       Users simply drag widgets onto the game screen or click anywhere on the screen 
+       and press a key to bind it. Smooth animated golden rings indicate placed controls.
+   - Zone D: Animated First-Boot Onboarding Screen:
+     * When downloading/unpacking the Android image on first launch, display a sleek 
+       centered GorillaLuxe splash card with a smooth golden progress bar, download 
+       speed MB/s, and localized status text ("Подготовка среды Android 13..." / 
+       "Preparing Android 13 Environment...").
+
+
+4. STEP-BY-STEP EXECUTION ROADMAP & CI ACCEPTANCE TESTS
+--------------------------------------------------------------------------------
+Execute strictly in order. Every phase must be verified locally (unit tests + 
+cross-check) AND via GitHub Actions (`windows-latest` runner) with Exit Code 0.
+
+PHASE 1: CI Pipeline, Host VMM (WHPX) & Guest Execution Foundation [COMPLETED]
+- Also ensure Long Mode (64-bit page tables + GDT) transition and VirtIO MMIO/vsock 
+  transport foundation are ready for Linux 6.1 guest kernel boot.
+
+PHASE 2: Zero-Copy Graphics Engine, DX12 Flip Compositor, CAS & "Luxe Dark" Bilingual UI
+- Tasks:
+  1. Build the DirectX 12 (`DXGI 1.6` Flip-Model SwapChain, `DXGI_SWAP_EFFECT_FLIP_DISCARD`, 
+     `FRAME_LATENCY_WAITABLE_OBJECT`) compositor in `gorillaluxe` supporting both hardware 
+     GPUs and `--ci-software-gpu` (WARP adapter).
+  2. Implement Zero-Copy GPU shared texture import (`ID3D12Device::OpenSharedHandle` + 
+     shared fence sync) and Guest-to-Host shared framebuffer / VirtIO-GPU blob pipeline 
+     (zero CPU pixel copies during steady-state rendering).
+  3. Write and compile the HLSL **AMD FidelityFX CAS (Contrast Adaptive Sharpening)** 
+     Compute Shader pass (`R8G8B8A8_UNORM` lossless pipeline) with adjustable sharpness (`0.0..1.0`).
+  4. Integrate the in-window GPU UI Overlay (`Dear ImGui` DX12 renderer or custom DX12 
+     rounded-rect/SDF UI renderer) implementing the **"Luxe Dark"** theme (`#0D0E12` obsidian, 
+     `#F5A623` amber gold, `12px` rounded corners), **Cyrillic (`U+0400..U+052F`) + Latin font atlas**, 
+     Zone A (Right Sidebar Dock), Zone B (Top-Left Performance Pill HUD), and instant `[ RU | EN ]` 
+     hot-swap without restart.
+- Automated Verification Test 2 (Graphics, Zero-Copy, CAS, Theme & Localization Proof):
+  Run on GitHub Actions (`windows-latest` with `--ci-software-gpu` / headless self-test):
+  1. Guest writes/renders a test procedural HDR/RGBA pattern into the shared GPU blob resource; 
+     Host imports it via DX12 Zero-Copy (`steady_state_cpu_copy_bytes == 0`).
+  2. Host runs the HLSL CAS Compute Shader pass and presents to the DX12 Flip SwapChain.
+  3. Read back a verification frame via a DX12 Readback Heap: assert valid non-black 
+     `R8G8B8A8_UNORM` output, verify CAS sharpening math (SSIM >= 0.99 against reference), 
+     verify Cyrillic glyph rendering (`0x0410..0x044F`) produces non-empty alpha coverage 
+     in the font atlas, and verify `RU <-> EN` hot-swap switches all UI strings in < 1ms.
+  4. Upload standalone `GorillaLuxe-Win64.zip` artifact to GitHub Actions.
+
+PHASE 3: Audio (WASAPI Low-Latency), Raw Input, Infinite Swipe & Visual Keymapper
+- Tasks:
+  1. Implement `virtio-input` multi-touch device (Linux MT Protocol Type B) connected to Host `WM_INPUT`.
+  2. Implement the FPS "Infinite Swipe" state machine and JSON keymap config loader.
+  3. Build the interactive Drag-and-Drop Visual Keymapper Canvas (Zone C) and 
+     Drag-and-Drop APK installer (`WM_DROPFILES` with animated toast notifications).
+  4. Connect `virtio-snd` to Windows WASAPI Low-Latency Shared audio stream (<= 10ms period).
+- Automated Verification Test 3:
+  Run automated input harness injecting 10,000px continuous horizontal mouse motion. 
+  Verify smooth coordinate progression and seamless slot reset (`ABS_MT_TRACKING_ID` cycling 
+  in < 2ms) without stalling at screen bounds. Verify WASAPI audio initialization and keymapper JSON roundtrip.
+
+PHASE 4: 64-Bit Linux/Android 13 Boot, ARM64 Translation, Device Profiles & Bot API
+- Tasks:
+  1. Implement 64-bit Long Mode Linux boot protocol (`bzImage` + `initramfs` / EROFS `virtio-blk` / 
+     `virtio-pmem`) in `gorillaluxe-core` and First-Boot Downloader UI (Zone D) + script 
+     (`scripts/fetch-android-image.ps1`) for Android 13 x86_64 + `libndk_translation`.
+  2. Implement the Device Profile manager, Guest Locale Sync (`ru-RU` / `en-US`), 
+     and Virtual Sensor HAL (`sensors.gorillaluxe.so` with 1D Perlin micro-noise).
+  3. Implement gRPC / IPC Control Server + Windows Named Shared Memory Frame Publisher 
+     (`Global\GorillaLuxe_Frame_<ID>`) + LZ4 VM Snapshots + Hybrid CPU Pinning (P/E cores).
+- Automated Verification Test 4:
+  1. Boot 64-bit Guest kernel in WHPX, verify `binfmt_misc` / ARM64 translation readiness, 
+     active sensor Perlin variance, and dynamic locale sync (`ru-RU` / `en-US`).
+  2. Verify Shared Memory frame capture (`Global\GorillaLuxe_Frame_0`) delivers 60 
+     consecutive 1080p RGBA frames in < 60ms total CPU time.
