@@ -40,7 +40,15 @@ jobs:
         run: cargo build --release --locked
 
       - name: Unit tests
-        run: cargo test --release --locked
+        shell: pwsh
+        run: |
+          cargo test --release --locked 2>&1 | Tee-Object test-output.txt
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content test-output.txt -Tail 80 | Out-String)
+            $tail = $tail -replace '%','%25' -replace "`r",'%0D' -replace "`n",'%0A'
+            Write-Host "::error title=UnitTests::$tail"
+            exit 1
+          }
 
       - name: Phase 1 acceptance — WHPX vCPU smoke test
         shell: pwsh
