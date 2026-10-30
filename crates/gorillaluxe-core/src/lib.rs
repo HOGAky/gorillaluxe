@@ -4,8 +4,10 @@
 //! Later phases: virtio devices, DX12 zero-copy compositor, CAS pass.
 
 pub mod config;
+pub mod gfx;
 pub mod guest;
 pub mod i18n;
+pub mod ui;
 pub mod vmm;
 pub mod whpx;
 

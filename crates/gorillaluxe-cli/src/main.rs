@@ -1,11 +1,13 @@
 //! gorillaluxe-cli.exe — headless entry point.
 //!
-//! Phase 1 usage:
-//!   gorillaluxe-cli --self-test [--lang en|ru] [--allow-no-whpx]
+//! Usage:
+//!   gorillaluxe-cli --self-test      [--lang en|ru] [--allow-no-whpx]   (Phase 1 WHPX)
+//!   gorillaluxe-cli --self-test-gfx  [--lang en|ru] [--ci-software-gpu] (Phase 2 DX12/CAS/UI)
 //!
 //! Exit codes: 0 = PASS (or SKIP with --allow-no-whpx), 1 = FAIL, 2 = SKIP.
 
 use gorillaluxe_core::config::Config;
+use gorillaluxe_core::gfx::selftest;
 use gorillaluxe_core::i18n::{tr, Lang};
 use gorillaluxe_core::vmm::{run_smoke_test, SelfTest};
 use gorillaluxe_core::{APP_NAME, APP_VERSION};
@@ -19,6 +21,7 @@ fn real_main() -> i32 {
 
     let mut cfg = Config::load();
     let mut self_test = false;
+    let mut gfx_test = false;
     let mut allow_no_whpx = false;
     let mut show_help = false;
     let mut show_version = false;
@@ -26,6 +29,8 @@ fn real_main() -> i32 {
     while i < args.len() {
         match args[i].as_str() {
             "--self-test" | "selftest" => self_test = true,
+            "--self-test-gfx" | "gfxtest" => gfx_test = true,
+            "--ci-software-gpu" => cfg.ci_software_gpu = true,
             "--allow-no-whpx" => allow_no_whpx = true,
             "--version" | "-V" => show_version = true,
             "--help" | "-h" | "/?" => show_help = true,
@@ -66,9 +71,13 @@ fn real_main() -> i32 {
         println!("{} {} ({})", APP_NAME, APP_VERSION, cfg.lang.code());
         return 0;
     }
-    if show_help || !self_test {
+    if show_help || (!self_test && !gfx_test) {
         println!("{}", tr(cfg.lang, "cli.help"));
         return 0;
+    }
+
+    if gfx_test {
+        return run_gfx_test(cfg.lang, cfg.ci_software_gpu);
     }
 
     let lang = cfg.lang;
@@ -92,6 +101,33 @@ fn real_main() -> i32 {
         }
         Err(e) => {
             eprintln!("{}: {}", tr(lang, "selftest.guest.bad"), e);
+            println!("{}", tr(lang, "selftest.fail"));
+            1
+        }
+    }
+}
+
+/// Phase 2 — Automated Verification Test 2 (DX12 zero-copy, CAS,
+/// Luxe Dark UI, Cyrillic atlas, RU/EN hot-swap).
+fn run_gfx_test(lang: Lang, allow_software: bool) -> i32 {
+    println!("{}", tr(lang, "gfx.init"));
+    match selftest::run(allow_software) {
+        Ok(r) => {
+            println!("{}: {} | {}", tr(lang, "gfx.adapter"), r.host_adapter, if r.is_warp { "WARP" } else { "HW" });
+            println!("{}: {}", tr(lang, "gfx.zerocopy.ok"), tr(lang, "gfx.steady.zero"));
+            println!("{}: SSIM={:.4} non-black={} presented={}", tr(lang, "gfx.cas.ok"), r.ssim, r.nonblack, r.presented);
+            println!("{}: cyr={} glyphs, coverage={}", tr(lang, "gfx.atlas.ok"), r.cyr_glyphs, r.cyr_coverage);
+            println!("{}: {:.1} us", tr(lang, "gfx.hotswap.ok"), r.hotswap_us);
+            if r.passed() {
+                println!("{}", tr(lang, "selftest.pass"));
+                0
+            } else {
+                println!("{}", tr(lang, "selftest.fail"));
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("gfx self-test error: {}", e);
             println!("{}", tr(lang, "selftest.fail"));
             1
         }

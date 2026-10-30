@@ -29,13 +29,29 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from(".").join("GorillaLuxe")
 }
 
+/// Host UI language autodetect (spec §3.5): `GetUserDefaultUILanguage`
+/// primary ID `LANG_RUSSIAN` -> RU, otherwise EN. Only used when the
+/// user has no saved preference.
+pub fn detect_os_lang() -> Lang {
+    const LANG_RUSSIAN: u16 = 0x19;
+    unsafe {
+        let id = windows::Win32::Globalization::GetUserDefaultUILanguage();
+        if (id & 0x3FF) == LANG_RUSSIAN {
+            Lang::Ru
+        } else {
+            Lang::En
+        }
+    }
+}
+
 impl Config {
     pub fn path() -> PathBuf {
         data_dir().join("config.cfg")
     }
 
     pub fn load() -> Config {
-        let mut cfg = Config::default();
+        // Autodetect first; the saved file overrides below.
+        let mut cfg = Config { lang: detect_os_lang(), ..Default::default() };
         let Ok(text) = std::fs::read_to_string(Self::path()) else {
             return cfg;
         };

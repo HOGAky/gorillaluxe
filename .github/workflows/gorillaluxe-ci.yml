@@ -7,7 +7,7 @@ on:
 
 jobs:
   windows-build-test:
-    name: Build (MSVC) + Phase 1 WHPX self-test
+    name: Build (MSVC) + Phase 1 WHPX + Phase 2 DX12/CAS self-tests
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -44,6 +44,19 @@ jobs:
           .\target\release\gorillaluxe-cli.exe --self-test --lang ru
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "PHASE1-CI: RU locale run exited 0"
+
+      - name: Phase 2 acceptance — DX12 zero-copy + CAS + Luxe Dark UI
+        shell: pwsh
+        run: |
+          # Automated Verification Test 2: shared texture import via
+          # OpenSharedHandle + shared fence, HLSL CAS SSIM>=0.99,
+          # Cyrillic atlas coverage, RU/EN hot-swap <1ms, flip swapchain.
+          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang en
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE2-CI: gorillaluxe-cli --self-test-gfx exited 0"
+          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang ru
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE2-CI: RU locale run exited 0"
 
       - name: Package GorillaLuxe-Win64.zip
         shell: pwsh

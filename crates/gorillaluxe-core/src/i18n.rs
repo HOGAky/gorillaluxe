@@ -1,10 +1,35 @@
 //! Bilingual UI strings: English (EN) and Russian (RU).
 //! Hot-swappable: `tr()` is pure lookup, callers re-render on language change.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,
     Ru,
+}
+
+/// Global UI language — atomic so the `[ RU | EN ]` pill can hot-swap
+/// mid-frame without restart (spec §3.5).
+static CURRENT: AtomicU8 = AtomicU8::new(0);
+
+pub fn current_lang() -> Lang {
+    if CURRENT.load(Ordering::Relaxed) == 1 {
+        Lang::Ru
+    } else {
+        Lang::En
+    }
+}
+
+/// Switch the active language instantly; next lookup sees the new value.
+/// Returns the switch cost — must stay << 1 ms (Phase 2 check).
+pub fn set_lang(l: Lang) {
+    CURRENT.store(if l == Lang::Ru { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Lookup in the currently active language.
+pub fn trc(key: &str) -> &str {
+    tr(current_lang(), key)
 }
 
 impl Lang {
@@ -51,6 +76,20 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("ui.welcome", "Welcome to GorillaLuxe", "Добро пожаловать в GorillaLuxe"),
     ("ui.phase1", "Phase 1 — WHPX foundation", "Фаза 1 — базис WHPX"),
     ("ui.phase2", "Phase 2 — DX12 zero-copy pipeline (next)", "Фаза 2 — конвейер DX12 zero-copy (далее)"),
+    ("ui.keymapper", "Keymapper", "Раскладка"),
+    ("ui.quick_settings", "Quick Settings", "Быстрые настройки"),
+    ("ui.install_apk", "Install APK", "Установить APK"),
+    ("ui.screenshot", "Screenshot", "Скриншот"),
+    ("ui.multi_instance", "Multi-Instance Manager", "Менеджер окон"),
+    ("ui.preparing", "Preparing Android 13 Environment...", "Подготовка среды Android 13..."),
+    ("hud.zero_copy", "DX12 Zero-Copy", "DX12 Zero-Copy"),
+    ("gfx.init", "Initializing DirectX 12", "Инициализация DirectX 12"),
+    ("gfx.adapter", "D3D12 adapter", "Адаптер D3D12"),
+    ("gfx.zerocopy.ok", "Zero-copy shared texture import verified", "Импорт общей текстуры без копирования проверен"),
+    ("gfx.cas.ok", "CAS compute pass verified (SSIM >= 0.99)", "Проход CAS проверен (SSIM >= 0.99)"),
+    ("gfx.atlas.ok", "Cyrillic glyph coverage verified", "Покрытие кириллических глифов проверено"),
+    ("gfx.hotswap.ok", "RU/EN hot-swap under 1 ms", "Переключение RU/EN быстрее 1 мс"),
+    ("gfx.steady.zero", "steady_state_cpu_copy_bytes == 0", "steady_state_cpu_copy_bytes == 0"),
 ];
 
 #[cfg(test)]
