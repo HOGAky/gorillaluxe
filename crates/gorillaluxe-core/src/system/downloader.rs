@@ -225,7 +225,8 @@ pub fn digest_hex(path: &Path, algo: &str) -> Result<String, String> {
     let mut f = File::open(path).map_err(|e| format!("open: {e}"))?;
     let mut buf = vec![0u8; 1024 * 1024];
     macro_rules! feed {
-        ($h:expr) => {{
+        ($h:ident, $ctor:expr) => {{
+            let mut $h = $ctor;
             loop {
                 let n = f.read(&mut buf).map_err(|e| e.to_string())?;
                 if n == 0 {
@@ -237,8 +238,8 @@ pub fn digest_hex(path: &Path, algo: &str) -> Result<String, String> {
         }};
     }
     Ok(match algo {
-        "sha256" => feed!(sha2::Sha256::new()),
-        "sha1" => feed!(sha1::Sha1::new()),
+        "sha256" => feed!(h, sha2::Sha256::new()),
+        "sha1" => feed!(h, sha1::Sha1::new()),
         _ => return Err(format!("unknown digest {algo}")),
     })
 }
