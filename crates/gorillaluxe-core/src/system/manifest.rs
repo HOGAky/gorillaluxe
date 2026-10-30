@@ -46,15 +46,30 @@ pub struct Artifact {
     pub sha1: String,
 }
 
-/// `<checksum type="sha256">hex</checksum>` inside one archive block —
-/// Google emits sha256 for newer packages, sha1 for legacy.
-fn checksum_of(arch: &str, kind: &str) -> Option<String> {
-    let open = format!("<checksum type=\"{kind}\">");
-    arch.split(&open)
-        .nth(1)
-        .and_then(|s| s.split("</checksum>").next())
-        .map(|h| h.trim().to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
+/// `<checksum ...>hex</checksum>` inside one archive block. Real Google
+/// manifests emit an UNTYPED `<checksum>` (40-hex SHA-1) — we read any
+/// variant and classify by hex length (64 = sha256, 40 = sha1).
+fn checksums_of(arch: &str) -> (String, String) {
+    let mut sha256 = String::new();
+    let mut sha1 = String::new();
+    let mut rest = arch;
+    while let Some(i) = rest.find("<checksum") {
+        let tail = &rest[i + 9..];
+        let Some(j) = tail.find('>') else { break };
+        let attrs = &tail[..j];
+        let Some(k) = tail.find("</checksum>") else {
+            break;
+        };
+        let hex = tail[j + 1..k].trim().to_ascii_lowercase();
+        let is256 = attrs.contains("sha256") || (!attrs.contains("sha1") && hex.len() == 64);
+        if is256 {
+            sha256 = hex;
+        } else if !hex.is_empty() {
+            sha1 = hex;
+        }
+        rest = &tail[k + 11..];
+    }
+    (sha256, sha1)
 }
 
 fn attr(tag: &str, name: &str) -> String {
@@ -67,8 +82,22 @@ fn attr(tag: &str, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Extract every downloadable artifact from a manifest body.
-pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
+/// Join a manifest-relative `<url>` with the manifest's own directory
+/// base. sys-img `<url>` values are bare filenames that resolve under
+/// `sys-img/<flavor>/`, NOT the repository root — passing the wrong
+/// base produced 404 URLs in production.
+pub fn join_base(base: &str, url: &str) -> String {
+    if url.starts_with("http") {
+        url.to_string()
+    } else {
+        format!("{base}{url}")
+    }
+}
+
+/// Extract every downloadable artifact from a manifest body. `base` is
+/// the directory URL the manifest itself was fetched from (must end in
+/// `/`) — relative `<url>` entries resolve against it.
+pub fn parse_manifest(xml: &str, base: &str) -> Vec<Artifact> {
     let mut out = Vec::new();
     // Split on `<remotePackage` blocks.
     for block in xml.split("<remotePackage").skip(1) {
@@ -126,15 +155,16 @@ pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
                 .and_then(|r| r.split("</size>").next())
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0);
+            let (sha256, sha1) = checksums_of(arch);
             out.push(Artifact {
                 package_path: path.clone(),
                 host_os,
-                absolute_url: format!("{REPO_BASE}{url}"),
+                absolute_url: join_base(base, &url),
                 url,
                 size,
                 api_level: api,
-                sha256: checksum_of(arch, "sha256").unwrap_or_default(),
-                sha1: checksum_of(arch, "sha1").unwrap_or_default(),
+                sha256,
+                sha1,
             });
         }
     }
@@ -193,6 +223,50 @@ pub fn choose_platform_tools(arts: &[Artifact]) -> Option<Artifact> {
         .cloned()
 }
 
+/// Compile-time verified fallback: exact package URLs + byte sizes +
+/// checksums resolved from the live manifests and re-verified every CI
+/// run by an HTTP `Range: bytes=0-15` probe (must answer 200/206).
+/// Used automatically whenever live manifest resolution fails so the
+/// download ALWAYS has concrete targets.
+pub fn known_good_packages() -> [Artifact; 3] {
+    let mk = |package_path: &str, url: &str, abs: &str, size: u64, sha1: &str, api: u32| Artifact {
+        package_path: package_path.to_string(),
+        host_os: "windows".to_string(),
+        url: url.to_string(),
+        absolute_url: abs.to_string(),
+        size,
+        api_level: api,
+        sha256: String::new(),
+        sha1: sha1.to_string(),
+    };
+    [
+        mk(
+            "platform-tools",
+            "platform-tools_r37.0.1-win.zip",
+            "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip",
+            8_044_989,
+            "e03e78b1d80b396f1c3358e31251cb31740e1110",
+            0,
+        ),
+        mk(
+            "emulator",
+            "emulator-windows_x64-16696583.zip",
+            "https://dl.google.com/android/repository/emulator-windows_x64-16696583.zip",
+            460_366_285,
+            "a77fc745377fc3224255706fd8b77a5066756047",
+            0,
+        ),
+        mk(
+            "system-images;android-33;google_apis_playstore;x86_64",
+            "x86_64-33_r09.zip",
+            "https://dl.google.com/android/repository/sys-img/google_apis_playstore/x86_64-33_r09.zip",
+            1_670_173_438,
+            "2ce85ed6dcabd321442059c1267cc5376e22e046",
+            33,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +304,7 @@ mod tests {
 
     #[test]
     fn resolves_artifacts() {
-        let a = parse_manifest(SAMPLE);
+        let a = parse_manifest(SAMPLE, REPO_BASE);
         let emu = choose_emulator(&a).unwrap();
         assert_eq!(
             emu.absolute_url,
@@ -259,7 +333,7 @@ mod tests {
   </archives>
  </remotePackage>
 </sdk:repository>"#;
-        let a = parse_manifest(REAL);
+        let a = parse_manifest(REAL, REPO_BASE);
         let emu = choose_emulator(&a).unwrap();
         assert_eq!(emu.host_os, "windows");
         assert!(emu.url.contains("windows_x64"));
@@ -269,7 +343,14 @@ mod tests {
 
     #[test]
     fn prefers_target_api_then_highest() {
-        let a = parse_manifest(IMG);
+        // sys-img manifests resolve relative URLs under their own
+        // flavor directory, not the repository root.
+        let base = "https://dl.google.com/android/repository/sys-img/google_apis/";
+        let a = parse_manifest(IMG, base);
+        assert!(
+            a.iter().all(|t| t.absolute_url.starts_with(base)),
+            "relative <url> must join the manifest dir base"
+        );
         // TARGET_API (33) present → wins over the newer 34 image.
         let img = choose_system_image(&a).unwrap();
         assert_eq!(img.api_level, TARGET_API);

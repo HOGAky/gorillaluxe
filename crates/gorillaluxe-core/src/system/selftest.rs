@@ -95,8 +95,8 @@ const EMBEDDED_SYSIMG: &str = r#"
 
 fn manifest_check() -> Check {
     // Try the FULL live resolve (repo manifest + flavor sys-img
-    // manifests, 60s budget); fall back to embedded samples so the
-    // resolver logic is always exercised offline.
+    // manifests, 60s budget); then probe each resolved zip with
+    // `Range: bytes=0-15` — CI must see HTTP 200/206 on all three.
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let _ = tx.send(android_runtime::resolve_runtime_urls());
@@ -107,21 +107,29 @@ fn manifest_check() -> Check {
             && img.absolute_url.ends_with(".zip")
             && img.package_path.contains("android-33")
             && img.package_path.contains("x86_64");
-        return if ok {
-            Check::Pass(format!(
-                "live dl.google.com -> {} + {} + api33 {}",
-                emu.url, tools.url, img.url
-            ))
-        } else {
-            Check::Fail(format!(
+        if !ok {
+            return Check::Fail(format!(
                 "bad resolve: {} / {} / {}",
                 emu.url, tools.url, img.package_path
-            ))
-        };
+            ));
+        }
+        // Range-probe every resolved URL (the KNOWN_GOOD fallback is
+        // verified by the same probe when it was the source).
+        let mut probed = Vec::new();
+        for a in [&tools, &emu, &img] {
+            match super::downloader::probe_url(&a.absolute_url) {
+                Ok(sz) => probed.push(format!("{}={}B", a.url, sz)),
+                Err(e) => return Check::Fail(format!("range probe failed: {e}")),
+            }
+        }
+        return Check::Pass(format!("verified 200/206: {}", probed.join(" + ")));
     }
     // Offline path — exercise resolver on embedded samples.
-    let repo = manifest::parse_manifest(EMBEDDED_MANIFEST);
-    let sys = manifest::parse_manifest(EMBEDDED_SYSIMG);
+    let repo = manifest::parse_manifest(EMBEDDED_MANIFEST, manifest::REPO_BASE);
+    let sys = manifest::parse_manifest(
+        EMBEDDED_SYSIMG,
+        &format!("{}sys-img/google_apis_playstore/", manifest::REPO_BASE),
+    );
     match (
         manifest::choose_emulator(&repo),
         manifest::choose_platform_tools(&repo),

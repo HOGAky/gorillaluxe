@@ -145,6 +145,17 @@ fn shell_slot() -> &'static Mutex<Option<android_runtime::AdbShell>> {
 
 /// Zone D → resolve Google manifests, then start the native download.
 fn start_android_download(a: &mut App) {
+    // Debounce: exactly one resolve+download pipeline may run at a
+    // time. A failed resolve surfaces as `Failed` within ms and rapid
+    // clicks must never spawn a thread per click.
+    if a.dl.is_some()
+        || !matches!(
+            a.ui.onboard,
+            Onboard::MissingRuntime | Onboard::Failed { .. } | Onboard::Stopped | Onboard::Hidden
+        )
+    {
+        return;
+    }
     let slot = dl_slot();
     *slot.lock().unwrap() = None;
     a.ui.onboard = Onboard::CheckingEnvironment;

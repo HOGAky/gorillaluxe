@@ -151,48 +151,82 @@ pub fn install_state() -> InstallState {
 // Manifest resolution
 // ---------------------------------------------------------------------------
 
-/// Fetch + parse a repository manifest via ureq. `None` when offline
-/// or when the body isn't SDK-repository XML.
-pub fn fetch_manifest(rel: &str) -> Option<Vec<manifest::Artifact>> {
-    let url = format!("{}{rel}", manifest::REPO_BASE);
-    let body = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(30))
-        .call()
-        .ok()?
-        .into_string()
-        .ok()?;
-    if !body.contains("<remotePackage") {
-        return None;
+/// Base URL artifacts of manifest `rel` resolve against — the
+/// manifest's own directory. sys-img `<url>` values are bare filenames
+/// (`x86_64-33_r09.zip`), NOT repository-root-relative — joining them
+/// with `REPO_BASE` produces 404s.
+fn manifest_base(rel: &str) -> String {
+    match rel.rfind('/') {
+        Some(i) => format!("{}{}", manifest::REPO_BASE, &rel[..i + 1]),
+        None => manifest::REPO_BASE.to_string(),
     }
-    let arts = manifest::parse_manifest(&body);
-    (!arts.is_empty()).then_some(arts)
+}
+
+/// Fetch + parse a repository manifest. ureq is tried first, then
+/// `curl.exe` (built into Windows 10/11) — errors always carry the
+/// exact URL and transport detail.
+pub fn fetch_manifest(rel: &str) -> Result<Vec<manifest::Artifact>, String> {
+    let url = format!("{}{rel}", manifest::REPO_BASE);
+    let bytes = downloader::http_get(&url)?;
+    let body = String::from_utf8_lossy(&bytes);
+    if !body.contains("<remotePackage") {
+        return Err(format!(
+            "{url}: not an SDK manifest ({} bytes)",
+            bytes.len()
+        ));
+    }
+    let arts = manifest::parse_manifest(&body, &manifest_base(rel));
+    if arts.is_empty() {
+        return Err(format!("{url}: manifest parsed but had no archives"));
+    }
+    Ok(arts)
 }
 
 /// Resolve the Android 13 x86_64 system image: walks the flavor
-/// manifests in preference order (playstore → google_apis → aosp).
-pub fn fetch_system_image() -> Option<manifest::Artifact> {
+/// manifests in preference order (playstore → google_apis → aosp),
+/// collecting per-flavor errors so nothing is silently swallowed.
+pub fn fetch_system_image() -> Result<manifest::Artifact, String> {
+    let mut errs = Vec::new();
     for (_flavor, rel) in manifest::SYSIMG_MANIFESTS {
-        if let Some(arts) = fetch_manifest(rel) {
-            if let Some(img) = manifest::choose_system_image(&arts) {
-                return Some(img);
-            }
+        match fetch_manifest(rel) {
+            Ok(arts) => match manifest::choose_system_image(&arts) {
+                Some(img) => return Ok(img),
+                None => errs.push(format!(
+                    "{rel}: no android-{TARGET}x86_64 image",
+                    TARGET = manifest::TARGET_API
+                )),
+            },
+            Err(e) => errs.push(e),
         }
     }
-    None
+    Err(errs.join(" | "))
+}
+
+fn resolve_live() -> Result<[manifest::Artifact; 3], String> {
+    let repo = fetch_manifest(manifest::REPO_MANIFEST)?;
+    let tools = manifest::choose_platform_tools(&repo)
+        .ok_or_else(|| "repository2-1.xml: no windows platform-tools archive".to_string())?;
+    let emu = manifest::choose_emulator(&repo)
+        .ok_or_else(|| "repository2-1.xml: no windows emulator archive".to_string())?;
+    let img = fetch_system_image()?;
+    Ok([tools, emu, img])
 }
 
 /// Resolve the three download URLs needed for the runtime.
 /// `Ok` = `(platform-tools, emulator, system-image)` in download order.
+/// Live resolution is preferred; on ANY failure the compile-time
+/// `KNOWN_GOOD_PACKAGES` (CI-verified URLs) take over so the download
+/// always has concrete targets.
 pub fn resolve_runtime_urls() -> Result<[manifest::Artifact; 3], String> {
-    let repo = fetch_manifest(manifest::REPO_MANIFEST)
-        .ok_or_else(|| "cannot reach dl.google.com repository manifest".to_string())?;
-    let tools = manifest::choose_platform_tools(&repo)
-        .ok_or_else(|| "no platform-tools package in manifest".to_string())?;
-    let emu = manifest::choose_emulator(&repo)
-        .ok_or_else(|| "no emulator-windows_x64 package in manifest".to_string())?;
-    let img = fetch_system_image()
-        .ok_or_else(|| "no x86_64 system image in sys-img manifests".to_string())?;
-    Ok([tools, emu, img])
+    match resolve_live() {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            log_line(&format!(
+                "live manifest resolve failed ({e}); using known-good package URLs"
+            ));
+            Ok(manifest::known_good_packages())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

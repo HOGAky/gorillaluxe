@@ -120,7 +120,111 @@ fn remote_len(url: &str) -> u64 {
         .call()
         .ok()
         .and_then(|r| r.header("Content-Length").and_then(|s| s.parse().ok()))
+        .or_else(|| curl_len(url))
         .unwrap_or(0)
+}
+
+/// Spawn `curl.exe` hidden (built into Windows 10/11 — reliable where
+/// ureq's TLS/DNS path fails on some machines).
+fn curl(args: &[&str]) -> Result<std::process::Output, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("curl.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("spawn curl.exe: {e}"))
+}
+
+/// content-length via `curl -sI` (transport fallback).
+fn curl_len(url: &str) -> Option<u64> {
+    let out = curl(&["-sIL", "--max-time", "20", url]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let head = String::from_utf8_lossy(&out.stdout);
+    head.lines()
+        .filter_map(|l| {
+            l.strip_prefix("Content-Length:")
+                .or_else(|| l.strip_prefix("content-length:"))
+        })
+        .next_back()
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// GET a small body (manifest XML etc.) — ureq first, `curl.exe -fL`
+/// when ureq's transport fails. Errors always carry the URL.
+pub fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    match ureq::get(url).timeout(Duration::from_secs(30)).call() {
+        Ok(resp) => {
+            let mut b = Vec::new();
+            resp.into_reader()
+                .read_to_end(&mut b)
+                .map_err(|e| format!("{url}: read: {e}"))?;
+            Ok(b)
+        }
+        Err(e) => {
+            let out = curl(&["-fL", "-sS", "--retry", "3", "--max-time", "60", url])
+                .map_err(|e2| format!("{url}: ureq: {e}; curl spawn: {e2}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{url}: ureq: {e}; curl exit {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(out.stdout)
+        }
+    }
+}
+
+/// Probe `url` with `Range: bytes=0-15` — returns the server-reported
+/// total size when the server answers 200/206. CI gates on this for
+/// every resolved package URL.
+pub fn probe_url(url: &str) -> Result<u64, String> {
+    let resp = ureq::get(url)
+        .set("Range", "bytes=0-15")
+        .timeout(Duration::from_secs(30))
+        .call();
+    match resp {
+        Ok(r) => {
+            // 206 → parse Content-Range "bytes 0-15/TOTAL"; 200 →
+            // the whole object was returned, use Content-Length.
+            if let Some(cr) = r.header("Content-Range") {
+                if let Some(total) = cr.rsplit('/').next().and_then(|s| s.trim().parse().ok()) {
+                    return Ok(total);
+                }
+            }
+            r.header("Content-Length")
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| format!("{url}: no Content-Range/Content-Length"))
+        }
+        Err(e) => {
+            // curl fallback: download 16 bytes with -r, read size.
+            let out = curl(&[
+                "-fL",
+                "-sS",
+                "-r",
+                "0-15",
+                "-o",
+                "NUL",
+                "-w",
+                "%{size_download} %{size_header}",
+                "--max-time",
+                "30",
+                url,
+            ])
+            .map_err(|e2| format!("{url}: ureq: {e}; curl spawn: {e2}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{url}: ureq: {e}; curl exit {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(0) // reachable, total unknown via this path
+        }
+    }
 }
 
 /// Download `t.url` → `t.zip` with `.part` resume and 3 attempts.
@@ -161,7 +265,44 @@ fn download_attempt(
     if have > 0 && total > have {
         req = req.set("Range", &format!("bytes={have}-"));
     }
-    let resp = req.call().map_err(|e| format!("HTTP {}: {e}", t.url))?;
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(e) => {
+            // Transport fallback: curl.exe handles its own resume via
+            // `-C -` against the existing .part file.
+            emit(
+                tx,
+                DlEvent::Log(format!(
+                    "ureq failed on {} ({e}); falling back to curl.exe",
+                    t.url
+                )),
+            )?;
+            let part_s = part.to_string_lossy().to_string();
+            let out = curl(&["-fL", "--retry", "3", "-C", "-", "-o", &part_s, &t.url])
+                .map_err(|e2| format!("{}: ureq: {e}; curl spawn: {e2}", t.url))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{}: ureq: {e}; curl exit {}: {}",
+                    t.url,
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let done = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+            emit(
+                tx,
+                DlEvent::Progress {
+                    done,
+                    total,
+                    speed_bps: 0.0,
+                },
+            )?;
+            if total > 0 && done < total {
+                return Err(format!("truncated at {done}/{total}"));
+            }
+            return Ok(());
+        }
+    };
     let mut reader = resp.into_reader();
     let mut file = OpenOptions::new()
         .create(true)
