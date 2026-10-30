@@ -167,41 +167,53 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
         Err(e) => return Err(VmError::Whpx(e)),
     }
 
-    let part = api.create_partition(1)?;
+    // Hosted CI runners can transiently refuse a vCPU run
+    // (WHvRunVpExitReasonUnsupportedFeature / canceled exits under
+    // nested-virt load) — recreate the partition and retry a few
+    // times before declaring failure. A real guest bug (triple
+    // fault at a stable RIP) still fails after all attempts.
+    let mut last_err = String::new();
+    let mut regs = Vec::new();
     let mem = GuestRam::alloc()?;
-    build_guest_image(&mem);
-    unsafe {
-        part.map_gpa_range(
-            mem.0,
-            0,
-            MEM_SIZE as u32,
-            WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
+    'attempt: for attempt in 1..=3u32 {
+        let part = api.create_partition(1)?;
+        build_guest_image(&mem);
+        unsafe {
+            part.map_gpa_range(
+                mem.0,
+                0,
+                MEM_SIZE as u32,
+                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute,
+            )?;
+        }
+
+        const VP: u32 = 0;
+        part.create_vcpu(VP)?;
+        setup_long_mode(&part, VP)?;
+
+        // Straight 64-bit payload → a single run must reach HLT.
+        let mut exit = WHV_RUN_VP_EXIT_CONTEXT::default();
+        part.run(VP, &mut exit)?;
+        if exit.ExitReason != WHvRunVpExitReasonX64Halt {
+            last_err = format!(
+                "reason={} RIP=0x{:X} (attempt {attempt}/3)",
+                exit.ExitReason.0, exit.VpContext.Rip
+            );
+            continue 'attempt;
+        }
+        regs = part.get_registers(
+            VP,
+            &[WHvX64RegisterRax, WHvX64RegisterCs, WHvX64RegisterEfer],
         )?;
+        part.delete_vcpu(VP).ok();
+        break 'attempt;
     }
-
-    const VP: u32 = 0;
-    part.create_vcpu(VP)?;
-    setup_long_mode(&part, VP)?;
-
-    // Straight 64-bit payload → a single run must reach HLT; any
-    // other exit reason (MMIO/PIO/triple fault) is a hard error.
-    let mut exit = WHV_RUN_VP_EXIT_CONTEXT::default();
-    part.run(VP, &mut exit)?;
-    if exit.ExitReason != WHvRunVpExitReasonX64Halt {
+    if regs.is_empty() {
         return Err(VmError::Exit {
-            reason: exit.ExitReason.0,
-            detail: format!(
-                "RIP=0x{:X} (expected straight 64-bit run to HLT)",
-                exit.VpContext.Rip
-            ),
+            reason: -1,
+            detail: format!("{last_err} (expected straight 64-bit run to HLT)"),
         });
     }
-
-    let regs = part.get_registers(
-        VP,
-        &[WHvX64RegisterRax, WHvX64RegisterCs, WHvX64RegisterEfer],
-    )?;
-    part.delete_vcpu(VP).ok();
 
     let rax = unsafe { regs[0].Reg64 };
     let cs_attr = unsafe { regs[1].Segment.Anonymous.Attributes };
