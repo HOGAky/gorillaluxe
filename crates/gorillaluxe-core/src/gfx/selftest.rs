@@ -54,6 +54,8 @@ pub struct Report {
     /// Phase 3: glyph cells must be letter shapes, not solid blocks.
     pub glyph_cells: usize,
     pub glyph_fill_bad: usize,
+    /// Offending codepoints (U+ hex) for `glyph_fill_bad`.
+    pub glyph_fill_chars: Vec<u16>,
     /// Production: zero ClearType vertical streaks in the multi-size
     /// ANTIALIASED_QUALITY atlas.
     pub glyph_streak_bad: usize,
@@ -389,6 +391,7 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         hotswap_changed,
         ui_nonblack,
         glyph_cells,
+        glyph_fill_chars: glyph_bad,
         glyph_fill_bad,
         glyph_streak_bad,
         steady_bytes: s

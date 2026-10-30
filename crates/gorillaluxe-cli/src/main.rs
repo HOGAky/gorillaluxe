@@ -200,6 +200,16 @@ fn run_gfx_test(lang: Lang, allow_software: bool) -> i32 {
                 "glyph cells={} block_bad={} streak_bad={}",
                 r.glyph_cells, r.glyph_fill_bad, r.glyph_streak_bad
             );
+            if !r.glyph_fill_chars.is_empty() {
+                println!(
+                    "  block glyphs: {}",
+                    r.glyph_fill_chars
+                        .iter()
+                        .map(|c| format!("U+{c:04X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
             println!("{}: {:.1} us", tr(lang, "gfx.hotswap.ok"), r.hotswap_us);
             if r.passed() {
                 println!("{}", tr(lang, "selftest.pass"));
