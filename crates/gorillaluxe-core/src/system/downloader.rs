@@ -288,19 +288,64 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Minimal store-only ZIP builder (zip 2.x refuses `..` names at
+    /// write time, so a hostile entry must be hand-rolled).
+    fn make_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xEDB88320 & (0u32.wrapping_sub(crc & 1)));
+                }
+            }
+            !crc
+        }
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        for (name, data) in entries {
+            let off = out.len() as u32;
+            let crc = crc32(data);
+            let (n, d) = (name.len() as u16, data.len() as u32);
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&d.to_le_bytes());
+            out.extend_from_slice(&d.to_le_bytes());
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            cd.extend_from_slice(b"PK\x01\x02");
+            cd.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            cd.extend_from_slice(&crc.to_le_bytes());
+            cd.extend_from_slice(&d.to_le_bytes());
+            cd.extend_from_slice(&d.to_le_bytes());
+            cd.extend_from_slice(&n.to_le_bytes());
+            cd.extend_from_slice(&[0; 8]); // extra+comment+disk+intattr
+            cd.extend_from_slice(&[0; 4]); // ext attr
+            cd.extend_from_slice(&off.to_le_bytes());
+            cd.extend_from_slice(name.as_bytes());
+        }
+        let (cd_off, cd_len) = (out.len() as u32, cd.len() as u32);
+        out.extend_from_slice(&cd);
+        out.extend_from_slice(b"PK\x05\x06");
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
     #[test]
     fn zip_traversal_is_rejected() {
         let tmp = std::env::temp_dir().join("gorillaluxe-ziptest");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        // Build a hostile archive in memory: `../evil.txt` + `ok.txt`.
-        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts = zip::write::SimpleFileOptions::default();
-        zw.start_file("../evil.txt", opts).unwrap();
-        zw.write_all(b"pwned").unwrap();
-        zw.start_file("dir/ok.txt", opts).unwrap();
-        zw.write_all(b"fine").unwrap();
-        let blob = zw.finish().unwrap().into_inner();
+        // Hostile archive: `../evil.txt` traversal + a legit nested entry.
+        let blob = make_zip(&[("../evil.txt", b"pwned"), ("dir/ok.txt", b"fine")]);
         let zpath = tmp.join("evil.zip");
         fs::write(&zpath, &blob).unwrap();
         let dest = tmp.join("out");
