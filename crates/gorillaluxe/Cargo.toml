@@ -1,0 +1,13 @@
+[package]
+name = "gorillaluxe"
+version = "0.1.0"
+edition = "2021"
+description = "GorillaLuxe player GUI (gorillaluxe.exe)"
+
+[[bin]]
+name = "gorillaluxe"
+path = "src/main.rs"
+
+[dependencies]
+gorillaluxe-core = { path = "../gorillaluxe-core" }
+windows = { workspace = true }

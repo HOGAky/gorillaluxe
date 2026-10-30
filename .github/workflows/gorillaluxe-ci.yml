@@ -1,0 +1,65 @@
+name: GorillaLuxe CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-build-test:
+    name: Build (MSVC) + Phase 1 WHPX self-test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check WHPX availability on runner
+        shell: pwsh
+        run: |
+          $svc = Get-Service -Name vmcompute -ErrorAction SilentlyContinue
+          Write-Host "vmcompute service: $($svc.Status)"
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -ErrorAction SilentlyContinue
+          Write-Host "HypervisorPlatform feature: $($feature.State)"
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Phase 1 acceptance — WHPX vCPU smoke test
+        shell: pwsh
+        run: |
+          .\target\release\gorillaluxe-cli.exe --self-test --lang en
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE1-CI: gorillaluxe-cli --self-test exited 0"
+          .\target\release\gorillaluxe-cli.exe --self-test --lang ru
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE1-CI: RU locale run exited 0"
+
+      - name: Package GorillaLuxe-Win64.zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\gorillaluxe.exe, target\release\gorillaluxe-cli.exe dist\
+          Copy-Item README.md, SPECIFICATION.txt dist\
+          Compress-Archive -Path dist\* -DestinationPath GorillaLuxe-Win64.zip
+          $size = (Get-Item GorillaLuxe-Win64.zip).Length / 1MB
+          Write-Host ("GorillaLuxe-Win64.zip: {0:N1} MB" -f $size)
+          if ($size -gt 35) { Write-Error "artifact exceeds 35 MB budget"; exit 1 }
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GorillaLuxe-Win64
+          path: GorillaLuxe-Win64.zip
+          if-no-files-found: error
+          retention-days: 30

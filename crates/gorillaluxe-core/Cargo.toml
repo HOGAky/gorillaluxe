@@ -1,0 +1,8 @@
+[package]
+name = "gorillaluxe-core"
+version = "0.1.0"
+edition = "2021"
+description = "GorillaLuxe core: WHPX VMM, DX12 compositor, i18n (RU/EN)"
+
+[dependencies]
+windows = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "gorillaluxe-cli"
+version = "0.1.0"
+edition = "2021"
+description = "GorillaLuxe headless CLI (gorillaluxe-cli.exe)"
+
+[[bin]]
+name = "gorillaluxe-cli"
+path = "src/main.rs"
+
+[dependencies]
+gorillaluxe-core = { path = "../gorillaluxe-core" }
