@@ -66,7 +66,21 @@ pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
         for arch in block.split("<archive").skip(1) {
             let tag_end = arch.find('>').unwrap_or(0);
             let tag = &arch[..tag_end];
-            let host_os = attr(tag, "host-os");
+            // Real manifests carry <host-os> as a child element; some
+            // schemas also emit it as an archive attribute.
+            let host_os = {
+                let a = attr(tag, "host-os");
+                if a.is_empty() {
+                    arch.split("<host-os>")
+                        .nth(1)
+                        .and_then(|s| s.split("</").next())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                } else {
+                    a
+                }
+            };
             let url = arch
                 .split("<url>")
                 .nth(1)
@@ -96,14 +110,19 @@ pub fn parse_manifest(xml: &str) -> Vec<Artifact> {
     out
 }
 
+/// Windows-targeted archive: `<host-os>windows` (the authoritative
+/// filter) with URL-level fallbacks (`-win.zip` for platform-tools,
+/// `windows_x64` for the emulator).
+fn is_windows(a: &Artifact) -> bool {
+    a.host_os == "windows"
+        || a.url.contains("windows")
+        || a.url.ends_with("-win.zip")
+}
+
 /// Pick the Windows x64 headless emulator package.
 pub fn choose_emulator(arts: &[Artifact]) -> Option<Artifact> {
     arts.iter()
-        .filter(|a| {
-            a.package_path == "emulator"
-                && a.url.contains("windows")
-                && a.url.ends_with(".zip")
-        })
+        .filter(|a| a.package_path == "emulator" && is_windows(a) && a.url.ends_with(".zip"))
         .max_by_key(|a| a.size)
         .cloned()
 }
@@ -121,14 +140,11 @@ pub fn choose_system_image(arts: &[Artifact]) -> Option<Artifact> {
         .cloned()
 }
 
-/// Pick the Windows platform-tools package (adb.exe).
+/// Pick the Windows platform-tools package (adb.exe) — Google names
+/// it `platform-tools_r*-win.zip`, not `windows`.
 pub fn choose_platform_tools(arts: &[Artifact]) -> Option<Artifact> {
     arts.iter()
-        .filter(|a| {
-            a.package_path == "platform-tools"
-                && a.url.contains("windows")
-                && a.url.ends_with(".zip")
-        })
+        .filter(|a| a.package_path == "platform-tools" && is_windows(a) && a.url.ends_with(".zip"))
         .cloned()
         .into_iter()
         .next()
@@ -179,6 +195,33 @@ mod tests {
         );
         let pt = choose_platform_tools(&a).unwrap();
         assert!(pt.absolute_url.ends_with(".zip"));
+    }
+
+    /// Regression: real Google manifests use <host-os> elements and
+    /// `*-win.zip` (not `*windows*`) platform-tools URLs.
+    #[test]
+    fn real_manifest_shapes() {
+        const REAL: &str = r#"
+<sdk:repository>
+ <remotePackage path="emulator">
+  <archives>
+   <archive><complete><size>1</size><url>emulator-linux_x64-1.zip</url></complete><host-os>linux</host-os></archive>
+   <archive><complete><size>460366285</size><url>emulator-windows_x64-16696583.zip</url></complete><host-os>windows</host-os></archive>
+  </archives>
+ </remotePackage>
+ <remotePackage path="platform-tools">
+  <archives>
+   <archive><complete><size>2</size><url>platform-tools_r37.0.1-darwin.zip</url></complete><host-os>macosx</host-os></archive>
+   <archive><complete><size>3</size><url>platform-tools_r37.0.1-win.zip</url></complete><host-os>windows</host-os></archive>
+  </archives>
+ </remotePackage>
+</sdk:repository>"#;
+        let a = parse_manifest(REAL);
+        let emu = choose_emulator(&a).unwrap();
+        assert_eq!(emu.host_os, "windows");
+        assert!(emu.url.contains("windows_x64"));
+        let tools = choose_platform_tools(&a).unwrap();
+        assert!(tools.url.ends_with("-win.zip"), "{}", tools.url);
     }
 
     #[test]
