@@ -1,0 +1,134 @@
+================================================================================
+TECHNICAL SPECIFICATION & EXECUTION PLAN (FOR DEVIN AI)
+Project: GorillaLuxe — High-Performance Android Virtualization Engine (Windows)
+Target Architecture: x86_64 Windows Host -> x86_64 Android 13 Guest + ARM64 Translation
+Environment Constraint: ZERO-BUDGET / LOW-DISK (<5GB) / CI-DRIVEN DEVELOPMENT
+================================================================================
+
+0. AGENT ENVIRONMENT & RESOURCE CONSTRAINTS (CRITICAL - READ FIRST)
+--------------------------------------------------------------------------------
+1. PROJECT BRANDING, NAMING & LOCALIZATION:
+   - Project Name: `GorillaLuxe`
+   - Main GUI/Player Executable: `gorillaluxe.exe`
+   - Headless CLI Executable: `gorillaluxe-cli.exe`
+   - Host Data & Shader Cache Path: `%LOCALAPPDATA%\GorillaLuxe\`
+   - Native Bilingual UI: Full support for **Russian (RU)** and **English (EN)** 
+     with instant hot-swapping in the UI and automatic Android Guest locale sync.
+   - Design Philosophy: Modern, consumer-friendly "Luxe Dark" aesthetic (inspired by 
+     GeForce NOW / Steam Overlay). Strictly NO ugly default ImGui blue/sharp windows.
+2. STRICT DISK BUDGET (< 5 GB LOCAL): Your local workspace has limited disk space 
+   and runs on Linux without a physical Windows GPU. 
+   - NEVER clone full AOSP or download multi-gigabyte raw disk images locally.
+   - Cross-compile Windows binaries locally using `cargo-xwin` / `mingw-w64` OR 
+     offload heavy MSVC/C++ builds and WHPX runtime tests to **GitHub Actions** 
+     (`runs-on: windows-latest`).
+3. AUTOMATED CLOUD TESTING VIA GITHUB ACTIONS:
+   - GitHub Actions `windows-latest` runners natively support **WHPX (Windows 
+     Hypervisor Platform)** and **DirectX 12 / Vulkan** (via Microsoft WARP / 
+     SwiftShader / Mesa Lavapipe for headless CI verification).
+   - You must create `.github/workflows/gorillaluxe-ci.yml` to compile the project, 
+     boot the VM under WHPX, run the automated verification tests on every push, 
+     and upload `GorillaLuxe-Win64.zip` (< 35 MB) as a downloadable artifact.
+4. MICRO-GUEST FOR FAST TESTING (< 50 MB):
+   - For Phases 1, 2, and 3, build and boot a 40 MB Minimal Linux 6.1 Guest 
+     (`bzImage` + busybox/drm/vulkan-tools initramfs) to verify WHPX, `virtio-vsock`, 
+     `virtio-gpu` (`gfxstream`), `virtio-input`, and DX12 Zero-Copy sharing.
+   - In Phase 4, the CI script will dynamically fetch the compressed prebuilt 
+     Android 13 GSI/Cuttlefish system image (~800 MB compressed) directly inside the 
+     GitHub Actions runner, pack it into EROFS, and run the verification suite.
+5. GRAPHICS QUALITY IS PARAMOUNT: Visual output on the user's PC must be lossless 
+   (`R8G8B8A8_UNORM`), tear-free, supporting 4K scale at 120-240 FPS with <12ms latency.
+
+
+1. DEFINITIVE ARCHITECTURE & TECH STACK
+--------------------------------------------------------------------------------
+- Host OS: Windows 10 (21H2+) / Windows 11 64-bit (with Windows 11 DWM Dark Mode 
+  & rounded window corner attributes `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`).
+- Hypervisor Backend: Windows Hypervisor Platform (`WHPX` via `WinHvPlatform.dll`).
+- VMM Engine: Custom lightweight VMM in Rust (based on `crosvm` / `whp` crate, 
+  target `x86_64-pc-windows-msvc`).
+- Graphics Virtualization: `virtio-gpu` using `rutabaga_gfx` (`gfxstream` backend: 
+  Vulkan 1.2/1.3 1:1 passthrough + GLES 3.2 via Host Google ANGLE).
+- Host Window & Compositor: Native Rust (`windows-rs` crate) + HLSL. Pure `Win32 API` 
+  window + DirectX 12 (`DXGI 1.6` Flip-Model SwapChain) + DirectComposition.
+  *Note: Must gracefully support hardware GPUs (NVIDIA/AMD/Intel) AND fallback to 
+  `DXGI_ADAPTER_FLAG_SOFTWARE` (WARP) ONLY when `--ci-software-gpu` flag is passed.*
+- In-Game Overlay, Launcher & Keymapper UI: Custom-styled `Dear ImGui` (`imgui-rs` / 
+  `imgui-dx12-renderer`), rendered directly into the DX12 SwapChain command list, 
+  0 extra window overhead, compiled with UTF-8 + Cyrillic glyph ranges + Lucide/ForkAwesome 
+  vector icon font.
+- Audio Subsystem: `virtio-snd` -> Host `WASAPI` in Low-Latency Shared Mode 
+  (`IAudioClient3::InitializeSharedAudioStream`, period <= 10ms).
+- Input Subsystem: Host `WM_INPUT` (Raw Input API) -> `virtio-input` (Linux 
+  Multi-Touch Protocol Type B, `/dev/input/event*` at 1000Hz polling rate).
+- Host-Guest IPC: `virtio-vsock` using gRPC / Protobuf (control plane) + Windows 
+  Named Shared Memory / DXGI Shared Handles (video frame plane).
+- Network Stack: User-mode networking via `virtio-net` + `libslirp` (with SOCKS5 support).
+
+
+2. ULTRA-QUALITY GRAPHICS PIPELINE SPECIFICATION (CRITICAL)
+--------------------------------------------------------------------------------
+2.1. True Zero-Copy GPU Memory Architecture
+- PROHIBITED: Calling `glReadPixels`, `vkCmdCopyImageToBuffer` (to CPU RAM), or 
+  sending uncompressed pixel arrays over sockets for local window rendering.
+- REQUIRED IMPLEMENTATION:
+  1. Guest allocates buffers via `virtio-gpu` blob resources (`VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB`).
+  2. Host (`rutabaga_gfx` / `gfxstream`) backs every guest color buffer with a 
+     native Host Vulkan Image (`VkImage`) created with `VkExternalMemoryImageCreateInfo` 
+     (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT` or `D3D11_TEXTURE_BIT`).
+  3. Export the Vulkan image as a Windows `HANDLE` (`vkGetMemoryWin32HandleKHR`).
+  4. The Host DX12 Compositor opens this shared handle via `ID3D12Device::OpenSharedHandle` 
+     and synchronizes GPU access via shared fences (`ID3D12Fence` <-> `VkSemaphore`).
+
+2.2. Image Enhancement & Lossless Presentation Pipeline
+Inside the GorillaLuxe DX12 Compositor, before calling `IDXGISwapChain4::Present1`, 
+implement a lightweight Post-Processing Compute Pass (< 0.2ms GPU time):
+1. Color Format: Enforce `DXGI_FORMAT_R8G8B8A8_UNORM` (or `R10G10B10A2_UNORM`). 
+   Never convert to YUV420.
+2. Forced 16x Anisotropic Filtering: In the Host `gfxstream` / `ANGLE` sampler 
+   creation hook (`vkCreateSampler`), intercept 3D render target samplers and force 
+   `anisotropyEnable = VK_TRUE`, `maxAnisotropy = 16.0f`.
+3. AMD FidelityFX CAS (Contrast Adaptive Sharpening): Implement a single-pass HLSL 
+   Compute Shader (CAS) that upscales and sharpens the guest render texture to the 
+   native Host monitor resolution. Expose sharpness parameter (`0.0f` to `1.0f`).
+4. Independent Flip & Ultra-Low Latency:
+   - Create Win32 Window with `WS_EX_NOREDIRECTIONBITMAP`.
+   - Create DXGI SwapChain with:
+     * `SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD`
+     * `Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`
+   - Call `SetMaximumFrameLatency(1)` and block the render thread on 
+     `WaitForSingleObjectEx(waitableObject, 1000, true)` before frame composition.
+
+2.3. Shader Stutter Elimination (Pipeline Cache)
+- Implement a persistent on-disk Vulkan Pipeline Cache (`VkPipelineCache`) and 
+  ANGLE Program Binary Cache in `%LOCALAPPDATA%\GorillaLuxe\ShaderCache\`.
+- Compile guest shaders asynchronously on a background worker thread pool.
+
+
+3. SUBSYSTEM SPECIFICATIONS
+--------------------------------------------------------------------------------
+3.1. Memory, Disk & Multi-Instance Optimization
+- Read-Only Base Partitions: `system.img` and `vendor.img` formatted as EROFS (LZ4) 
+  and mounted via `virtio-pmem` with DAX so multiple instances share Host page cache.
+- Userdata Copy-on-Write: `userdata.img` mounted via `virtio-blk` using a sparse 
+  QCOW2 (64KB cluster) overlay.
+- Dynamic RAM Reclaim: Enable `virtio-balloon` (`VIRTIO_BALLOON_F_FREE_PAGE_HINT`). 
+  Host VMM calls `VirtualFree(addr, size, MEM_DECOMMIT)` on free pages to keep idle 
+  Host RAM overhead < 400 MB.
+- Idle Rendering Throttle: When Host window is minimized (`IsIconic(hwnd)`) AND no 
+  headless subscriber is active, throttle Guest VSync timer from 120Hz down to 2Hz.
+- Hybrid CPU Pinning: Detect Intel P-cores and E-cores via `GetLogicalProcessorInformationEx`. 
+  Pin active instance threads to P-cores, and minimized instances to E-cores.
+
+3.2. Precision Input & FPS "Infinite Swipe" State Machine
+- Raw Input: Register mouse via `RegisterRawInputDevices` (`RIDEV_INPUTSINK`). 
+  Process `WM_INPUT` on a dedicated thread with `THREAD_PRIORITY_HIGHEST`.
+- FPS Aiming State Machine (Preventing Camera Lock at Screen Edges):
+  - When FPS Mode is active, map relative mouse deltas (dx, dy) to touch Slot 0 
+    starting at anchor point (X0, Y0) = (0.75 * Width, 0.50 * Height).
+  - Boundary Reset Algorithm: When virtual coordinates (X_curr, Y_curr) reach 
+    within 10% of any screen border:
+    1. Immediately inject `ABS_MT_SLOT = 0`, `ABS_MT_TRACKING_ID = -1`, `SYN_REPORT`.
+    2. Reset (X_curr, Y_curr) = (X0, Y0).
+    3. On the next 1ms tick, inject new `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X = X0`, 
+       `ABS_MT_POSI
