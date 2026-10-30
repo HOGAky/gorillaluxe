@@ -309,8 +309,13 @@ fn avd_quoting_check() -> Check {
     let root = std::env::temp_dir().join("gorillaluxe-avdtest");
     let _ = std::fs::remove_dir_all(&root);
     let sysdir = root.join(r"system-images\android-33\google_apis_playstore\x86_64");
-    match android_runtime::write_avd(&root, &sysdir, &device_profile::PRESETS[0])
-        .and_then(|avd| android_runtime::validate_avd(&avd))
+    match android_runtime::write_avd(
+        &root,
+        &sysdir,
+        &device_profile::PRESETS[0],
+        "angle_indirect",
+    )
+    .and_then(|avd| android_runtime::validate_avd(&avd))
     {
         Ok(()) => {
             // image.sysdir.1 must point at the sysdir with fwd slashes.

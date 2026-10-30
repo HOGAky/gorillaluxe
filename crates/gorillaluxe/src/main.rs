@@ -166,23 +166,31 @@ fn start_android_download(a: &mut App) {
     });
 }
 
+/// Slot the boot-completed poller drops `true` into once the guest
+/// reports `sys.boot_completed=1` (clears the "Booting" HUD chip).
+fn booted_slot() -> &'static Mutex<bool> {
+    static SLOT: OnceLock<Mutex<bool>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(false))
+}
+
 /// Zone D → launch the headless emulator + start the frame pump.
 fn start_android(a: &mut App) {
     a.ui.onboard = Onboard::StartingEmulator;
     let profile = &gorillaluxe_core::system::device_profile::PRESETS[0];
-    let gpu = if a.cfg.ci_software_gpu {
-        "swiftshader_indirect"
-    } else {
-        "host"
-    };
-    // Try hardware acceleration first, fall back to `-accel auto`.
-    let res = android_runtime::launch(profile, gpu, "whpx").or_else(|e| {
-        android_runtime::log_line(&format!("whpx launch failed ({e}); retry accel=auto"));
-        android_runtime::launch(profile, gpu, "auto")
-    });
+    // GPU-aware fallback chain (host → angle_indirect → swiftshader):
+    // Intel iGPUs crash `-gpu host` at Vulkan ext-mem init, so the
+    // chain auto-advances when the engine dies inside 12 s.
+    // WHPX accel first, `-accel auto` as the outer fallback.
+    let res =
+        android_runtime::launch_resilient(profile, "whpx", a.cfg.ci_software_gpu).or_else(|e| {
+            android_runtime::log_line(&format!("whpx chain exhausted ({e}); retry accel=auto"));
+            android_runtime::launch_resilient(profile, "auto", a.cfg.ci_software_gpu)
+        });
     match res {
         Ok(emu) => {
             a.emu = Some(emu);
+            a.ui.booted = false;
+            *booted_slot().lock().unwrap() = false;
             a.ui.onboard = Onboard::WaitingForBoot {
                 elapsed_s: 0,
                 log: "engine spawned — waiting for guest framebuffer".to_string(),
@@ -190,6 +198,8 @@ fn start_android(a: &mut App) {
             let (tx, rx) = mpsc::channel();
             a.frame_rx = Some(rx);
             // Frame bridge: raw `exec-out screencap` → RGBA upload.
+            // Starts IMMEDIATELY — the boot animation streams live;
+            // we never wait for sys.boot_completed before showing it.
             std::thread::spawn(move || loop {
                 match android_runtime::grab_frame() {
                     Ok(f) => {
@@ -210,6 +220,12 @@ fn start_android(a: &mut App) {
                             *shell_slot().lock().unwrap() = Some(sh);
                         }
                         Err(e) => android_runtime::log_line(&format!("adb shell: {e}")),
+                    }
+                    // Boot-completion poll — clears the HUD chip; runs
+                    // in parallel with the live frame stream.
+                    if android_runtime::boot_completed(240) {
+                        android_runtime::log_line("sys.boot_completed=1");
+                        *booted_slot().lock().unwrap() = true;
                     }
                 }
             });
@@ -687,6 +703,10 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     if let Some(sh) = shell_slot().lock().unwrap().take() {
                         a.shell = Some(sh);
                     }
+                }
+                // Boot-completion poller cleared the "Booting" chip.
+                if *booted_slot().lock().unwrap() {
+                    a.ui.booted = true;
                 }
                 let status = engine_status(a.whpx_ok, &a.ui.onboard);
                 a.ui.status = status;

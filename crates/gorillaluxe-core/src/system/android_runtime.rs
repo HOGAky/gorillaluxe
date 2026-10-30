@@ -388,7 +388,13 @@ fn avd_home() -> PathBuf {
 
 /// Create/refresh the `GorillaLuxe` AVD inside the runtime dir.
 /// Paths with spaces are safe — config values, not CLI args.
-pub fn write_avd(root: &Path, sysimg: &Path, profile: &DeviceProfile) -> Result<PathBuf, String> {
+/// `gpu_mode` lands in `hw.gpu.mode` so config and CLI agree.
+pub fn write_avd(
+    root: &Path,
+    sysimg: &Path,
+    _profile: &DeviceProfile,
+    gpu_mode: &str,
+) -> Result<PathBuf, String> {
     let home = root.join("avd");
     let avd = home.join("GorillaLuxe.avd");
     std::fs::create_dir_all(&avd).map_err(|e| e.to_string())?;
@@ -417,15 +423,17 @@ pub fn write_avd(root: &Path, sysimg: &Path, profile: &DeviceProfile) -> Result<
             "hw.cpu.arch=x86_64\n",
             "hw.cpu.ncore=4\n",
             "hw.ramSize=4096\n",
-            "hw.lcd.width=1440\n",
-            "hw.lcd.height=3088\n",
-            "hw.lcd.density={dpi}\n",
+            // 1080x1920 @ 420dpi — fast universal default (~8 MB raw
+            // frames) that streams well on iGPU and dGPU alike.
+            "hw.lcd.width=1080\n",
+            "hw.lcd.height=1920\n",
+            "hw.lcd.density=420\n",
             "hw.keyboard=yes\n",
             "hw.mainKeys=no\n",
             "hw.sensors.proximity=yes\n",
             "hw.camera.back=virtualscene\n",
             "hw.gpu.enabled=yes\n",
-            "hw.gpu.mode=host\n",
+            "hw.gpu.mode={gpu_mode}\n",
             "vm.heapSize=576\n",
             "image.sysdir.1={sysdir}\n",
             "tag.display=Google APIs PlayStore\n",
@@ -439,7 +447,7 @@ pub fn write_avd(root: &Path, sysimg: &Path, profile: &DeviceProfile) -> Result<
             "disk.dataPartition.size=8G\n",
             "fastboot.forceColdBoot=yes\n"
         ),
-        dpi = profile.dpi,
+        gpu_mode = gpu_mode,
         sysdir = sysimg.to_string_lossy().replace('\\', "/"),
     );
     std::fs::write(avd.join("config.ini"), config).map_err(|e| e.to_string())?;
@@ -478,14 +486,19 @@ pub fn validate_avd(avd_dir: &Path) -> Result<(), String> {
 }
 
 /// Launch arguments — `-no-window` keeps Google's Qt window from ever
-/// appearing while gfxstream/ANGLE renders offscreen.
-fn emulator_args(profile: &DeviceProfile, gpu: &str, accel: &str) -> Vec<String> {
-    let mut v = vec![
+/// appearing while gfxstream/ANGLE renders offscreen. `-no-metrics`
+/// silences the usage-stats banner; the boot animation is intentionally
+/// kept (screencap streams it live so boot never looks frozen).
+/// NEVER pass `-prop ro.product.*` here — overriding
+/// hardware/board/device props makes Android 13 `init` fail to locate
+/// `init.ranchu.rc` and the guest bootloops (sys.boot_completed never 1).
+fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
+    vec![
         "-avd".into(),
         "GorillaLuxe".into(),
         "-no-window".into(),
-        "-no-boot-anim".into(),
         "-no-snapshot".into(),
+        "-no-metrics".into(),
         "-accel".into(),
         accel.to_string(),
         "-gpu".into(),
@@ -499,18 +512,7 @@ fn emulator_args(profile: &DeviceProfile, gpu: &str, accel: &str) -> Vec<String>
         "-netspeed".into(),
         "full".into(),
         "-verbose".into(),
-    ];
-    for (k, val) in [
-        ("ro.product.model", profile.model),
-        ("ro.product.brand", profile.brand),
-        ("ro.product.device", profile.device),
-        ("ro.product.board", profile.board),
-        ("ro.product.hardware", profile.hardware),
-    ] {
-        v.push("-prop".into());
-        v.push(format!("{k}={val}"));
-    }
-    v
+    ]
 }
 
 /// Boot Android headlessly. `gpu` = `"host"` (gfxstream→ANGLE→D3D) or
@@ -523,7 +525,7 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
         return Err("Android runtime not installed".into());
     };
     let root = runtime_dir();
-    write_avd(&root, &sysimg, profile)?;
+    write_avd(&root, &sysimg, profile, gpu)?;
     // Engine stdout+stderr → logs\emulator.log so an early exit (e.g.
     // "PANIC: Cannot find AVD system path") is diagnosable.
     let logs = data_dir().join("logs");
@@ -535,7 +537,7 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
         .map_err(|e| format!("emulator.log: {e}"))?;
     let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
     let child = super::silent_cmd(&emulator)
-        .args(emulator_args(profile, gpu, accel))
+        .args(emulator_args(gpu, accel))
         .current_dir(emulator.parent().unwrap())
         // Point the engine entirely inside our runtime dir — AVD and
         // SDK resolution never touch the user's global ~/.android.
@@ -563,6 +565,120 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
 /// `true` while the emulator process is alive.
 pub fn alive(emu: &mut EmulatorProc) -> bool {
     matches!(emu.child.try_wait(), Ok(None))
+}
+
+// ---------------------------------------------------------------------------
+// GPU auto-selection + resilient fallback
+// ---------------------------------------------------------------------------
+
+/// VendorId of the primary DXGI adapter (0x10DE NVIDIA, 0x1002 AMD,
+/// 0x8086 Intel). `None` when enumeration fails — treat as discrete.
+pub fn primary_gpu_vendor() -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for i in 0u32.. {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            // Skip Microsoft's software (WARP/BasicRender) adapter.
+            if desc.VendorId != 0x1414 {
+                return Some(desc.VendorId);
+            }
+        }
+        None
+    }
+}
+
+/// Ordered `-gpu` candidates for the fallback chain. Intel iGPUs crash
+/// `host` mode at Vulkan external-memory init → lead with ANGLE/D3D11;
+/// discrete NVIDIA/AMD get `host` first; CI forces pure software.
+pub fn gpu_chain(force_swiftshader: bool) -> Vec<&'static str> {
+    if force_swiftshader {
+        return vec!["swiftshader_indirect"];
+    }
+    match primary_gpu_vendor() {
+        Some(0x8086) => vec!["angle_indirect", "host", "swiftshader_indirect"],
+        _ => vec!["host", "angle_indirect", "swiftshader_indirect"],
+    }
+}
+
+/// Delete stale qemu lock files that block a cold relaunch after an
+/// unclean exit (`multiinstance.lock`, `hardware-qemu.ini.lock`, etc).
+fn purge_stale_locks(avd: &Path) {
+    if let Ok(rd) = std::fs::read_dir(avd) {
+        for e in rd.flatten() {
+            if e.path().extension().is_some_and(|x| x == "lock") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+/// Last lines of `logs\emulator.log` — surfaced in errors/UI on early exit.
+fn emulator_log_tail() -> String {
+    let p = data_dir().join("logs").join("emulator.log");
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Spawn → watch 12 s → if the engine died, retry with the next `-gpu`
+/// mode in the vendor-aware chain. Guarantees a boot on every GPU
+/// (NVIDIA/AMD `host`, Intel `angle_indirect`, software last resort)
+/// without user intervention. `accel` = `"whpx"` or `"auto"`.
+pub fn launch_resilient(
+    profile: &DeviceProfile,
+    accel: &str,
+    force_swiftshader: bool,
+) -> Result<EmulatorProc, String> {
+    let chain = gpu_chain(force_swiftshader);
+    let mut last = String::new();
+    for (i, gpu) in chain.iter().enumerate() {
+        // Remove stale locks BEFORE qemu grabs the AVD — leftover
+        // `*.lock` files from an unclean exit block cold relaunch.
+        purge_stale_locks(&avd_home().join("GorillaLuxe.avd"));
+        let mut emu = match launch(profile, gpu, accel) {
+            Ok(e) => e,
+            Err(e) => {
+                last = format!("gpu={gpu}: {e}");
+                log_line(&format!("launch attempt {i} failed: {last}"));
+                continue;
+            }
+        };
+        emu.retried = i > 0;
+        // Watch: a GPU-mode failure kills emulator.exe within ~2-10 s.
+        let deadline = Instant::now() + std::time::Duration::from_secs(12);
+        let mut alive_past = true;
+        while Instant::now() < deadline {
+            if !alive(&mut emu) {
+                alive_past = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if alive_past {
+            log_line(&format!(
+                "emulator stable on -gpu {gpu} (attempt {})",
+                i + 1
+            ));
+            return Ok(emu);
+        }
+        last = format!("gpu={gpu}: exited within 12s — {}", emulator_log_tail());
+        log_line(&format!("launch attempt {} failed: {last}", i + 1));
+        emu.shutdown();
+    }
+    Err(format!("all GPU modes failed ({accel}): {last}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +792,22 @@ pub fn wait_for_device() -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// `true` once the guest reports `sys.boot_completed=1` — polled every
+/// 2 s, up to `timeout_s`. Frame streaming must NOT wait on this: the
+/// boot animation is live-captured the moment adbd answers.
+pub fn boot_completed(timeout_s: u64) -> bool {
+    let deadline = Instant::now() + std::time::Duration::from_secs(timeout_s);
+    while Instant::now() < deadline {
+        if let Ok(out) = adb_run(&["shell", "getprop", "sys.boot_completed"]) {
+            if out.trim() == "1" {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    false
 }
 
 /// Install an `.apk`/`.xapk` dropped onto the window (`-r` = reinstall).

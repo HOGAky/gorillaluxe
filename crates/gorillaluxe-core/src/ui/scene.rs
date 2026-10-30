@@ -184,6 +184,10 @@ pub struct UiState {
     /// Real engine status shown in the Zone B pill — replaces the old
     /// MVP placeholder (e.g. "GorillaLuxe Engine | WHPX: Ready | A13").
     pub status: String,
+    /// Guest reached `sys.boot_completed=1`. While `false` with the
+    /// emulator Running, a small "Booting Android..." chip renders so
+    /// the boot animation never looks stuck.
+    pub booted: bool,
 }
 
 impl Default for UiState {
@@ -204,6 +208,7 @@ impl Default for UiState {
             palette_drag: None,
             onboard: Onboard::Hidden,
             status: "GorillaLuxe Engine".to_string(),
+            booted: true,
         }
     }
 }
@@ -424,6 +429,20 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
             TEXT_MUTED,
             &mut v,
         );
+        // Non-blocking "Booting Android..." chip while the guest boots
+        // — frames already stream live underneath it.
+        if matches!(st.onboard, Onboard::Running) && !st.booted {
+            let bt = tr(lang, "ui.onboard.booting");
+            let bw = text_width(atlas, bt, FONT_HUD);
+            let by = sty + FONT_HUD as f32 + 8.0 + ITEM_SPACING;
+            v.push(Instance::rect(
+                [16.0, by - 2.0],
+                [bw + PAD_FRAME_X * 2.0, FONT_HUD as f32 + 8.0],
+                BG_SURFACE,
+                R_FRAME,
+            ));
+            layout_text(atlas, bt, FONT_HUD, 16.0 + PAD_FRAME_X, by, ACCENT, &mut v);
+        }
     }
 
     // ---- Zone C: keymapper canvas -------------------------------------------
