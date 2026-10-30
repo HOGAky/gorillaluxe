@@ -316,7 +316,10 @@ pub fn glyph_fill_violations(atlas: &FontAtlas) -> (usize, Vec<u16>) {
         }
         // A correct letter can reach ~100% ink but never ~all 255 —
         // a solid 0xFF cell is the GDI-fallback rectangle symptom.
-        let solid = sat * 100 > 75 * area;
+        // Bar-shaped glyphs (I, l, |, palochka І/Ӏ/ꏆ) legitimately
+        // saturate a narrow cell, so only ~square blocks (gw >= gh/2)
+        // count as fallback rectangles.
+        let solid = sat * 100 > 75 * area && gw * 2 >= gh;
         let letter = matches!(ch, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x0400..=0x052F);
         let empty = letter && nz * 100 < 5 * area;
         if solid || empty {
