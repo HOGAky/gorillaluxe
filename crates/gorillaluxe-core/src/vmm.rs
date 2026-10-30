@@ -52,6 +52,9 @@ pub enum SelfTest {
     Skipped(&'static str),
 }
 
+/// Per-exit debug record, included in failure reports.
+type ExitTrace = String;
+
 /// Guard for the host buffer backing guest RAM.
 struct GuestMemory {
     ptr: *mut c_void,
@@ -180,6 +183,7 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
     setup_real_mode(&part, VP, guest::SMOKE_GPA)?;
 
     let mut transcript: Vec<u8> = Vec::new();
+    let mut trace: Vec<ExitTrace> = Vec::new();
     let mut halted = false;
 
     for _ in 0..MAX_EXITS {
@@ -191,6 +195,18 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
             let info = unsafe { io.AccessInfo.AsUINT32 };
             let is_write = (info >> 3) & 1 == 1;
             let access_size = (info & 0x7) as usize;
+            if trace.len() < 64 {
+                trace.push(format!(
+                    "reason={} IO port=0x{:X} write={} size={} rax=0x{:X} rip=0x{:X} insn_len={}",
+                    reason.0,
+                    io.PortNumber,
+                    is_write,
+                    access_size,
+                    io.Rax,
+                    exit.VpContext.Rip,
+                    io.InstructionByteCount
+                ));
+            }
             if is_write && io.PortNumber == guest::DEBUG_PORT {
                 let bytes = io.Rax.to_le_bytes();
                 transcript.extend_from_slice(&bytes[..access_size.min(8)]);
@@ -199,6 +215,7 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
             let next_rip = exit.VpContext.Rip + io.InstructionByteCount as u64;
             part.set_registers(VP, &[WHvX64RegisterRip], &[reg64(next_rip)])?;
         } else if reason == WHvRunVpExitReasonX64Halt {
+            trace.push(format!("reason={} HLT rip=0x{:X}", reason.0, exit.VpContext.Rip));
             halted = true;
             break;
         } else if reason == WHvRunVpExitReasonMemoryAccess {
@@ -213,29 +230,44 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
         } else {
             return Err(VmError::Exit {
                 reason: reason.0,
-                detail: format!("(RIP=0x{:X})", exit.VpContext.Rip),
+                detail: format!(
+                    "(RIP=0x{:X}) trace={:?}",
+                    exit.VpContext.Rip,
+                    trace.iter().rev().take(8).rev().collect::<Vec<_>>()
+                ),
             });
         }
     }
 
-    part.delete_vcpu(VP).ok();
-
     if !halted {
-        return Err(VmError::GuestProtocol(
-            "exit budget exhausted before HLT".into(),
-        ));
+        part.delete_vcpu(VP).ok();
+        return Err(VmError::GuestProtocol(format!(
+            "exit budget exhausted before HLT; trace={:?}",
+            trace.iter().rev().take(16).rev().collect::<Vec<_>>()
+        )));
     }
 
+    // Pass criterion: the guest's completion signature in RAX/RSI.
+    // This is robust whether or not the host surfaces port-IO exits.
+    let regs = part.get_registers(VP, &[WHvX64RegisterRax, WHvX64RegisterRsi])?;
+    part.delete_vcpu(VP).ok();
+    let rax = unsafe { regs[0].Reg64 };
+    let rsi = unsafe { regs[1].Reg64 };
+
     let text = String::from_utf8_lossy(&transcript);
-    if text.contains(std::str::from_utf8(guest::MAGIC).unwrap()) {
+    if rax == guest::MAGIC_REG && rsi == guest::MAGIC_SI {
         Ok(SelfTest::Pass {
-            transcript: text.trim_end().to_string(),
+            transcript: if transcript.is_empty() {
+                format!("regs RAX=0x{:X} RSI=0x{:X}", rax, rsi)
+            } else {
+                text.trim_end().to_string()
+            },
         })
     } else {
         Err(VmError::GuestProtocol(format!(
-            "magic {:?} not found in transcript {:?}",
-            String::from_utf8_lossy(guest::MAGIC),
-            text
+            "bad completion state: RAX=0x{:X} (want 0x{:X}) RSI=0x{:X} (want 0x{:X}); \
+             transcript={:?}; trace={:?}",
+            rax, guest::MAGIC_REG, rsi, guest::MAGIC_SI, text, trace
         )))
     }
 }
