@@ -53,11 +53,11 @@ jobs:
       - name: Phase 1 acceptance — WHPX vCPU smoke test
         shell: pwsh
         run: |
-          .\target\release\gorillaluxe-cli.exe --self-test --lang en
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test --lang en 2>&1 | Tee-Object p1.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p1.log; exit 1 }
           Write-Host "PHASE1-CI: gorillaluxe-cli --self-test exited 0"
-          .\target\release\gorillaluxe-cli.exe --self-test --lang ru
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test --lang ru 2>&1 | Tee-Object p1-ru.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p1-ru.log; exit 1 }
           Write-Host "PHASE1-CI: RU locale run exited 0"
 
       - name: Phase 2 acceptance — DX12 zero-copy + CAS + Luxe Dark UI
@@ -66,11 +66,11 @@ jobs:
           # Automated Verification Test 2: shared texture import via
           # OpenSharedHandle + shared fence, HLSL CAS SSIM>=0.99,
           # Cyrillic atlas coverage, RU/EN hot-swap <1ms, flip swapchain.
-          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang en
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang en 2>&1 | Tee-Object p2.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p2.log; exit 1 }
           Write-Host "PHASE2-CI: gorillaluxe-cli --self-test-gfx exited 0"
-          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang ru
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang ru 2>&1 | Tee-Object p2-ru.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p2-ru.log; exit 1 }
           Write-Host "PHASE2-CI: RU locale run exited 0"
 
       - name: Phase 3 acceptance — Infinite Swipe, WASAPI, keymap roundtrip
@@ -79,11 +79,11 @@ jobs:
           # Automated Verification Test 3: 10,000 px continuous motion,
           # ABS_MT_TRACKING_ID cycling <2ms, no screen-bound stall,
           # WASAPI init/fallback, keymap.json roundtrip.
-          .\target\release\gorillaluxe-cli.exe --self-test-input --lang en
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-input --lang en 2>&1 | Tee-Object p3.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p3.log; exit 1 }
           Write-Host "PHASE3-CI: gorillaluxe-cli --self-test-input exited 0"
-          .\target\release\gorillaluxe-cli.exe --self-test-input --lang ru
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-input --lang ru 2>&1 | Tee-Object p3-ru.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p3-ru.log; exit 1 }
           Write-Host "PHASE3-CI: RU locale run exited 0"
 
       - name: Phase 4 acceptance — long mode, downloader, AVD, shm, manifests
@@ -94,11 +94,11 @@ jobs:
           # + api-33 x86_64 sysimg), native ureq+zip real-archive download,
           # AVD/config.ini strict validation, raw screencap header parse,
           # atlas streak check, profiles/sensors/shm/lz4/cpu-pinning.
-          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang en
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang en 2>&1 | Tee-Object p4.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p4.log; exit 1 }
           Write-Host "PHASE4-CI: gorillaluxe-cli --self-test-phase4 exited 0"
-          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang ru
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang ru 2>&1 | Tee-Object p4-ru.log
+          if ($LASTEXITCODE -ne 0) { .\.github\fail.ps1 p4-ru.log; exit 1 }
           Write-Host "PHASE4-CI: RU locale run exited 0"
 
       - name: Package GorillaLuxe-Win64.zip
