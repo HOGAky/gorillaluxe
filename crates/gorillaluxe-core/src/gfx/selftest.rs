@@ -26,7 +26,7 @@ use super::{hr, reset_steady_state_counter, stats, GResult};
 use crate::i18n::{set_lang, trc, Lang};
 use crate::ui::atlas::{self};
 use crate::ui::renderer::UiRenderer;
-use crate::ui::scene::{build_scene, HudStats};
+use crate::ui::scene::{build_frame, HudStats, UiState};
 
 const GW: u32 = 1024;
 const GH: u32 = 576;
@@ -51,6 +51,9 @@ pub struct Report {
     pub hotswap_us: f64,
     pub hotswap_changed: bool,
     pub ui_nonblack: bool,
+    /// Phase 3: glyph cells must be letter shapes, not solid blocks.
+    pub glyph_cells: usize,
+    pub glyph_fill_bad: usize,
     pub steady_bytes: u64,
     pub verification_bytes: u64,
 }
@@ -65,6 +68,8 @@ impl Report {
             && self.hotswap_us < HOTSWAP_US_MAX
             && self.hotswap_changed
             && self.ui_nonblack
+            && self.glyph_cells > 0
+            && self.glyph_fill_bad == 0
             && self.steady_bytes == 0
     }
 }
@@ -264,7 +269,8 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
             .CreateRenderTargetView(&ui_rt, None, rtv);
     }
     let stats_h = HudStats { fps: 240, frame_ms: 4.2, backend: "DX12 Zero-Copy | WARP" };
-    let instances = build_scene(DW as f32, DH as f32, Lang::En, &atlas, &stats_h);
+    let mut ui_state = UiState::default();
+    let instances = build_frame(DW as f32, DH as f32, &ui_state, &atlas, &stats_h).instances;
     let (_ua, ulist) = host.cmd()?;
     unsafe {
         // `sharpened` is left in COPY_SOURCE by the readback — return it to
@@ -302,11 +308,16 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         .filter(|c| atlas.glyphs.get(c).map(|g| g.coverage > 0).unwrap_or(false))
         .count();
 
+    // ---- (3b) Glyph cells must be letter shapes, not solid blocks -----
+    let (glyph_cells, glyph_bad) = atlas::glyph_fill_violations(&atlas);
+    let glyph_fill_bad = glyph_bad.len();
+
     // ---- (4) RU<->EN hot-swap < 1 ms -----------------------------------
     let t0 = Instant::now();
     set_lang(Lang::Ru);
     let ru = trc("ui.phase2");
-    let _ = build_scene(DW as f32, DH as f32, Lang::Ru, &atlas, &stats_h);
+    ui_state.lang = Lang::Ru;
+    let _ = build_frame(DW as f32, DH as f32, &ui_state, &atlas, &stats_h);
     set_lang(Lang::En);
     let en = trc("ui.phase2");
     let hotswap_us = t0.elapsed().as_secs_f64() * 1e6;
@@ -363,6 +374,8 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
         hotswap_us,
         hotswap_changed,
         ui_nonblack,
+        glyph_cells,
+        glyph_fill_bad,
         steady_bytes: s.steady_state_cpu_copy_bytes.load(std::sync::atomic::Ordering::SeqCst),
         verification_bytes: s
             .verification_copy_bytes

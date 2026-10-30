@@ -90,6 +90,26 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("gfx.atlas.ok", "Cyrillic glyph coverage verified", "Покрытие кириллических глифов проверено"),
     ("gfx.hotswap.ok", "RU/EN hot-swap under 1 ms", "Переключение RU/EN быстрее 1 мс"),
     ("gfx.steady.zero", "steady_state_cpu_copy_bytes == 0", "steady_state_cpu_copy_bytes == 0"),
+    // Phase 3 — interactive UI, keymapper, WHPX auto-setup.
+    ("ui.resolution", "Resolution", "Разрешение"),
+    ("ui.fps_cap", "FPS cap", "Лимит FPS"),
+    ("ui.fps_aim", "FPS AIM", "FPS ПРИЦЕЛ"),
+    ("ui.keymapper.hint", "Drag widgets onto the screen, click to bind keys",
+     "Перетащите виджеты на экран, нажмите для привязки клавиш"),
+    ("ui.apk.dropped", "Installing", "Установка"),
+    ("ui.apk.hint", "Drop an .apk/.xapk onto the window", "Перетащите .apk/.xapk на окно"),
+    ("ui.shot.saved", "Screenshot saved", "Скриншот сохранён"),
+    ("ui.whpx.missing", "WHPX acceleration unavailable", "Ускорение WHPX недоступно"),
+    ("ui.whpx.enable", "Enable WHPX Acceleration in 1 Click",
+     "Включить ускорение WHPX в 1 клик"),
+    ("ui.whpx.restart", "[ Restart PC ]", "[ Перезагрузить ПК ]"),
+    ("ui.whpx.done", "WHPX enabled — restart to apply", "WHPX включён — требуется перезагрузка"),
+    ("ui.whpx.uac_denied", "Elevation declined", "Права администратора отклонены"),
+    ("input.selftest", "Phase 3 self-test: infinite swipe + WASAPI + keymap",
+     "Самотест фазы 3: infinite swipe + WASAPI + keymap"),
+    ("cli.auto_setup", "Launching elevated WHPX setup...", "Запуск настройки WHPX с правами администратора..."),
+    ("cli.setup_done", "Windows features enabled — please restart your PC",
+     "Компоненты Windows включены — перезагрузите компьютер"),
 ];
 
 #[cfg(test)]

@@ -208,6 +208,48 @@ pub fn cyrillic_coverage(atlas: &FontAtlas) -> u64 {
         .sum()
 }
 
+/// Phase-3 visual QA: verify every rasterized glyph cell is a real
+/// letter shape, not a solid block — saturated (255) pixels must stay
+/// <= 75% of the cell and letter cells must contain >= 5% ink.
+/// Returns (cells_checked, offending_codepoints).
+pub fn glyph_fill_violations(atlas: &FontAtlas) -> (usize, Vec<u16>) {
+    let mut checked = 0usize;
+    let mut bad: Vec<u16> = Vec::new();
+    for (&ch, g) in &atlas.glyphs {
+        let px0 = (g.uv[0] * atlas.width as f32) as u32;
+        let py0 = (g.uv[1] * atlas.height as f32) as u32;
+        let gw = (g.uv[2] * atlas.width as f32) as u32;
+        let gh = (g.uv[3] * atlas.height as f32) as u32;
+        let area = (gw * gh) as usize;
+        if area < 9 {
+            continue; // dots/diacritics too small to judge
+        }
+        checked += 1;
+        let mut sat = 0usize;
+        let mut nz = 0usize;
+        for y in 0..gh {
+            for x in 0..gw {
+                let v = atlas.pixels[((py0 + y) * atlas.width + px0 + x) as usize];
+                if v == 255 {
+                    sat += 1;
+                }
+                if v > 0 {
+                    nz += 1;
+                }
+            }
+        }
+        // A correct letter can reach ~100% ink but never ~all 255 —
+        // a solid 0xFF cell is the GDI-fallback rectangle symptom.
+        let solid = sat * 100 > 75 * area;
+        let letter = matches!(ch, 0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x0400..=0x052F);
+        let empty = letter && nz * 100 < 5 * area;
+        if solid || empty {
+            bad.push(ch);
+        }
+    }
+    (checked, bad)
+}
+
 /// Convenience: UI + header atlases used by the compositor.
 pub fn build_ui_atlases() -> Result<(FontAtlas, FontAtlas), String> {
     Ok((build(FONT_UI)?, build(FONT_HEADER)?))

@@ -124,6 +124,51 @@ impl SwapChain {
                 .map_err(|e| hr("Present", e))
         }
     }
+
+    /// `WM_SIZE` path (Phase 3): wait for GPU, release back buffers,
+    /// `ResizeBuffers`, rebuild RTVs. Caller must ensure no in-flight
+    /// work references the back buffers (fence-synchronize first).
+    pub fn resize(&mut self, dx: &Dx12, w: u32, h: u32) -> GResult<()> {
+        if w == 0 || h == 0 || (w == self.width && h == self.height) {
+            return Ok(());
+        }
+        dx.wait_idle()?;
+        unsafe {
+            self.buffers.clear();
+            self.chain
+                .ResizeBuffers(
+                    BUFFER_COUNT,
+                    w,
+                    h,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                        | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+                )
+                .map_err(|e| hr("ResizeBuffers", e))?;
+            let incr = dx
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+                as usize;
+            let base = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            for i in 0..BUFFER_COUNT {
+                let buf = self
+                    .chain
+                    .GetBuffer::<ID3D12Resource>(i)
+                    .map_err(|e| hr("GetBuffer", e))?;
+                dx.device.CreateRenderTargetView(
+                    &buf,
+                    None,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: base.ptr + i as usize * incr,
+                    },
+                );
+                self.buffers.push(buf);
+            }
+        }
+        self.width = w;
+        self.height = h;
+        Ok(())
+    }
 }
 
 impl Drop for SwapChain {

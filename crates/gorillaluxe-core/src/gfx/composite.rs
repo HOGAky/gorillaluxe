@@ -50,6 +50,31 @@ impl Composite {
         )
     }
 
+    /// Record the Luxe Dark ambient backdrop (live GUI): obsidian +
+    /// grid + golden glow instead of the selftest checkerboard.
+    /// `guest` must currently be in `before`; left in
+    /// NON_PIXEL_SHADER_RESOURCE for the CAS pass.
+    pub fn ambient_frame(
+        &self,
+        dx: &Dx12,
+        list: &ID3D12GraphicsCommandList,
+        guest: &ID3D12Resource,
+        w: u32,
+        h: u32,
+        before: D3D12_RESOURCE_STATES,
+    ) -> GResult<()> {
+        super::pattern::render_ambient_frame(
+            dx,
+            &self.pattern,
+            list,
+            guest,
+            w,
+            h,
+            before,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )
+    }
+
     /// Record CAS: `guest` (NON_PIXEL_SHADER_RESOURCE) -> `out`
     /// (transitioned COMMON/other -> UNORDERED_ACCESS -> PIXEL_SHADER_RESOURCE).
     /// `out_before` is `out`'s current state.

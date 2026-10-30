@@ -36,6 +36,7 @@ pub fn pattern_image(w: u32, h: u32) -> Vec<u8> {
 pub struct PatternPass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    ambient_pso: ID3D12PipelineState,
     heap: ID3D12DescriptorHeap,
 }
 
@@ -47,19 +48,23 @@ impl PatternPass {
                 .device
                 .CreateRootSignature::<ID3D12RootSignature>(0, &blob)
                 .map_err(|e| hr("CreateRootSignature(pattern)", e))?;
-            let pso = dx
-                .device
-                .CreateComputePipelineState::<ID3D12PipelineState>(
-                    &D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: blob.as_ptr() as *const _,
-                            BytecodeLength: blob.len(),
+            let mk = |src: &str, entry: &'static str| -> GResult<ID3D12PipelineState> {
+                let b = shader::compile(src, entry, "cs_5_1\0")?;
+                dx.device
+                    .CreateComputePipelineState::<ID3D12PipelineState>(
+                        &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                            CS: D3D12_SHADER_BYTECODE {
+                                pShaderBytecode: b.as_ptr() as *const _,
+                                BytecodeLength: b.len(),
+                            },
+                            ..Default::default()
                         },
-                        ..Default::default()
-                    },
-                )
-                .map_err(|e| hr("CreateComputePipelineState(pattern)", e))?;
+                    )
+                    .map_err(|e| hr("CreateComputePipelineState(pattern)", e))
+            };
+            let pso = mk(shader::PATTERN_SRC, shader::PATTERN_ENTRY)?;
+            let ambient_pso = mk(shader::AMBIENT_SRC, shader::PATTERN_ENTRY)?;
             let heap = dx
                 .device
                 .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -69,19 +74,18 @@ impl PatternPass {
                     NodeMask: 0,
                 })
                 .map_err(|e| hr("CreateDescriptorHeap(pattern)", e))?;
-            Ok(PatternPass { root, pso, heap })
+            Ok(PatternPass { root, pso, ambient_pso, heap })
         }
     }
 
-    /// Dispatch the pattern write. `dst` must be in UNORDERED_ACCESS state
-    /// before and stays there after (caller manages barriers around it).
-    pub fn dispatch(
+    fn record(
         &self,
         dx: &Dx12,
         list: &ID3D12GraphicsCommandList,
         dst: &ID3D12Resource,
         w: u32,
         h: u32,
+        ambient: bool,
     ) -> GResult<()> {
         unsafe {
             let cpu = self.heap.GetCPUDescriptorHandleForHeapStart();
@@ -98,13 +102,38 @@ impl PatternPass {
             );
             list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             list.SetComputeRootSignature(&self.root);
-            list.SetPipelineState(&self.pso);
+            list.SetPipelineState(if ambient { &self.ambient_pso } else { &self.pso });
             list.SetComputeRootDescriptorTable(0, gpu);
             let consts: [u32; 4] = [w, h, 0, 0];
             list.SetComputeRoot32BitConstants(1, 4, consts.as_ptr() as *const _, 0);
             list.Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
             Ok(())
         }
+    }
+
+    /// Dispatch the pattern write. `dst` must be in UNORDERED_ACCESS state
+    /// before and stays there after (caller manages barriers around it).
+    pub fn dispatch(
+        &self,
+        dx: &Dx12,
+        list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        w: u32,
+        h: u32,
+    ) -> GResult<()> {
+        self.record(dx, list, dst, w, h, false)
+    }
+
+    /// Dispatch the Luxe Dark ambient backdrop (live GUI path).
+    pub fn dispatch_ambient(
+        &self,
+        dx: &Dx12,
+        list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        w: u32,
+        h: u32,
+    ) -> GResult<()> {
+        self.record(dx, list, dst, w, h, true)
     }
 }
 
@@ -119,10 +148,42 @@ pub fn render_guest_frame(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> GResult<()> {
+    render_frame_impl(dx, pass, list, dst, w, h, before, after, false)
+}
+
+/// Record the Luxe Dark ambient backdrop into `dst` (live GUI path).
+pub fn render_ambient_frame(
+    dx: &Dx12,
+    pass: &PatternPass,
+    list: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    w: u32,
+    h: u32,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> GResult<()> {
+    render_frame_impl(dx, pass, list, dst, w, h, before, after, true)
+}
+
+fn render_frame_impl(
+    dx: &Dx12,
+    pass: &PatternPass,
+    list: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    w: u32,
+    h: u32,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+    ambient: bool,
+) -> GResult<()> {
     unsafe {
         list.ResourceBarrier(&[barrier(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
     }
-    pass.dispatch(dx, list, dst, w, h)?;
+    if ambient {
+        pass.dispatch_ambient(dx, list, dst, w, h)?;
+    } else {
+        pass.dispatch(dx, list, dst, w, h)?;
+    }
     unsafe {
         list.ResourceBarrier(&[barrier(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, after)]);
     }

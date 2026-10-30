@@ -145,6 +145,25 @@ impl Dx12 {
             Ok(())
         }
     }
+
+    /// Block until all submitted queue work completes (used before
+    /// `IDXGISwapChain::ResizeBuffers` — back buffers must be idle).
+    pub fn wait_idle(&self) -> GResult<()> {
+        unsafe {
+            let v = self.fence_value.get() + 1;
+            self.fence_value.set(v);
+            self.queue
+                .Signal(&self.fence, v)
+                .map_err(|e| hr("Queue::Signal", e))?;
+            if self.fence.GetCompletedValue() < v {
+                self.fence
+                    .SetEventOnCompletion(v, self.fence_event)
+                    .map_err(|e| hr("SetEventOnCompletion", e))?;
+                WaitForSingleObject(self.fence_event, 30_000);
+            }
+            Ok(())
+        }
+    }
 }
 
 impl Drop for Dx12 {

@@ -200,6 +200,33 @@ float4 PSMain(VsOut i) : SV_Target {
         float d = length(max(q, 0.0f)) - i.radius;
         a *= 1.0f - saturate(d + 0.5f);
     }
-    return float4(i.color.rgb, a);
+    // Premultiplied output — SrcBlend is ONE: without the *a term
+    // every glyph/rect quad adds full rgb even where alpha == 0,
+    // which renders text as solid blocks.
+    return float4(i.color.rgb * a, a);
+}
+"#;
+
+/// Luxe Dark ambient backdrop for the live compositor (spec §3.6):
+/// deep obsidian, subtle dark grid lines, soft golden center glow.
+/// Same root signature as PATTERN_SRC.
+pub const AMBIENT_SRC: &str = r#"
+cbuffer Params : register(b0) { uint W; uint H; uint Pad0; uint Pad1; }
+RWTexture2D<float4> Dst : register(u0);
+
+[RootSignature("DescriptorTable(UAV(u0)),RootConstants(num32BitConstants=4,b0)")]
+[numthreads(8,8,1)]
+void CSMain(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= W || tid.y >= H) return;
+    float2 c = (float2(tid.xy) + 0.5f) / float2(W, H) - float2(0.5f, 0.42f);
+    float d = length(c * float2(1.15f, 1.0f));
+    float3 base = lerp(
+        float3(22.0f, 24.0f, 33.0f) / 255.0f,
+        float3(13.0f, 14.0f, 18.0f) / 255.0f,
+        saturate(d * 1.6f));
+    float grid = ((tid.x % 64u) == 0u || (tid.y % 64u) == 0u) ? (5.0f / 255.0f) : 0.0f;
+    float glow = exp(-d * d * 9.0f) * 0.16f;
+    float3 col = base + grid + float3(0xF5, 0xA6, 0x23) / 255.0f * glow;
+    Dst[tid.xy] = float4(col, 1.0f);
 }
 "#;

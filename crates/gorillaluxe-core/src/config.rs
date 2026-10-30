@@ -11,11 +11,23 @@ pub struct Config {
     pub ci_software_gpu: bool,
     /// FidelityFX CAS sharpness 0.0..=1.0 (Phase 2+).
     pub cas_sharpness: f32,
+    /// Compositor resolution preset (Phase 3 settings panel).
+    pub res_w: u32,
+    pub res_h: u32,
+    /// Frame cap (60/120/240).
+    pub fps_cap: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { lang: Lang::En, ci_software_gpu: false, cas_sharpness: 0.5 }
+        Config {
+            lang: Lang::En,
+            ci_software_gpu: false,
+            cas_sharpness: 0.5,
+            res_w: 1920,
+            res_h: 1080,
+            fps_cap: 120,
+        }
     }
 }
 
@@ -69,6 +81,21 @@ impl Config {
                         cfg.cas_sharpness = f.clamp(0.0, 1.0);
                     }
                 }
+                ("res", v) => {
+                    if let Some((w, h)) = v.split_once('x') {
+                        if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                            if w >= 320 && h >= 240 && w <= 8192 && h <= 8192 {
+                                cfg.res_w = w;
+                                cfg.res_h = h;
+                            }
+                        }
+                    }
+                }
+                ("fps_cap", v) => {
+                    if let Ok(f) = v.parse::<u32>() {
+                        cfg.fps_cap = f.clamp(30, 1000);
+                    }
+                }
                 _ => {}
             }
         }
@@ -79,10 +106,13 @@ impl Config {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
         let text = format!(
-            "lang={}\nci_software_gpu={}\ncas_sharpness={}\n",
+            "lang={}\nci_software_gpu={}\ncas_sharpness={}\nres={}x{}\nfps_cap={}\n",
             self.lang.code(),
             self.ci_software_gpu as u8,
-            self.cas_sharpness
+            self.cas_sharpness,
+            self.res_w,
+            self.res_h,
+            self.fps_cap
         );
         std::fs::write(Self::path(), text)
     }

@@ -58,12 +58,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "PHASE2-CI: RU locale run exited 0"
 
+      - name: Phase 3 acceptance — Infinite Swipe, WASAPI, keymap roundtrip
+        shell: pwsh
+        run: |
+          # Automated Verification Test 3: 10,000 px continuous motion,
+          # ABS_MT_TRACKING_ID cycling <2ms, no screen-bound stall,
+          # WASAPI init/fallback, keymap.json roundtrip.
+          .\target\release\gorillaluxe-cli.exe --self-test-input --lang en
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE3-CI: gorillaluxe-cli --self-test-input exited 0"
+          .\target\release\gorillaluxe-cli.exe --self-test-input --lang ru
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE3-CI: RU locale run exited 0"
+
       - name: Package GorillaLuxe-Win64.zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\gorillaluxe.exe, target\release\gorillaluxe-cli.exe dist\
-          Copy-Item README.md, SPECIFICATION.txt dist\
+          Copy-Item README.md, SPECIFICATION.txt, ARCHITECTURE.md dist\
           Compress-Archive -Path dist\* -DestinationPath GorillaLuxe-Win64.zip
           $size = (Get-Item GorillaLuxe-Win64.zip).Length / 1MB
           Write-Host ("GorillaLuxe-Win64.zip: {0:N1} MB" -f $size)

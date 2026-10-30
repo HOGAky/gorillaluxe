@@ -1,14 +1,18 @@
 //! gorillaluxe-cli.exe — headless entry point.
 //!
 //! Usage:
-//!   gorillaluxe-cli --self-test      [--lang en|ru] [--allow-no-whpx]   (Phase 1 WHPX)
-//!   gorillaluxe-cli --self-test-gfx  [--lang en|ru] [--ci-software-gpu] (Phase 2 DX12/CAS/UI)
+//!   gorillaluxe-cli --self-test       [--lang en|ru] [--allow-no-whpx]   (Phase 1 WHPX)
+//!   gorillaluxe-cli --self-test-gfx   [--lang en|ru] [--ci-software-gpu] (Phase 2 DX12/CAS/UI)
+//!   gorillaluxe-cli --self-test-input [--lang en|ru]                     (Phase 3 swipe/WASAPI/keymap)
+//!   gorillaluxe-cli --auto-setup      UAC-elevated WHPX feature enablement
 //!
 //! Exit codes: 0 = PASS (or SKIP with --allow-no-whpx), 1 = FAIL, 2 = SKIP.
 
 use gorillaluxe_core::config::Config;
 use gorillaluxe_core::gfx::selftest;
 use gorillaluxe_core::i18n::{tr, Lang};
+use gorillaluxe_core::input::selftest as input_selftest;
+use gorillaluxe_core::system::env_doctor;
 use gorillaluxe_core::vmm::{run_smoke_test, SelfTest};
 use gorillaluxe_core::{APP_NAME, APP_VERSION};
 
@@ -22,6 +26,9 @@ fn real_main() -> i32 {
     let mut cfg = Config::load();
     let mut self_test = false;
     let mut gfx_test = false;
+    let mut input_test = false;
+    let mut auto_setup = false;
+    let mut elevated_setup = false;
     let mut allow_no_whpx = false;
     let mut show_help = false;
     let mut show_version = false;
@@ -30,6 +37,9 @@ fn real_main() -> i32 {
         match args[i].as_str() {
             "--self-test" | "selftest" => self_test = true,
             "--self-test-gfx" | "gfxtest" => gfx_test = true,
+            "--self-test-input" | "inputtest" => input_test = true,
+            "--auto-setup" => auto_setup = true,
+            "--elevated-enable-whpx" => elevated_setup = true,
             "--ci-software-gpu" => cfg.ci_software_gpu = true,
             "--allow-no-whpx" => allow_no_whpx = true,
             "--version" | "-V" => show_version = true,
@@ -71,13 +81,50 @@ fn real_main() -> i32 {
         println!("{} {} ({})", APP_NAME, APP_VERSION, cfg.lang.code());
         return 0;
     }
-    if show_help || (!self_test && !gfx_test) {
+    if elevated_setup {
+        return match env_doctor::run_elevated_setup() {
+            Ok(_) => {
+                println!("{}", tr(cfg.lang, "cli.setup_done"));
+                0
+            }
+            Err(e) => {
+                eprintln!("WHPX setup failed: {e}");
+                1
+            }
+        };
+    }
+    if auto_setup {
+        println!("{}", tr(cfg.lang, "cli.auto_setup"));
+        if env_doctor::is_elevated() {
+            return match env_doctor::run_elevated_setup() {
+                Ok(_) => {
+                    println!("{}", tr(cfg.lang, "cli.setup_done"));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("WHPX setup failed: {e}");
+                    1
+                }
+            };
+        }
+        return match env_doctor::launch_elevated_setup() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}: {e}", tr(cfg.lang, "ui.whpx.uac_denied"));
+                1
+            }
+        };
+    }
+    if show_help || (!self_test && !gfx_test && !input_test) {
         println!("{}", tr(cfg.lang, "cli.help"));
         return 0;
     }
 
     if gfx_test {
         return run_gfx_test(cfg.lang, cfg.ci_software_gpu);
+    }
+    if input_test {
+        return run_input_test(cfg.lang);
     }
 
     let lang = cfg.lang;
@@ -131,6 +178,35 @@ fn run_gfx_test(lang: Lang, allow_software: bool) -> i32 {
             println!("{}", tr(lang, "selftest.fail"));
             1
         }
+    }
+}
+
+/// Phase 3 — Automated Verification Test 3 (Infinite Swipe 10,000px
+/// motion, MT-B slot reset < 2 ms, WASAPI init/fallback, keymap.json
+/// roundtrip).
+fn run_input_test(lang: Lang) -> i32 {
+    println!("{}", tr(lang, "input.selftest"));
+    let r = input_selftest::run();
+    println!(
+        "swipe: {:.0}px over {} ticks, resets={}, max tracking-id gap={} tick(s)",
+        r.total_dx_px, r.ticks, r.resets, r.max_reset_gap_ticks
+    );
+    println!(
+        "events={}, distinct tracking ids={}, stalled ticks={}",
+        r.events, r.distinct_ids, r.stalled_ticks
+    );
+    println!("keymap.json roundtrip: {}", r.keymap_roundtrip);
+    if r.wasapi_ready {
+        println!("WASAPI shared mode: ready ({} | period {:.1} ms)", r.wasapi_detail, r.wasapi_period_ms);
+    } else {
+        println!("WASAPI shared mode: fallback ({})", r.wasapi_detail);
+    }
+    if r.passed() {
+        println!("{}", tr(lang, "selftest.pass"));
+        0
+    } else {
+        println!("{}", tr(lang, "selftest.fail"));
+        1
     }
 }
 
