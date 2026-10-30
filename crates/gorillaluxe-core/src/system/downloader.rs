@@ -29,6 +29,9 @@ pub struct ArtifactTarget {
     pub sha256: String,
     /// Expected SHA-1 hex fallback when no sha256 is published.
     pub sha1: String,
+    /// "Already installed" marker file — when this exists on disk the
+    /// step is skipped entirely (retry only fetches what's missing).
+    pub marker: Option<PathBuf>,
 }
 
 /// Events emitted by the download worker thread.
@@ -66,6 +69,22 @@ pub fn start(targets: Vec<ArtifactTarget>) -> mpsc::Receiver<DlEvent> {
     rx
 }
 
+/// Shared HTTPS agent. CRITICAL: the `ureq::get()` convenience agent
+/// only auto-configures a TLS backend when the rustls feature is on —
+/// with a `native-tls`-only build the Schannel connector MUST be
+/// attached explicitly or every https request dies with
+/// "no TLS backend is configured".
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        let mut b = ureq::AgentBuilder::new();
+        if let Ok(c) = native_tls::TlsConnector::new() {
+            b = b.tls_connector(std::sync::Arc::new(c));
+        }
+        b.build()
+    })
+}
+
 fn emit(tx: &mpsc::Sender<DlEvent>, e: DlEvent) -> Result<(), String> {
     tx.send(e)
         .map_err(|_| "UI dropped download channel".to_string())
@@ -82,8 +101,28 @@ fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), Str
                 label: t.label.clone(),
             },
         )?;
+        // Already installed → skip download + verify + extract so a
+        // retry only fetches the missing component.
+        if t.marker.as_ref().is_some_and(|m| m.is_file()) {
+            emit(
+                tx,
+                DlEvent::Log(format!("{} already installed — skipping", t.label)),
+            )?;
+            continue;
+        }
+        let step = |r: Result<(), String>| -> Result<(), String> {
+            match r {
+                Err(e) => {
+                    // Log the FULL error before propagating — the UI
+                    // must never see a bare step end.
+                    emit(tx, DlEvent::Log(format!("ERROR {}: {e}", t.label)))?;
+                    Err(e)
+                }
+                Ok(()) => Ok(()),
+            }
+        };
         if !t.zip.is_file() {
-            download_resume(tx, t)?;
+            step(download_resume(tx, t))?;
         } else {
             emit(tx, DlEvent::Log(format!("cached {}", t.label)))?;
         }
@@ -96,8 +135,10 @@ fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), Str
                     label: t.label.clone(),
                 },
             )?;
-            verify_checksum(&t.zip, &t.sha256, &t.sha1)
-                .map_err(|e| format!("checksum {}: {e}", t.label))?;
+            step(
+                verify_checksum(&t.zip, &t.sha256, &t.sha1)
+                    .map_err(|e| format!("checksum {}: {e}", t.label)),
+            )?;
         }
         emit(
             tx,
@@ -105,7 +146,7 @@ fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), Str
                 label: t.label.clone(),
             },
         )?;
-        extract_zip(&t.zip, &t.dest).map_err(|e| format!("extract {}: {e}", t.label))?;
+        step(extract_zip(&t.zip, &t.dest).map_err(|e| format!("extract {}: {e}", t.label)))?;
         // Low-disk: don't keep the archive around.
         let _ = fs::remove_file(&t.zip);
         emit(tx, DlEvent::Log(format!("installed {}", t.label)))?;
@@ -115,7 +156,8 @@ fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), Str
 
 /// HEAD content-length (0 when unreachable).
 fn remote_len(url: &str) -> u64 {
-    ureq::head(url)
+    agent()
+        .head(url)
         .timeout(Duration::from_secs(20))
         .call()
         .ok()
@@ -127,11 +169,8 @@ fn remote_len(url: &str) -> u64 {
 /// Spawn `curl.exe` hidden (built into Windows 10/11 — reliable where
 /// ureq's TLS/DNS path fails on some machines).
 fn curl(args: &[&str]) -> Result<std::process::Output, String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("curl.exe")
+    super::silent_cmd("curl.exe")
         .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("spawn curl.exe: {e}"))
 }
@@ -155,7 +194,7 @@ fn curl_len(url: &str) -> Option<u64> {
 /// GET a small body (manifest XML etc.) — ureq first, `curl.exe -fL`
 /// when ureq's transport fails. Errors always carry the URL.
 pub fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    match ureq::get(url).timeout(Duration::from_secs(30)).call() {
+    match agent().get(url).timeout(Duration::from_secs(30)).call() {
         Ok(resp) => {
             let mut b = Vec::new();
             resp.into_reader()
@@ -182,7 +221,8 @@ pub fn http_get(url: &str) -> Result<Vec<u8>, String> {
 /// total size when the server answers 200/206. CI gates on this for
 /// every resolved package URL.
 pub fn probe_url(url: &str) -> Result<u64, String> {
-    let resp = ureq::get(url)
+    let resp = agent()
+        .get(url)
         .set("Range", "bytes=0-15")
         .timeout(Duration::from_secs(30))
         .call();
@@ -261,7 +301,7 @@ fn download_attempt(
     if total > 0 && have == total {
         return Ok(()); // fully downloaded previously
     }
-    let mut req = ureq::get(&t.url).timeout(Duration::from_secs(60));
+    let mut req = agent().get(&t.url).timeout(Duration::from_secs(60));
     if have > 0 && total > have {
         req = req.set("Range", &format!("bytes={have}-"));
     }
@@ -269,7 +309,9 @@ fn download_attempt(
         Ok(r) => r,
         Err(e) => {
             // Transport fallback: curl.exe handles its own resume via
-            // `-C -` against the existing .part file.
+            // `-C -` against the existing .part file. Spawned as a
+            // child — we poll the .part size every 200 ms so the UI
+            // progress bar streams live instead of freezing.
             emit(
                 tx,
                 DlEvent::Log(format!(
@@ -278,14 +320,68 @@ fn download_attempt(
                 )),
             )?;
             let part_s = part.to_string_lossy().to_string();
-            let out = curl(&["-fL", "--retry", "3", "-C", "-", "-o", &part_s, &t.url])
+            // stderr → a side log (curl's progress meter would fill a
+            // pipe and deadlock; a file keeps the real error readable).
+            let curl_log = part.with_extension("curl.log");
+            let err_file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&curl_log)
+                .map_err(|e2| format!("curl log: {e2}"))?;
+            let mut child = super::silent_cmd("curl.exe")
+                .args([
+                    "-fL", "-sS", "--retry", "3", "-C", "-", "-o", &part_s, &t.url,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::from(err_file))
+                .spawn()
                 .map_err(|e2| format!("{}: ureq: {e}; curl spawn: {e2}", t.url))?;
-            if !out.status.success() {
+            let mut emit_at = Instant::now();
+            let mut window = Instant::now();
+            let mut prev = have;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => break st,
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = child.kill();
+                        return Err(format!("curl wait: {err}"));
+                    }
+                }
+                if emit_at.elapsed() >= Duration::from_millis(200) {
+                    let cur = fs::metadata(part).map(|m| m.len()).unwrap_or(have);
+                    let dt = window.elapsed().as_secs_f64();
+                    let speed = if dt > 0.0 {
+                        cur.saturating_sub(prev) as f64 / dt
+                    } else {
+                        0.0
+                    };
+                    prev = cur;
+                    window = Instant::now();
+                    emit_at = Instant::now();
+                    emit(
+                        tx,
+                        DlEvent::Progress {
+                            done: cur,
+                            total,
+                            speed_bps: speed,
+                        },
+                    )?;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            if !status.success() {
+                let tail = fs::read_to_string(&curl_log)
+                    .unwrap_or_default()
+                    .lines()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 return Err(format!(
-                    "{}: ureq: {e}; curl exit {}: {}",
+                    "{}: ureq: {e}; curl exit {status}: {}",
                     t.url,
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    tail.trim()
                 ));
             }
             let done = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
@@ -497,6 +593,28 @@ mod tests {
         assert!(!tmp.join("evil.txt").exists());
         assert!(!dest.join("..").join("evil.txt").exists());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Regression: the shared agent must have a TLS backend — the
+    /// "no TLS backend is configured" UnknownScheme failure must never
+    /// come back (it fires BEFORE any network access, so this test is
+    /// deterministic even offline).
+    #[test]
+    fn ureq_https_backend_configured() {
+        let res = agent()
+            .get("https://dl.google.com/android/repository/repository2-1.xml")
+            .timeout(Duration::from_secs(15))
+            .call();
+        match res {
+            Ok(_) | Err(ureq::Error::Status(_, _)) => {}
+            Err(ureq::Error::Transport(t)) => {
+                assert!(
+                    t.kind() != ureq::ErrorKind::UnknownScheme,
+                    "TLS backend missing: {t}"
+                );
+                // Any other transport error = offline runner — skip.
+            }
+        }
     }
 
     #[test]

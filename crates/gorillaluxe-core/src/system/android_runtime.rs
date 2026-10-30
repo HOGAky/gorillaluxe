@@ -20,7 +20,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -92,8 +92,8 @@ pub fn find_sysimg(root: &Path) -> Option<PathBuf> {
 }
 
 /// Runtime files that MUST exist for the emulator to boot.
-/// (`vendor.img` is validated separately as a warning — some images
-/// fold it into `system.img`.)
+/// (`userdata.img` is excluded — absent from some sys-img zips; the
+/// emulator creates it on first boot.)
 pub fn missing_required(root: &Path) -> Vec<String> {
     let mut missing = Vec::new();
     for rel in [EMULATOR_REL, QEMU_REL, ADB_REL] {
@@ -103,7 +103,10 @@ pub fn missing_required(root: &Path) -> Vec<String> {
     }
     match find_sysimg(root) {
         Some(si) => {
-            for f in ["system.img", "vendor.img", "ramdisk.img", "userdata.img"] {
+            // `userdata.img` is intentionally absent from this list —
+            // some Google sys-img zips omit it and emulator.exe will
+            // create it on first boot.
+            for f in ["system.img", "vendor.img", "ramdisk.img"] {
                 if !si.join(f).is_file() {
                     missing.push(format!(r"system-images\...\x86_64\{f}"));
                 }
@@ -268,14 +271,27 @@ impl DownloadJob {
         let mut targets = Vec::new();
         for (i, a) in urls.iter().enumerate() {
             let leaf = a.url.rsplit('/').next().unwrap_or(&a.url);
+            let dest = target_dest(&root, a);
+            // Per-component "installed" marker — retries skip a step
+            // whose payload is already extracted and valid on disk.
+            let marker = if a.package_path == "platform-tools" {
+                Some(root.join(ADB_REL))
+            } else if a.package_path == "emulator" {
+                Some(root.join(EMULATOR_REL))
+            } else {
+                // system-images;android-33;<flavor>;x86_64 → zip's top
+                // folder is `x86_64/` inside `dest`.
+                Some(dest.join("x86_64").join("system.img"))
+            };
             targets.push(ArtifactTarget {
                 step: i + 1,
                 label: labels[i].to_string(),
                 url: a.absolute_url.clone(),
                 zip: root.join(leaf),
-                dest: target_dest(&root, a),
+                dest,
                 sha256: a.sha256.clone(),
                 sha1: a.sha1.clone(),
+                marker,
             });
         }
         Ok(DownloadJob {
@@ -376,6 +392,16 @@ pub fn write_avd(root: &Path, sysimg: &Path, profile: &DeviceProfile) -> Result<
     let home = root.join("avd");
     let avd = home.join("GorillaLuxe.avd");
     std::fs::create_dir_all(&avd).map_err(|e| e.to_string())?;
+    // emulator.exe aborts with "PANIC: Cannot find AVD system path.
+    // Please define ANDROID_SDK_ROOT" unless a `platforms\android-33\`
+    // dir exists inside the SDK root — ship a minimal build.prop.
+    let platform = root.join("platforms").join("android-33");
+    std::fs::create_dir_all(&platform).map_err(|e| e.to_string())?;
+    std::fs::write(
+        platform.join("build.prop"),
+        "# GorillaLuxe minimal platform marker\nro.build.version.sdk=33\nro.build.version.release=13\n",
+    )
+    .map_err(|e| e.to_string())?;
     std::fs::write(
         home.join("GorillaLuxe.ini"),
         format!(
@@ -498,16 +524,27 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
     };
     let root = runtime_dir();
     write_avd(&root, &sysimg, profile)?;
-    let child = Command::new(&emulator)
+    // Engine stdout+stderr → logs\emulator.log so an early exit (e.g.
+    // "PANIC: Cannot find AVD system path") is diagnosable.
+    let logs = data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&logs);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join("emulator.log"))
+        .map_err(|e| format!("emulator.log: {e}"))?;
+    let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
+    let child = super::silent_cmd(&emulator)
         .args(emulator_args(profile, gpu, accel))
         .current_dir(emulator.parent().unwrap())
         // Point the engine entirely inside our runtime dir — AVD and
         // SDK resolution never touch the user's global ~/.android.
         .env("ANDROID_SDK_ROOT", &root)
+        .env("ANDROID_HOME", &root)
         .env("ANDROID_EMULATOR_HOME", &root)
         .env("ANDROID_AVD_HOME", avd_home())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| format!("spawn emulator: {e}"))?;
     let job = attach_kill_job(&child);
@@ -537,7 +574,7 @@ fn adb() -> std::ffi::OsString {
 }
 
 fn adb_run(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(adb())
+    let out = super::silent_cmd(adb())
         .args(args)
         .output()
         .map_err(|e| format!("adb: {e}"))?;
@@ -556,7 +593,7 @@ pub struct AdbShell {
 
 impl AdbShell {
     pub fn open() -> Result<Self, String> {
-        let mut child = Command::new(adb())
+        let mut child = super::silent_cmd(adb())
             .arg("shell")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -634,7 +671,7 @@ pub fn set_locale(locale: &str) -> Result<(), String> {
 
 /// Block (caller runs this on a thread) until `adb` reports a device.
 pub fn wait_for_device() -> bool {
-    Command::new(adb())
+    super::silent_cmd(adb())
         .arg("wait-for-device")
         .status()
         .map(|s| s.success())
@@ -674,7 +711,7 @@ pub fn parse_screencap_header(b: &[u8]) -> Option<(u32, u32, usize)> {
 /// cost, ~3-4x faster. Falls back to the GDI+ PNG path for
 /// `-p`-style output.
 pub fn grab_frame() -> Result<(Vec<u8>, u32, u32), String> {
-    let out = Command::new(adb())
+    let out = super::silent_cmd(adb())
         .args(["exec-out", "screencap"])
         .output()
         .map_err(|e| format!("adb screencap: {e}"))?;

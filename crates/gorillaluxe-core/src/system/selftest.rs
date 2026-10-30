@@ -269,6 +269,7 @@ fn downloader_check() -> Check {
         dest: tmp.clone(),
         sha256: String::new(), // -latest alias publishes no checksum
         sha1: String::new(),
+        marker: None,
     }]);
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut connected = false;

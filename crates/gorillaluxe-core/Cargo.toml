@@ -9,7 +9,10 @@ windows = { workspace = true }
 lz4_flex = "0.11"
 # native-tls → Windows Schannel: OS root CAs + proxy support, no
 # vendored crypto (ring needs a C toolchain we deliberately avoid).
+# The direct native-tls dep lets us attach the connector to the ureq
+# Agent explicitly (ureq::get()'s default agent only wires rustls).
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 sha1 = "0.10"

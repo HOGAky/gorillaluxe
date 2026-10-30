@@ -150,7 +150,7 @@ pub fn run_elevated_setup() -> Result<String, String> {
     ];
     let mut log = String::new();
     for (exe, args) in cmds {
-        let out = std::process::Command::new(exe)
+        let out = super::silent_cmd(exe)
             .args(*args)
             .output()
             .map_err(|e| format!("spawn {exe}: {e}"))?;
@@ -175,7 +175,7 @@ pub fn run_elevated_setup() -> Result<String, String> {
 
 /// Trigger a Windows restart (`shutdown /r /t 0`).
 pub fn restart_pc() -> Result<(), String> {
-    std::process::Command::new("shutdown.exe")
+    super::silent_cmd("shutdown.exe")
         .args(["/r", "/t", "0"])
         .spawn()
         .map(|_| ())
