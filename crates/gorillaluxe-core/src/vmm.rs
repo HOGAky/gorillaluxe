@@ -182,7 +182,6 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
     part.create_vcpu(VP)?;
     setup_real_mode(&part, VP, guest::SMOKE_GPA)?;
 
-    let mut transcript: Vec<u8> = Vec::new();
     let mut trace: Vec<ExitTrace> = Vec::new();
     let mut halted = false;
 
@@ -193,25 +192,30 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
         if reason == WHvRunVpExitReasonX64IoPortAccess {
             let io = unsafe { exit.Anonymous.IoPortAccess };
             let info = unsafe { io.AccessInfo.AsUINT32 };
-            let is_write = (info >> 3) & 1 == 1;
-            let access_size = (info & 0x7) as usize;
             if trace.len() < 64 {
                 trace.push(format!(
-                    "reason={} IO port=0x{:X} write={} size={} rax=0x{:X} rip=0x{:X} insn_len={}",
+                    "reason={} IO port=0x{:X} info=0x{:X} rax=0x{:X} rip=0x{:X} insn_len={}",
                     reason.0,
                     io.PortNumber,
-                    is_write,
-                    access_size,
+                    info,
                     io.Rax,
                     exit.VpContext.Rip,
                     io.InstructionByteCount
                 ));
             }
-            if is_write && io.PortNumber == guest::DEBUG_PORT {
-                let bytes = io.Rax.to_le_bytes();
-                transcript.extend_from_slice(&bytes[..access_size.min(8)]);
+            // IO exits are pre-instruction: advance RIP past the instruction.
+            // WHPX does not decode 16-bit real-mode instructions
+            // (InstructionByteCount == 0), so a zero length is fatal here.
+            if io.InstructionByteCount == 0 {
+                return Err(VmError::Exit {
+                    reason: reason.0,
+                    detail: format!(
+                        "undecodable IO exit (port=0x{:X} rip=0x{:X}); \
+                         real-mode IO exits cannot be emulated",
+                        io.PortNumber, exit.VpContext.Rip
+                    ),
+                });
             }
-            // IO exits are pre-instruction: advance RIP past it.
             let next_rip = exit.VpContext.Rip + io.InstructionByteCount as u64;
             part.set_registers(VP, &[WHvX64RegisterRip], &[reg64(next_rip)])?;
         } else if reason == WHvRunVpExitReasonX64Halt {
@@ -247,27 +251,54 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
         )));
     }
 
-    // Pass criterion: the guest's completion signature in RAX/RSI.
-    // This is robust whether or not the host surfaces port-IO exits.
-    let regs = part.get_registers(VP, &[WHvX64RegisterRax, WHvX64RegisterRsi])?;
+    // Pass criteria (all must hold):
+    //  1. completion signature RAX = 0x600D
+    //  2. RSI past the NUL -> the copy loop ran for every byte
+    //  3. RDI past the mailbox -> every byte was stored
+    //  4. mailbox contents == expected transcript (full fidelity check)
+    let regs = part.get_registers(
+        VP,
+        &[WHvX64RegisterRax, WHvX64RegisterRsi, WHvX64RegisterRdi],
+    )?;
     part.delete_vcpu(VP).ok();
     let rax = unsafe { regs[0].Reg64 };
     let rsi = unsafe { regs[1].Reg64 };
+    let rdi = unsafe { regs[2].Reg64 };
 
-    let text = String::from_utf8_lossy(&transcript);
-    if rax == guest::MAGIC_REG && rsi == guest::MAGIC_SI {
+    let mailbox = unsafe {
+        std::slice::from_raw_parts(
+            (mem.ptr as *const u8).add(guest::MAILBOX_GPA as usize),
+            guest::MAGIC_MSG.len(),
+        )
+    };
+    let mailbox_ok = mailbox == guest::MAGIC_MSG;
+    let regs_ok =
+        rax == guest::MAGIC_REG && rsi == guest::MAGIC_SI && rdi == guest::MAGIC_DI;
+
+    let text = String::from_utf8_lossy(mailbox);
+    if regs_ok && mailbox_ok {
         Ok(SelfTest::Pass {
-            transcript: if transcript.is_empty() {
-                format!("regs RAX=0x{:X} RSI=0x{:X}", rax, rsi)
-            } else {
-                text.trim_end().to_string()
-            },
+            transcript: format!(
+                "{:?} (RAX=0x{:X} RSI=0x{:X} RDI=0x{:X})",
+                text.trim_end(),
+                rax,
+                rsi,
+                rdi
+            ),
         })
     } else {
         Err(VmError::GuestProtocol(format!(
-            "bad completion state: RAX=0x{:X} (want 0x{:X}) RSI=0x{:X} (want 0x{:X}); \
-             transcript={:?}; trace={:?}",
-            rax, guest::MAGIC_REG, rsi, guest::MAGIC_SI, text, trace
+            "bad completion state: RAX=0x{:X} (want 0x{:X}) RSI=0x{:X} (want 0x{:X}) \
+             RDI=0x{:X} (want 0x{:X}); mailbox={:?} (want {:?}); trace={:?}",
+            rax,
+            guest::MAGIC_REG,
+            rsi,
+            guest::MAGIC_SI,
+            rdi,
+            guest::MAGIC_DI,
+            text,
+            String::from_utf8_lossy(guest::MAGIC_MSG),
+            trace
         )))
     }
 }
