@@ -71,12 +71,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "PHASE3-CI: RU locale run exited 0"
 
+      - name: Phase 4 acceptance — long mode, profiles, shm, snapshots, manifests
+        shell: pwsh
+        run: |
+          # Automated Verification Test 4: 64-bit Long Mode WHPX guest,
+          # device profiles + Perlin sensor variance + locale sync,
+          # 60x1080p named-shm frames <60ms, LZ4 snapshot roundtrip,
+          # P/E-core pinning, Google manifest URL resolver.
+          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang en
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE4-CI: gorillaluxe-cli --self-test-phase4 exited 0"
+          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang ru
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "PHASE4-CI: RU locale run exited 0"
+
       - name: Package GorillaLuxe-Win64.zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\release\gorillaluxe.exe, target\release\gorillaluxe-cli.exe dist\
           Copy-Item README.md, SPECIFICATION.txt, ARCHITECTURE.md dist\
+          Copy-Item scripts\fetch-android-image.ps1 dist\
           Compress-Archive -Path dist\* -DestinationPath GorillaLuxe-Win64.zip
           $size = (Get-Item GorillaLuxe-Win64.zip).Length / 1MB
           Write-Host ("GorillaLuxe-Win64.zip: {0:N1} MB" -f $size)

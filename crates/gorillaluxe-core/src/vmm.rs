@@ -1,5 +1,8 @@
 //! Phase 1 VMM: boots the real-mode smoke guest under WHPX and
-//! captures its debug-port output.
+//! captures its debug-port output. `long_mode` (Phase 4) bootstraps
+//! the 64-bit paging/GDT state used by the Linux boot protocol.
+
+pub mod long_mode;
 
 use std::ffi::c_void;
 use std::fmt;

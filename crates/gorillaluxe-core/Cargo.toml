@@ -6,3 +6,4 @@ description = "GorillaLuxe core: WHPX VMM, DX12 compositor, i18n (RU/EN)"
 
 [dependencies]
 windows = { workspace = true }
+lz4_flex = "0.11"

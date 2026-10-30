@@ -56,6 +56,9 @@ pub enum RegionId {
     Widget(usize),
     WhpxEnable,
     WhpxRestart,
+    OnboardDownload,
+    OnboardLaunch,
+    OnboardClose,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +85,20 @@ pub enum WhpxBanner {
     RestartReady,
 }
 
+/// Zone D first-boot onboarding state (spec §3.6 / Phase 4).
+#[derive(Clone, Debug)]
+pub enum Onboard {
+    Hidden,
+    /// Runtime not installed — golden "Download Android Runtime" button.
+    Missing,
+    /// Download/extract in progress — animated progress bar.
+    Downloading { progress: f32, mb_done: f32, mb_total: f32 },
+    /// Runtime installed — "Launch Android" button.
+    Ready,
+    /// Emulator spawned, guest booting.
+    Booting,
+}
+
 /// Full UI frame state (owned by the app, read by `build_frame`).
 pub struct UiState {
     pub lang: Lang,
@@ -100,6 +117,8 @@ pub struct UiState {
     pub fps_mode: bool,
     /// Widget kind currently dragged from the Zone C palette.
     pub palette_drag: Option<WidgetKind>,
+    /// Zone D first-boot onboarding card.
+    pub onboard: Onboard,
 }
 
 impl Default for UiState {
@@ -118,6 +137,7 @@ impl Default for UiState {
             hud_visible: true,
             fps_mode: false,
             palette_drag: None,
+            onboard: Onboard::Hidden,
         }
     }
 }
@@ -474,6 +494,82 @@ pub fn build_frame(
                 &mut v,
             );
             rg.push(Region { id: btn_id, r: br });
+        }
+    }
+
+    // ---- Zone D: first-boot onboarding card ---------------------------------
+    match &st.onboard {
+        Onboard::Hidden => {}
+        state => {
+            let bw = 440.0f32;
+            let bh = 220.0f32;
+            let bx = (sw - bw) / 2.0;
+            let by = sh * 0.5 - bh * 0.5;
+            // Dim the world behind the splash card.
+            v.push(Instance::rect(
+                [0.0, 0.0],
+                [sw, sh],
+                [BG_PRIMARY[0], BG_PRIMARY[1], BG_PRIMARY[2], 0.55 * BG_PRIMARY[3]],
+                0.0,
+            ));
+            v.push(Instance::rect([bx, by], [bw, bh], BG_SURFACE, R_WINDOW));
+            v.push(Instance::rect([bx, by], [bw, 4.0], ACCENT, R_WINDOW));
+            // Brand mark + status.
+            centered_text(atlas, tr(lang, "ui.onboard.title"), bx + bw / 2.0, by + 20.0, ACCENT, &mut v);
+            let status = match state {
+                Onboard::Missing => tr(lang, "ui.onboard.missing").to_string(),
+                Onboard::Downloading { mb_done, mb_total, .. } => format!(
+                    "{}  {:.0} / {:.0} MB",
+                    tr(lang, "ui.onboard.downloading"),
+                    mb_done,
+                    mb_total
+                ),
+                Onboard::Ready => tr(lang, "ui.onboard.ready").to_string(),
+                Onboard::Booting => tr(lang, "ui.onboard.booting").to_string(),
+                Onboard::Hidden => unreachable!(),
+            };
+            centered_text(atlas, &status, bx + bw / 2.0, by + 64.0, TEXT_MUTED, &mut v);
+            // Golden progress bar (animated while downloading).
+            let bar = [bx + 40.0, by + 104.0, bw - 80.0, 10.0];
+            v.push(Instance::rect([bar[0], bar[1]], [bar[2], bar[3]], BORDER, 5.0));
+            let frac = match state {
+                Onboard::Downloading { progress, .. } => *progress,
+                Onboard::Ready | Onboard::Booting => 1.0,
+                _ => 0.0,
+            };
+            if frac > 0.0 {
+                v.push(Instance::rect(
+                    [bar[0], bar[1]],
+                    [bar[2] * frac.clamp(0.0, 1.0), bar[3]],
+                    ACCENT,
+                    5.0,
+                ));
+            }
+            // Primary action button.
+            let (btn_text, btn_id) = match state {
+                Onboard::Missing => (tr(lang, "ui.onboard.download"), RegionId::OnboardDownload),
+                Onboard::Ready => (tr(lang, "ui.onboard.launch"), RegionId::OnboardLaunch),
+                _ => ("...", RegionId::OnboardClose),
+            };
+            let br = [bx + (bw - 260.0) / 2.0, by + bh - 76.0, 260.0, 40.0];
+            let hovered = st.hover == Some(btn_id);
+            v.push(Instance::rect(
+                [br[0], br[1]],
+                [br[2], br[3]],
+                if hovered { ACCENT_HOVER } else { ACCENT },
+                R_FRAME,
+            ));
+            centered_text(
+                atlas,
+                btn_text,
+                br[0] + br[2] / 2.0,
+                br[1] + (br[3] - atlas.size_px as f32) / 2.0,
+                BG_PRIMARY,
+                &mut v,
+            );
+            if !matches!(state, Onboard::Downloading { .. }) {
+                rg.push(Region { id: btn_id, r: br });
+            }
         }
     }
 

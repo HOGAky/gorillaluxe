@@ -4,6 +4,8 @@
 //!   gorillaluxe-cli --self-test       [--lang en|ru] [--allow-no-whpx]   (Phase 1 WHPX)
 //!   gorillaluxe-cli --self-test-gfx   [--lang en|ru] [--ci-software-gpu] (Phase 2 DX12/CAS/UI)
 //!   gorillaluxe-cli --self-test-input [--lang en|ru]                     (Phase 3 swipe/WASAPI/keymap)
+//!   gorillaluxe-cli --self-test-phase4 [--lang en|ru]                    (Phase 4 long-mode/runtime)
+//!   gorillaluxe-cli setup-android     resolve + download the Google Android runtime
 //!   gorillaluxe-cli --auto-setup      UAC-elevated WHPX feature enablement
 //!
 //! Exit codes: 0 = PASS (or SKIP with --allow-no-whpx), 1 = FAIL, 2 = SKIP.
@@ -12,7 +14,7 @@ use gorillaluxe_core::config::Config;
 use gorillaluxe_core::gfx::selftest;
 use gorillaluxe_core::i18n::{tr, Lang};
 use gorillaluxe_core::input::selftest as input_selftest;
-use gorillaluxe_core::system::env_doctor;
+use gorillaluxe_core::system::{android_runtime, env_doctor, selftest as sys_selftest};
 use gorillaluxe_core::vmm::{run_smoke_test, SelfTest};
 use gorillaluxe_core::{APP_NAME, APP_VERSION};
 
@@ -27,6 +29,8 @@ fn real_main() -> i32 {
     let mut self_test = false;
     let mut gfx_test = false;
     let mut input_test = false;
+    let mut phase4_test = false;
+    let mut setup_android = false;
     let mut auto_setup = false;
     let mut elevated_setup = false;
     let mut allow_no_whpx = false;
@@ -38,6 +42,8 @@ fn real_main() -> i32 {
             "--self-test" | "selftest" => self_test = true,
             "--self-test-gfx" | "gfxtest" => gfx_test = true,
             "--self-test-input" | "inputtest" => input_test = true,
+            "--self-test-phase4" | "phase4test" => phase4_test = true,
+            "setup-android" => setup_android = true,
             "--auto-setup" => auto_setup = true,
             "--elevated-enable-whpx" => elevated_setup = true,
             "--ci-software-gpu" => cfg.ci_software_gpu = true,
@@ -115,7 +121,7 @@ fn real_main() -> i32 {
             }
         };
     }
-    if show_help || (!self_test && !gfx_test && !input_test) {
+    if show_help || (!self_test && !gfx_test && !input_test && !phase4_test && !setup_android) {
         println!("{}", tr(cfg.lang, "cli.help"));
         return 0;
     }
@@ -125,6 +131,12 @@ fn real_main() -> i32 {
     }
     if input_test {
         return run_input_test(cfg.lang);
+    }
+    if phase4_test {
+        return run_phase4_test(cfg.lang);
+    }
+    if setup_android {
+        return run_setup_android(cfg.lang);
     }
 
     let lang = cfg.lang;
@@ -207,6 +219,71 @@ fn run_input_test(lang: Lang) -> i32 {
     } else {
         println!("{}", tr(lang, "selftest.fail"));
         1
+    }
+}
+
+/// Phase 4 — Automated Verification Test 4 (long mode, profiles,
+/// sensors, shm frames, snapshots, pinning, manifest resolver).
+fn run_phase4_test(lang: Lang) -> i32 {
+    let _ = lang;
+    let r = sys_selftest::run();
+    r.print();
+    if r.passed() {
+        0
+    } else {
+        1
+    }
+}
+
+/// `setup-android`: resolve Google repository URLs and run the
+/// resumable downloader synchronously (CLI mode).
+fn run_setup_android(lang: Lang) -> i32 {
+    println!("{}", tr(lang, "cli.setup_android"));
+    match android_runtime::install_state() {
+        android_runtime::InstallState::Ready { emulator, sysimg, .. } => {
+            println!("already installed: {} | {}", emulator.display(), sysimg.display());
+            return 0;
+        }
+        _ => {}
+    }
+    match android_runtime::resolve_runtime_urls() {
+        Ok(urls) => {
+            for a in &urls {
+                println!("  -> {}", a.absolute_url);
+            }
+            match android_runtime::DownloadJob::start(&urls) {
+                Ok(mut job) => {
+                    let mut last = 0u64;
+                    while job.alive() {
+                        let (done, total) = job.progress();
+                        if done != last {
+                            print!("\r  {:.1} / {:.1} MB   ", done as f64 / 1048576.0, total as f64 / 1048576.0);
+                            last = done;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    println!();
+                    match (job.finished_ok(), android_runtime::install_state()) {
+                        (Some(true), android_runtime::InstallState::Ready { .. }) => {
+                            println!("{}", tr(lang, "ui.onboard.ready"));
+                            0
+                        }
+                        _ => {
+                            eprintln!("download finished but runtime incomplete");
+                            1
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("downloader spawn failed: {e}");
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("manifest resolve failed: {e}");
+            1
+        }
     }
 }
 

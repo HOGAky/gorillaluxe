@@ -74,13 +74,58 @@ Zero CPU pixel copies in steady state
   hosts without endpoints.
   WASAPI shared-mode ≤10 мс с мягким фолбэком без аудиовыхода.
 
-### `system` (Phase 3 / Фаза 3)
+### `system` (Phase 3+4 / Фазы 3–4)
 - **`env_doctor.rs`** — WHPX diagnosis (`diagnose_host`), UAC
   `ShellExecuteW("runas")` → `gorillaluxe.exe --elevated-enable-whpx`
   → `dism` enables `HypervisorPlatform` + `VirtualMachinePlatform` +
   `bcdedit hypervisorlaunchtype auto`, marker + log in
   `%LOCALAPPDATA%\GorillaLuxe`, `restart_pc()`.
   Диагностика WHPX и «Включить в 1 клик» через UAC.
+- **`manifest.rs`** — `dl.google.com/android/repository` XML resolver:
+  `repository2-1.xml` (emulator + platform-tools) and `sys-img2-1.xml`
+  (x86_64 system images) → concrete `.zip` URLs.
+  Парсер манифестов репозитория Google → прямые ссылки на zip.
+- **`android_runtime.rs`** — real Android bootstrapper/engine bridge:
+  install-state probe under `%LOCALAPPDATA%\GorillaLuxe\runtime\`,
+  resumable `DownloadJob` (PowerShell bootstrapper), AVD writer,
+  headless `emulator.exe -no-window -accel whpx -gpu host|swiftshader_indirect`
+  spawn (gfxstream/ANGLE, no Qt window), adb bridge (`install -r`,
+  `input tap/swipe`, `setprop persist.sys.locale`), and `exec-out
+  screencap` → GDI+ PNG → RGBA frame capture feeding the DX12/CAS
+  pipeline. Загрузчик и мост к headless-движку Google.
+- **`device_profile.rs`** — S23 Ultra / ROG Phone 7 / Pixel 8 Pro
+  presets (`model/brand/board/dpi/mac`), `setprop` script +
+  kernel-cmdline fragment, `binfmt_misc` AArch64/ARMv7 descriptors for
+  `libndk_translation`, `locale_sync_cmds` (ru-RU/en-US).
+  Профили устройств и ARM64-трансляция.
+- **`sensors.rs`** — virtual sensor HAL twin: deterministic 1D Perlin
+  micro-noise (±0.002 m/s² accel, 100 Hz) + gyro + lux; identical
+  generator to `sensors.gorillaluxe.so`. Перлин-шум сенсоров.
+- **`shm_publisher.rs`** — named shared memory
+  `Global\GorillaLuxe_Frame_<ID>` + named event
+  `Global\GorillaLuxe_Event_<ID>`; `[seq][len][payload]` layout,
+  publisher + reader. Именованная память кадров + событие.
+- **`snapshot.rs`** — LZ4 VM snapshot save/restore (`lz4_flex`,
+  size-prepended frames). LZ4-снимки ВМ.
+- **`cpu_pinning.rs`** — hybrid P/E topology via
+  `GetLogicalProcessorInformationEx` + `GetSystemCpuSetInformation`,
+  `SetThreadSelectedCpuSets` P-core pinning.
+  Гибридная топология P/E-ядер и закрепление потоков.
+- **`selftest.rs`** — Automated Verification Test 4 runner/report.
+
+### `vmm/long_mode.rs` (Phase 4 / Фаза 4)
+- PML4→PDPT→PD identity map (2 MiB pages), 64-bit GDT, `EFER.LME|LMA`,
+  `CR4.PAE`, `CR0.PG`, `GDTR`, CS L-attribute — the same vCPU state the
+  Linux x86_64 64-bit boot protocol expects after `startup_64`.
+  64-битное состояние vCPU для загрузки Linux.
+- 64-bit payload proof: `mov r64,imm64` + qword mailbox + HLT,
+  verified `RAX` signature + CS L-bit under WHPX.
+
+### `scripts/fetch-android-image.ps1` (Phase 4 / Фаза 4)
+Resumable chunked downloader (`HttpWebRequest` + HTTP Range, 8 MiB
+chunks, `.part` resume, `.dl_progress` file for GUI polling) +
+auto-extract into `runtime\{emulator,platform-tools,system-images}`.
+Возобновляемая загрузка пакетов Google с прогрессом для GUI.
 
 ### `i18n` + `config`
 - **`i18n.rs`** — atomic `set_lang`/`current_lang`, `tr()` table for
@@ -101,14 +146,20 @@ wnd_proc ──► App (Mutex) ──► build_frame(state) ──► Frame{inst
 - `WM_LBUTTONDOWN/UP`, `WM_MOUSEMOVE` → dock clicks, hover, widget
   drags, slider scrub.
 - `WM_INPUT` → raw mouse deltas → `InfiniteSwipe` (F6 toggles FPS aim).
-- `WM_DROPFILES` → `.apk`/`.xapk` → animated install toast.
+- `WM_DROPFILES` → `.apk`/`.xapk` → animated install toast +
+  `adb install -r` into the running guest.
 - `WM_SIZE` → `swapchain.resize()` + CAS/UI viewport update.
-- Hotkeys: F1 keymapper, F2 settings, F3 HUD, F4 RU/EN, F5 WHPX
-  setup, F6 FPS aim, ESC quit.
+- Hotkeys: F1 keymapper, F2 settings, F3 HUD, F4 RU/EN (+ guest locale
+  sync), F5 WHPX setup, F6 FPS aim (adb swipe forward), ESC quit.
+- Zone D onboarding: `install_state()` → Download (resumable
+  bootstrapper + progress bar) / Launch Android → headless emulator →
+  `exec-out screencap` frames → `android_tex` → CAS → swapchain.
+  Clicks on the game surface forward as `input tap` mapped to guest
+  display dims.
 
 ## CI pipeline / Конвейер CI
 
 `windows-latest` (MSVC): `cargo test` → Phase 1 `--self-test` →
 Phase 2 `--self-test-gfx --ci-software-gpu` → Phase 3
-`--self-test-input` (EN + RU) → `GorillaLuxe-Win64.zip` artifact
-(< 35 MB budget).
+`--self-test-input` → Phase 4 `--self-test-phase4` (EN + RU) →
+`GorillaLuxe-Win64.zip` artifact (< 35 MB budget).

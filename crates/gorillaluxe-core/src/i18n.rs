@@ -110,6 +110,20 @@ static STRINGS: &[(&str, &str, &str)] = &[
     ("cli.auto_setup", "Launching elevated WHPX setup...", "Запуск настройки WHPX с правами администратора..."),
     ("cli.setup_done", "Windows features enabled — please restart your PC",
      "Компоненты Windows включены — перезагрузите компьютер"),
+    // Phase 4 — Zone D first-boot onboarding / Android runtime.
+    ("ui.onboard.title", "GORILLALUXE", "GORILLALUXE"),
+    ("ui.onboard.missing", "Android 13 runtime required",
+     "Требуется среда Android 13"),
+    ("ui.onboard.download", "Download Android Runtime",
+     "Скачать среду Android"),
+    ("ui.onboard.launch", "Launch Android",
+     "Запустить Android"),
+    ("ui.onboard.booting", "Booting Android 13...", "Загрузка Android 13..."),
+    ("ui.onboard.ready", "Android environment ready", "Среда Android готова"),
+    ("ui.onboard.downloading", "Downloading Android 13 Environment...",
+     "Загрузка среды Android 13..."),
+    ("cli.setup_android", "Setting up Android runtime (emulator + system image)...",
+     "Установка среды Android (эмулятор + образ системы)..."),
 ];
 
 #[cfg(test)]
