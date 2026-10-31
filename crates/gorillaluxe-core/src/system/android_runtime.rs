@@ -423,18 +423,19 @@ pub fn write_avd(
             "hw.cpu.arch=x86_64\n",
             "hw.cpu.ncore=4\n",
             "hw.ramSize=4096\n",
-            // 1080x1920 @ 420dpi — fast universal default (~8 MB raw
-            // frames) that streams well on iGPU and dGPU alike.
-            "hw.lcd.width=1080\n",
-            "hw.lcd.height=1920\n",
-            "hw.lcd.density=420\n",
+            // Gaming tablet, landscape 720p — small raw frames for
+            // 60 FPS streaming; games upscale cleanly.
+            "hw.lcd.width=1280\n",
+            "hw.lcd.height=720\n",
+            "hw.lcd.density=240\n",
+            "hw.initialOrientation=landscape\n",
             "hw.keyboard=yes\n",
             "hw.mainKeys=no\n",
             "hw.sensors.proximity=yes\n",
             "hw.camera.back=virtualscene\n",
             "hw.gpu.enabled=yes\n",
             "hw.gpu.mode={gpu_mode}\n",
-            "vm.heapSize=576\n",
+            "vm.heapSize=512\n",
             "image.sysdir.1={sysdir}\n",
             "tag.display=Google APIs PlayStore\n",
             "tag.id=google_apis_playstore\n",
@@ -445,7 +446,10 @@ pub fn write_avd(
             "hw.device.manufacturer=Generic\n",
             "hw.device.name=GorillaLuxe\n",
             "disk.dataPartition.size=8G\n",
-            "fastboot.forceColdBoot=yes\n"
+            // QuickBoot: after the first cold boot the engine snapshots
+            // guest RAM — subsequent launches restore in ~2-3 s.
+            "fastboot.forceColdBoot=no\n",
+            "fastboot.forceFastBoot=yes\n"
         ),
         gpu_mode = gpu_mode,
         sysdir = sysimg.to_string_lossy().replace('\\', "/"),
@@ -497,8 +501,13 @@ fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
         "-avd".into(),
         "GorillaLuxe".into(),
         "-no-window".into(),
-        "-no-snapshot".into(),
+        // QuickBoot snapshots stay ON — never `-no-snapshot`: the
+        // engine restores guest RAM in ~2-3 s on every launch after
+        // the first cold boot.
         "-no-metrics".into(),
+        // Local gRPC control port (screenshot streaming / touch API).
+        "-grpc".into(),
+        "8554".into(),
         "-accel".into(),
         accel.to_string(),
         "-gpu".into(),
@@ -511,6 +520,11 @@ fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
         "none".into(),
         "-netspeed".into(),
         "full".into(),
+        // ARM64 game support: enable Google's NDK translation bridge
+        // (present on Play-Store x86_64 images ≥API 30). Harmless when
+        // the lib is absent — the prop only matters for arm64 libs.
+        "-prop".into(),
+        "ro.dalvik.vm.native.bridge=libndk_translation.so".into(),
         "-verbose".into(),
     ]
 }
@@ -560,11 +574,6 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
         retried: false,
         job,
     })
-}
-
-/// `true` while the emulator process is alive.
-pub fn alive(emu: &mut EmulatorProc) -> bool {
-    matches!(emu.child.try_wait(), Ok(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -633,15 +642,128 @@ fn emulator_log_tail() -> String {
         .join(" | ")
 }
 
-/// Spawn → watch 12 s → if the engine died, retry with the next `-gpu`
-/// mode in the vendor-aware chain. Guarantees a boot on every GPU
-/// (NVIDIA/AMD `host`, Intel `angle_indirect`, software last resort)
-/// without user intervention. `accel` = `"whpx"` or `"auto"`.
+/// Emulator attachment: `Owned` = spawned by us (Job Object bound,
+/// killed with the app); `Attached` = an emulator that was already
+/// running our AVD — we adopt it without respawning (and never kill
+/// it on shutdown, since we don't own it).
+pub enum EmulatorHandle {
+    Owned(EmulatorProc),
+    Attached { next_probe: Instant, since: Instant },
+}
+
+impl EmulatorHandle {
+    /// When the engine was spawned (or adopted) — drives the
+    /// boot-elapsed HUD counter.
+    pub fn launched_at(&self) -> Instant {
+        match self {
+            EmulatorHandle::Owned(e) => e.launched_at,
+            EmulatorHandle::Attached { since, .. } => *since,
+        }
+    }
+}
+
+/// `true` while the emulator is up. `Attached` probes `adb get-state`
+/// at most every 2 s (a one-shot process spawn per frame would be
+/// exactly the churn this runtime avoids).
+pub fn alive(h: &mut EmulatorHandle) -> bool {
+    match h {
+        EmulatorHandle::Owned(e) => matches!(e.child.try_wait(), Ok(None)),
+        EmulatorHandle::Attached { next_probe, .. } => {
+            if Instant::now() < *next_probe {
+                return true;
+            }
+            *next_probe = Instant::now() + std::time::Duration::from_secs(2);
+            adb_run(&["get-state"])
+                .map(|s| s.trim() == "device")
+                .unwrap_or(false)
+        }
+    }
+}
+
+impl EmulatorHandle {
+    /// Terminate the emulator we spawned. `Attached` is left running —
+    /// it predates us.
+    pub fn shutdown(&mut self) {
+        if let EmulatorHandle::Owned(e) = self {
+            e.shutdown();
+        }
+    }
+}
+
+/// `true` when adb already sees a live emulator (e.g. a previous
+/// `emulator.exe` still booted under `Temp\avd\running\pid_*.ini`).
+fn adb_device_present() -> bool {
+    adb_run(&["devices"])
+        .map(|d| {
+            d.lines()
+                .any(|l| l.starts_with("emulator-") && l.ends_with("device"))
+        })
+        .unwrap_or(false)
+}
+
+/// Terminate stale `emulator.exe`/`qemu-system-*` instances holding
+/// our AVD, then clear `*.lock` files. Only runs when stale locks or
+/// an `avd/running/pid_*.ini` orphan actually exist — a live usable
+/// emulator takes the `Attached` path instead.
+fn kill_stale_emulators() {
+    let avd = avd_home().join("GorillaLuxe.avd");
+    let has_locks = std::fs::read_dir(&avd)
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.path().extension().is_some_and(|x| x == "lock"))
+        })
+        .unwrap_or(false);
+    let run_dir = std::env::temp_dir().join(r"avd\running");
+    let has_pid = std::fs::read_dir(&run_dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name().to_string_lossy().starts_with("pid_")
+                    && e.path().extension().is_some_and(|x| x == "ini")
+            })
+        })
+        .unwrap_or(false);
+    if !has_locks && !has_pid {
+        return;
+    }
+    log_line("stale emulator locks/pids found — terminating orphans");
+    for img in [
+        "qemu-system-x86_64-headless.exe",
+        "qemu-system-x86_64.exe",
+        "emulator.exe",
+    ] {
+        let _ = super::silent_cmd("taskkill.exe")
+            .args(["/F", "/T", "/IM", img])
+            .output();
+    }
+    for e in std::fs::read_dir(&run_dir).into_iter().flatten().flatten() {
+        if e.path().extension().is_some_and(|x| x == "ini") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    purge_stale_locks(&avd);
+}
+
+/// Attach to a running emulator, else kill stale orphans, then spawn →
+/// watch 12 s → if the engine died, retry with the next `-gpu` mode in
+/// the vendor-aware chain. Guarantees a boot on every GPU (NVIDIA/AMD
+/// `host`, Intel `angle_indirect`, software last resort) without user
+/// intervention. `accel` = `"whpx"` or `"auto"`.
 pub fn launch_resilient(
     profile: &DeviceProfile,
     accel: &str,
     force_swiftshader: bool,
-) -> Result<EmulatorProc, String> {
+) -> Result<EmulatorHandle, String> {
+    // Two `emulator.exe` instances can never share an AVD — if one is
+    // already serving `emulator-5554`, adopt it; otherwise clear the
+    // orphans whose locks would make every spawn die inside 12 s.
+    if adb_device_present() {
+        log_line("live emulator detected — attaching (no respawn)");
+        return Ok(EmulatorHandle::Attached {
+            next_probe: Instant::now() + std::time::Duration::from_secs(2),
+            since: Instant::now(),
+        });
+    }
+    kill_stale_emulators();
     let chain = gpu_chain(force_swiftshader);
     let mut last = String::new();
     for (i, gpu) in chain.iter().enumerate() {
@@ -661,7 +783,7 @@ pub fn launch_resilient(
         let deadline = Instant::now() + std::time::Duration::from_secs(12);
         let mut alive_past = true;
         while Instant::now() < deadline {
-            if !alive(&mut emu) {
+            if matches!(emu.child.try_wait(), Ok(Some(_)) | Err(_)) {
                 alive_past = false;
                 break;
             }
@@ -672,7 +794,7 @@ pub fn launch_resilient(
                 "emulator stable on -gpu {gpu} (attempt {})",
                 i + 1
             ));
-            return Ok(emu);
+            return Ok(EmulatorHandle::Owned(emu));
         }
         last = format!("gpu={gpu}: exited within 12s — {}", emulator_log_tail());
         log_line(&format!("launch attempt {} failed: {last}", i + 1));
@@ -810,9 +932,71 @@ pub fn boot_completed(timeout_s: u64) -> bool {
     false
 }
 
-/// Install an `.apk`/`.xapk` dropped onto the window (`-r` = reinstall).
+/// Install an `.apk`/`.xapk` dropped onto the window. `.xapk`/`.apks`
+/// bundles are unzipped and installed via `install-multiple` so split
+/// APKs (base + config.arm64_v8a + config.xxhdpi) land atomically.
+pub fn install_package(path: &Path) -> Result<String, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "apk" {
+        return adb_run(&["install", "-r", &path.to_string_lossy()]);
+    }
+    if ext != "xapk" && ext != "apks" {
+        return Err(format!("unsupported package type: {ext}"));
+    }
+    // Extract the split APKs to a temp dir (path-traversal safe).
+    let tmp = std::env::temp_dir().join(format!("gorillaluxe-xapk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<Vec<PathBuf>, String> {
+        let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
+        let mut apks = Vec::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).map_err(|e| e.to_string())?;
+            let Some(rel) = e.enclosed_name() else {
+                continue;
+            };
+            let name = rel.to_string_lossy().to_string();
+            if !name.to_ascii_lowercase().ends_with(".apk") || name.contains('/') {
+                continue;
+            }
+            let out = tmp.join(&name);
+            std::io::copy(
+                &mut e,
+                &mut std::fs::File::create(&out).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            apks.push(out);
+        }
+        Ok(apks)
+    })();
+    let mut apks = match result {
+        Ok(a) if !a.is_empty() => a,
+        Ok(_) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err("xapk contains no .apk files".into());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(format!("xapk extract: {e}"));
+        }
+    };
+    // base.apk first, then splits.
+    apks.sort_by_key(|p| !p.file_name().map(|n| n == "base.apk").unwrap_or(false));
+    let mut args: Vec<String> = vec!["install-multiple".into(), "-r".into()];
+    args.extend(apks.iter().map(|p| p.to_string_lossy().to_string()));
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let r = adb_run(&arg_refs);
+    let _ = std::fs::remove_dir_all(&tmp);
+    r
+}
+
+/// Kept for older call sites — forwards to `install_package`.
 pub fn install_apk(path: &Path) -> Result<String, String> {
-    adb_run(&["install", "-r", &path.to_string_lossy()])
+    install_package(path)
 }
 
 /// Parse the raw `screencap` (no `-p`) 12-byte header:
@@ -930,5 +1114,269 @@ pub fn cmdline_quote(path: &Path) -> String {
         format!("\"{s}\"")
     } else {
         s.into_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// High-FPS frame stream — ONE adb process total, zero per-frame spawns
+// ---------------------------------------------------------------------------
+
+/// Persistent `adb exec-out "while true; do screencap; done"` pipe.
+/// The guest pushes back-to-back `[u32 w][u32 h][u32 fmt][pixels]`
+/// records over a single stdout channel — no `adb.exe` process is
+/// ever created per frame (~10 FPS spawn-limited → display-limited).
+pub struct FrameStream {
+    child: Child,
+    stdout: std::process::ChildStdout,
+    buf: Vec<u8>,
+}
+
+impl FrameStream {
+    pub fn open() -> Result<Self, String> {
+        let mut child = super::silent_cmd(adb())
+            .args(["exec-out", "while true; do screencap; done"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("frame stream: {e}"))?;
+        let stdout = child.stdout.take().ok_or("frame stream stdout")?;
+        Ok(FrameStream {
+            child,
+            stdout,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Block for the next `[w,h,fmt,rgba]` record. Err = pipe dead
+    /// (caller reopens or falls back to per-frame `grab_frame`).
+    pub fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        use std::io::Read;
+        let mut hdr = [0u8; 12];
+        self.stdout
+            .read_exact(&mut hdr)
+            .map_err(|e| format!("stream hdr: {e}"))?;
+        let w = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let h = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+        let fmt = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+        if fmt != 1 || w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return Err(format!("stream bad hdr {w}x{h} fmt={fmt}"));
+        }
+        let n = (w as usize) * (h as usize) * 4;
+        self.buf.resize(n, 0);
+        self.stdout
+            .read_exact(&mut self.buf)
+            .map_err(|e| format!("stream px: {e}"))?;
+        Ok((self.buf.clone(), w, h))
+    }
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Low-latency input — emulator console (TCP 5554) or persistent sendevent
+// ---------------------------------------------------------------------------
+
+/// Android Emulator Console on 127.0.0.1:5554 — pure TCP, no guest
+/// process spawn per event (~1 ms vs ~100 ms for Java `input tap`).
+/// Authenticates with `%USERPROFILE%\.emulator_console_auth_token`.
+pub struct EmuConsole {
+    stream: std::net::TcpStream,
+}
+
+impl EmuConsole {
+    pub fn connect() -> Result<Self, String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::net::TcpStream::connect("127.0.0.1:5554")
+            .map_err(|e| format!("console 5554: {e}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .ok();
+        // Read the greeting ("Android Console: ... OK").
+        let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut line = String::new();
+        let _ = br.read_line(&mut line);
+        // Auth token — emulator writes it to $HOME or EMULATOR_HOME.
+        let token = [
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .map(|p| p.join(".emulator_console_auth_token")),
+            Some(runtime_dir().join(".emulator_console_auth_token")),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+        if !token.is_empty() {
+            writeln!(stream, "auth {token}").map_err(|e| e.to_string())?;
+            stream.flush().ok();
+            line.clear();
+            let _ = br.read_line(&mut line); // expect "OK"
+        }
+        Ok(EmuConsole { stream })
+    }
+
+    /// Fire one console command; replies are drained lazily (we never
+    /// block waiting — command latency is the only thing that matters).
+    pub fn cmd(&mut self, line: &str) -> Result<(), String> {
+        use std::io::Write;
+        writeln!(self.stream, "{line}")
+            .and_then(|_| self.stream.flush())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Multi-touch-style DOWN at (x,y) on the ranchu touchscreen.
+    pub fn touch_down(&mut self, x: u32, y: u32) -> Result<(), String> {
+        for ev in [
+            "event send EV_ABS:ABS_MT_TRACKING_ID:1",
+            &format!("event send EV_ABS:ABS_MT_POSITION_X:{x}"),
+            &format!("event send EV_ABS:ABS_MT_POSITION_Y:{y}"),
+            "event send EV_KEY:BTN_TOUCH:1",
+            "event send EV_SYN:SYN_REPORT:0",
+        ] {
+            self.cmd(ev)?;
+        }
+        Ok(())
+    }
+
+    pub fn touch_move(&mut self, x: u32, y: u32) -> Result<(), String> {
+        for ev in [
+            &format!("event send EV_ABS:ABS_MT_POSITION_X:{x}"),
+            &format!("event send EV_ABS:ABS_MT_POSITION_Y:{y}"),
+            "event send EV_SYN:SYN_REPORT:0",
+        ] {
+            self.cmd(ev)?;
+        }
+        Ok(())
+    }
+
+    pub fn touch_up(&mut self) -> Result<(), String> {
+        for ev in [
+            "event send EV_KEY:BTN_TOUCH:0",
+            "event send EV_ABS:ABS_MT_TRACKING_ID:-1",
+            "event send EV_SYN:SYN_REPORT:0",
+        ] {
+            self.cmd(ev)?;
+        }
+        Ok(())
+    }
+}
+
+/// Locate the guest touchscreen input node (`/dev/input/eventN`)
+/// via `/proc/bus/input/devices` — the goldfish/ranchu "qwerty2"
+/// device carries both keys and ABS_MT touch.
+pub fn touch_input_node() -> Result<String, String> {
+    let out = adb_run(&["shell", "cat", "/proc/bus/input/devices"])?;
+    let mut name = String::new();
+    for line in out.lines() {
+        let l = line.trim();
+        if let Some(n) = l.strip_prefix("N: Name=") {
+            name = n.trim_matches('"').to_string();
+        }
+        if l.starts_with("H: Handlers=")
+            && (name.contains("qwerty") || name.to_lowercase().contains("touch"))
+        {
+            if let Some(ev) = l.split_whitespace().find(|w| w.starts_with("event")) {
+                return Ok(format!("/dev/input/{ev}"));
+            }
+        }
+        if l.is_empty() {
+            name.clear();
+        }
+    }
+    Ok("/dev/input/event2".into()) // ranchu default
+}
+
+/// Unified low-latency injector: emulator console `event send`
+/// (pure TCP) preferred, `sendevent` batches over the persistent
+/// `adb shell` pipe as fallback — both ~1-3 ms, never `input tap`.
+pub enum FastInput {
+    Console(EmuConsole),
+    Events { node: String, tracking_id: i32 },
+}
+
+impl FastInput {
+    /// Console first; falls back to sendevent-on-shell (the caller
+    /// supplies the persistent `AdbShell` for that path).
+    pub fn connect() -> Result<Self, String> {
+        match EmuConsole::connect() {
+            Ok(mut c) => {
+                // Probe: a harmless SYN must not error.
+                c.cmd("event send EV_SYN:SYN_REPORT:0")?;
+                log_line("input path: emulator console :5554");
+                Ok(FastInput::Console(c))
+            }
+            Err(e) => {
+                let node = touch_input_node()
+                    .map_err(|e2| format!("console: {e}; sendevent probe: {e2}"))?;
+                log_line(&format!("input path: sendevent on {node} (console: {e})"));
+                Ok(FastInput::Events {
+                    node,
+                    tracking_id: 1,
+                })
+            }
+        }
+    }
+
+    fn ev_line(node: &str, t: u32, c: u32, v: i32) -> String {
+        format!("sendevent {node} {t} {c} {v}")
+    }
+
+    /// DOWN at (x,y) — writes one `;`-chained batch so the persistent
+    /// shell executes all five events in a single write.
+    pub fn down(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+        match self {
+            FastInput::Console(c) => c.touch_down(x, y),
+            FastInput::Events { node, tracking_id } => {
+                *tracking_id = tracking_id.wrapping_add(1).max(1);
+                let batch = [
+                    Self::ev_line(node, 3, 0x39, *tracking_id), // ABS_MT_TRACKING_ID
+                    Self::ev_line(node, 3, 0x35, x as i32),     // ABS_MT_POSITION_X
+                    Self::ev_line(node, 3, 0x36, y as i32),     // ABS_MT_POSITION_Y
+                    Self::ev_line(node, 1, 0x14a, 1),           // BTN_TOUCH down
+                    Self::ev_line(node, 0, 0, 0),               // SYN_REPORT
+                ]
+                .join(";");
+                shell.cmd(&batch)
+            }
+        }
+    }
+
+    pub fn mv(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+        match self {
+            FastInput::Console(c) => c.touch_move(x, y),
+            FastInput::Events { node, .. } => shell.cmd(
+                &[
+                    Self::ev_line(node, 3, 0x35, x as i32),
+                    Self::ev_line(node, 3, 0x36, y as i32),
+                    Self::ev_line(node, 0, 0, 0),
+                ]
+                .join(";"),
+            ),
+        }
+    }
+
+    pub fn up(&mut self, shell: &mut AdbShell) -> Result<(), String> {
+        match self {
+            FastInput::Console(c) => c.touch_up(),
+            FastInput::Events { node, .. } => shell.cmd(
+                &[
+                    Self::ev_line(node, 1, 0x14a, 0),
+                    Self::ev_line(node, 3, 0x39, -1),
+                    Self::ev_line(node, 0, 0, 0),
+                ]
+                .join(";"),
+            ),
+        }
+    }
+
+    /// Full tap = down+up (still <5 ms end-to-end on either path).
+    pub fn tap(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+        self.down(shell, x, y)?;
+        self.up(shell)
     }
 }

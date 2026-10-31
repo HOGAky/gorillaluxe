@@ -103,8 +103,11 @@ struct App {
     // ---- Phase 4: real Android runtime -----------------------------------
     /// Active bootstrapper download (spawned by Zone D).
     dl: Option<android_runtime::DownloadJob>,
-    /// Running headless emulator process.
-    emu: Option<android_runtime::EmulatorProc>,
+    /// Running headless emulator — spawned by us or attached to an
+    /// already-running instance.
+    emu: Option<android_runtime::EmulatorHandle>,
+    /// Low-latency input injector (console :5554 or sendevent pipe).
+    fast_input: Option<android_runtime::FastInput>,
     /// Frame channel fed by the screencap capture thread.
     frame_rx: Option<mpsc::Receiver<(Vec<u8>, u32, u32)>>,
     /// Live guest display dims (from the last captured frame).
@@ -140,6 +143,12 @@ fn dl_slot() -> &'static Mutex<Option<Result<android_runtime::DownloadJob, Strin
 /// Slot the adb-ready thread drops the persistent shell into.
 fn shell_slot() -> &'static Mutex<Option<android_runtime::AdbShell>> {
     static SLOT: OnceLock<Mutex<Option<android_runtime::AdbShell>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Slot the adb-ready thread drops the FastInput injector into.
+fn input_slot() -> &'static Mutex<Option<android_runtime::FastInput>> {
+    static SLOT: OnceLock<Mutex<Option<android_runtime::FastInput>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -197,21 +206,52 @@ fn start_android(a: &mut App) {
             };
             let (tx, rx) = mpsc::channel();
             a.frame_rx = Some(rx);
-            // Frame bridge: raw `exec-out screencap` → RGBA upload.
-            // Starts IMMEDIATELY — the boot animation streams live;
-            // we never wait for sys.boot_completed before showing it.
-            std::thread::spawn(move || loop {
-                match android_runtime::grab_frame() {
-                    Ok(f) => {
-                        if tx.send(f).is_err() {
-                            break;
+            // Frame bridge: ONE persistent `adb exec-out` screencap
+            // pipe — zero process spawns per frame (60 FPS path).
+            // Starts IMMEDIATELY so the boot animation streams live.
+            // Per-frame `grab_frame` stays as the fallback.
+            std::thread::spawn(move || {
+                let mut stream = match android_runtime::FrameStream::open() {
+                    Ok(s) => {
+                        android_runtime::log_line("frame stream: persistent screencap pipe");
+                        Some(s)
+                    }
+                    Err(e) => {
+                        android_runtime::log_line(&format!(
+                            "frame stream open failed ({e}) — per-frame fallback"
+                        ));
+                        None
+                    }
+                };
+                loop {
+                    let f = match &mut stream {
+                        Some(s) => s.next_frame(),
+                        None => android_runtime::grab_frame(),
+                    };
+                    match f {
+                        Ok(frame) => {
+                            if tx.send(frame).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            if stream.is_some() {
+                                android_runtime::log_line(&format!(
+                                    "frame stream died ({e}) — per-frame fallback"
+                                ));
+                                stream = None;
+                                continue;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(300));
                         }
                     }
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(300)),
+                    if stream.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(33));
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(33));
             });
-            // Persistent low-latency input shell once the guest is up.
+            // Persistent low-latency input shell + injector once the
+            // guest is up.
             std::thread::spawn(move || {
                 if android_runtime::wait_for_device() {
                     match android_runtime::AdbShell::open() {
@@ -220,6 +260,10 @@ fn start_android(a: &mut App) {
                             *shell_slot().lock().unwrap() = Some(sh);
                         }
                         Err(e) => android_runtime::log_line(&format!("adb shell: {e}")),
+                    }
+                    match android_runtime::FastInput::connect() {
+                        Ok(fi) => *input_slot().lock().unwrap() = Some(fi),
+                        Err(e) => android_runtime::log_line(&format!("fast input: {e}")),
                     }
                     // Boot-completion poll — clears the HUD chip; runs
                     // in parallel with the live frame stream.
@@ -249,6 +293,45 @@ fn shell_cmd(a: &mut App, cmd: &str) -> bool {
         a.shell = None;
     }
     false
+}
+
+/// Tap through the low-latency injector (emulator console `event send`
+/// ~1 ms, or `sendevent` batch ~3 ms). `false` when the fast path is
+/// unavailable so the caller can degrade to a shell `input tap`.
+fn fast_tap(a: &mut App, gx: u32, gy: u32) -> bool {
+    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
+        if fi.tap(sh, gx, gy).is_ok() {
+            return true;
+        }
+        android_runtime::log_line("fast input lost — degraded to shell");
+        a.fast_input = None;
+    }
+    false
+}
+
+/// Aim/touch move through the fast injector. `press` sends DOWN at the
+/// point (first feed of a drag), otherwise MOVE.
+fn fast_aim(a: &mut App, x: i32, y: i32, press: bool) -> bool {
+    let (x, y) = (x.max(0) as u32, y.max(0) as u32);
+    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
+        let r = if press {
+            fi.down(sh, x, y)
+        } else {
+            fi.mv(sh, x, y)
+        };
+        if r.is_ok() {
+            return true;
+        }
+        a.fast_input = None;
+    }
+    false
+}
+
+/// Release a held touch (FPS aim off / drag end).
+fn fast_up(a: &mut App) {
+    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
+        let _ = fi.up(sh);
+    }
 }
 
 /// Whether a live Android guest is attached.
@@ -333,6 +416,7 @@ unsafe fn run_app(cfg: Config) {
         cfg: cfg.clone(),
         dl: None,
         emu: None,
+        fast_input: None,
         frame_rx: None,
         android_dims: None,
         last_swipe_pos: None,
@@ -675,7 +759,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 let boot_elapsed = a
                     .emu
                     .as_ref()
-                    .map(|e| e.launched_at.elapsed().as_secs() as u32);
+                    .map(|e| e.launched_at().elapsed().as_secs() as u32);
                 if let (Some(secs), Onboard::WaitingForBoot { elapsed_s, .. }) =
                     (boot_elapsed, &mut a.ui.onboard)
                 {
@@ -702,6 +786,11 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 if a.shell.is_none() {
                     if let Some(sh) = shell_slot().lock().unwrap().take() {
                         a.shell = Some(sh);
+                    }
+                }
+                if a.fast_input.is_none() {
+                    if let Some(fi) = input_slot().lock().unwrap().take() {
+                        a.fast_input = Some(fi);
                     }
                 }
                 // Boot-completion poller cleared the "Booting" chip.
@@ -974,7 +1063,7 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
         if let Some((dw, dh)) = a.android_dims {
             let gx = (x / a.win.0 * dw as f32) as u32;
             let gy = (y / a.win.1 * dh as f32) as u32;
-            if !shell_cmd(a, &format!("input tap {gx} {gy}")) {
+            if !fast_tap(a, gx, gy) && !shell_cmd(a, &format!("input tap {gx} {gy}")) {
                 std::thread::spawn(move || {
                     let _ = android_runtime::send_tap(gx, gy);
                 });
@@ -1002,7 +1091,7 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
                     .then_some(((w.x * dw as f32) as u32, (w.y * dh as f32) as u32))
             });
             if let Some((gx, gy)) = tap_pos {
-                if !shell_cmd(a, &format!("input tap {gx} {gy}")) {
+                if !fast_tap(a, gx, gy) && !shell_cmd(a, &format!("input tap {gx} {gy}")) {
                     std::thread::spawn(move || {
                         let _ = android_runtime::send_tap(gx, gy);
                     });
@@ -1038,6 +1127,8 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
                 a.swipe.begin(a.tick);
             } else {
                 a.swipe.end(a.tick);
+                fast_up(a);
+                a.last_swipe_pos = None;
             }
         }
         k if k == VK_ESCAPE.0 => unsafe {
@@ -1069,7 +1160,7 @@ fn on_drop_files(a: &mut App, lparam: LPARAM) {
                 if android_running(a) {
                     let p = PathBuf::from(&path);
                     std::thread::spawn(move || {
-                        let _ = android_runtime::install_apk(&p);
+                        let _ = android_runtime::install_package(&p);
                     });
                 }
             }
@@ -1134,20 +1225,26 @@ unsafe extern "system" fn wnd_proc(
                 let tick = a.tick;
                 if a.ui.fps_mode {
                     a.swipe.feed(dx as f32, dy as f32, tick);
-                    // Forward FPS aim as adb swipes (~16 Hz throttle).
+                    // Forward FPS aim as touch moves on the fast
+                    // injector (~16 Hz throttle): DOWN on first feed,
+                    // MOVE after — <5 ms, no `input swipe` JVM spawn.
                     if android_running(&mut a) && tick.saturating_sub(a.last_swipe_tick) > 60 {
                         a.last_swipe_tick = tick;
-                        let pos = a.swipe.pos();
-                        if let Some(prev) = a.last_swipe_pos {
-                            let (x1, y1) = prev;
-                            let (x2, y2) = pos;
-                            if !shell_cmd(&mut a, &format!("input swipe {x1} {y1} {x2} {y2} 60")) {
-                                std::thread::spawn(move || {
-                                    let _ = android_runtime::send_swipe(x1, y1, x2, y2, 60);
-                                });
+                        let (x2, y2) = a.swipe.pos();
+                        let press = a.last_swipe_pos.is_none();
+                        if !fast_aim(&mut a, x2, y2, press) {
+                            if let Some((x1, y1)) = a.last_swipe_pos {
+                                if !shell_cmd(
+                                    &mut a,
+                                    &format!("input swipe {x1} {y1} {x2} {y2} 60"),
+                                ) {
+                                    std::thread::spawn(move || {
+                                        let _ = android_runtime::send_swipe(x1, y1, x2, y2, 60);
+                                    });
+                                }
                             }
                         }
-                        a.last_swipe_pos = Some(pos);
+                        a.last_swipe_pos = Some((x2, y2));
                     }
                 }
             }
