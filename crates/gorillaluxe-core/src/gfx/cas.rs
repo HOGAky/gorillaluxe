@@ -190,10 +190,11 @@ pub fn cas_reference(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, sharpness: 
     let mut out = vec![0u8; (dw * dh * 4) as usize];
     for oy in 0..dh {
         for ox in 0..dw {
-            let spx = (ox as f32 + 0.5) * (sw as f32 / dw as f32);
-            let spy = (oy as f32 + 0.5) * (sh as f32 / dh as f32);
-            let icx = spx.floor() as i32;
-            let icy = spy.floor() as i32;
+            // Same exact-rational index math as CAS_SRC — integer
+            // division, no fp, so GPU and reference always agree on
+            // the sampled source texel.
+            let icx = ((2 * ox + 1) * sw / (2 * dw)) as i32;
+            let icy = ((2 * oy + 1) * sh / (2 * dh)) as i32;
             let e = src_px(src, sw, sh, icx, icy);
             let b = src_px(src, sw, sh, icx, icy - 1);
             let d = src_px(src, sw, sh, icx - 1, icy);

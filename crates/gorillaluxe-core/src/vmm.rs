@@ -223,6 +223,16 @@ pub fn run_smoke_test() -> Result<SelfTest, VmError> {
             ));
             halted = true;
             break;
+        } else if reason == WHvRunVpExitReasonCanceled || reason == WHvRunVpExitReasonNone {
+            // Scheduler preemption — not a guest fault. Log and re-run
+            // the vCPU within the same exit budget.
+            if trace.len() < 64 {
+                trace.push(format!(
+                    "reason={} preempted rip=0x{:X}",
+                    reason.0, exit.VpContext.Rip
+                ));
+            }
+            continue;
         } else if reason == WHvRunVpExitReasonMemoryAccess {
             let mem_acc = unsafe { exit.Anonymous.MemoryAccess };
             return Err(VmError::Exit {

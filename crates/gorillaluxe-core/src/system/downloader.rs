@@ -349,6 +349,9 @@ pub fn probe_url(url: &str) -> Result<u64, String> {
 /// Download `t.url` → `t.zip` with `.part` resume and 3 attempts.
 fn download_resume(tx: &mpsc::Sender<DlEvent>, t: &ArtifactTarget) -> Result<(), String> {
     let part = t.zip.with_extension("part");
+    if let Some(dir) = part.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
     let total = remote_len(&t.url);
     let mut last_err = String::new();
     for attempt in 1..=3 {

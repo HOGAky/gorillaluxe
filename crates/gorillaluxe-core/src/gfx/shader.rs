@@ -97,8 +97,11 @@ float3 Max3(float3 a, float3 b, float3 c) { return max(a, max(b, c)); }
 [numthreads(8,8,1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= DstW || tid.y >= DstH) return;
-    float2 sp = (float2(tid.xy) + 0.5f) * (float2(SrcW, SrcH) / float2(DstW, DstH));
-    int2 ic = int2(sp);
+    // Exact-rational source index: floor((2*tid+1)*SrcW/(2*DstW)) in
+    // integer math. The float path lands ~1 ulp below an exact integer
+    // on real GPUs at texel-boundary positions (vs IEEE-exact WARP),
+    // flipping `floor` and breaking the SSIM-vs-reference gate.
+    int2 ic = int2((2u * tid.xy + 1u) * uint2(SrcW, SrcH) / (2u * uint2(DstW, DstH)));
     float3 e = Load(ic);
     float3 b = Load(ic + int2(0, -1));
     float3 d = Load(ic + int2(-1, 0));

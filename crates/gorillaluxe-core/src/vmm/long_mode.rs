@@ -32,8 +32,10 @@ const MEM_SIZE: usize = 1024 * 1024;
 /// `b"GLX-LM64"` packed little-endian — the 64-bit signature.
 pub const LM64_MAGIC: u64 = u64::from_le_bytes(*b"GLX-LM64");
 
-const SEG_ATTR_CODE64: u16 = 0x209B; // P + code/read + L (long mode)
-const SEG_ATTR_DATA64: u16 = 0x0093;
+// VMCS access-rights format: Limit 0xFFFFFFFF requires G (bit 15) —
+// newer WHPX builds reject G=0 + big limits as InvalidVpRegisterValue.
+const SEG_ATTR_CODE64: u16 = 0xA09B; // G + P + code/read + L (long mode)
+const SEG_ATTR_DATA64: u16 = 0x8093; // G + P + writable data
 
 fn reg64(v: u64) -> WHV_REGISTER_VALUE {
     let mut r = WHV_REGISTER_VALUE::default();
@@ -174,6 +176,7 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
     // fault at a stable RIP) still fails after all attempts.
     let mut last_err = String::new();
     let mut regs = Vec::new();
+    let mut preempted_total = 0u32;
     let mem = GuestRam::alloc()?;
     'attempt: for attempt in 1..=3u32 {
         let part = api.create_partition(1)?;
@@ -191,16 +194,29 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
         part.create_vcpu(VP)?;
         setup_long_mode(&part, VP)?;
 
-        // Straight 64-bit payload → a single run must reach HLT.
+        // Straight 64-bit payload → the run must reach HLT.
+        // Canceled/None exits are scheduler preemption, not guest
+        // faults — re-run the vCPU instead of failing the attempt.
         let mut exit = WHV_RUN_VP_EXIT_CONTEXT::default();
-        part.run(VP, &mut exit)?;
+        let mut preempted = 0u32;
+        for _ in 0..64 {
+            part.run(VP, &mut exit)?;
+            if exit.ExitReason == WHvRunVpExitReasonCanceled
+                || exit.ExitReason == WHvRunVpExitReasonNone
+            {
+                preempted += 1;
+                continue;
+            }
+            break;
+        }
         if exit.ExitReason != WHvRunVpExitReasonX64Halt {
             last_err = format!(
-                "reason={} RIP=0x{:X} (attempt {attempt}/3)",
+                "reason={} RIP=0x{:X} (attempt {attempt}/3, preempted {preempted})",
                 exit.ExitReason.0, exit.VpContext.Rip
             );
             continue 'attempt;
         }
+        preempted_total += preempted;
         regs = part.get_registers(
             VP,
             &[WHvX64RegisterRax, WHvX64RegisterCs, WHvX64RegisterEfer],
@@ -226,8 +242,8 @@ pub fn run_long_mode_test() -> Result<SelfTest, VmError> {
     if sig_ok && long_ok {
         Ok(SelfTest::Pass {
             transcript: format!(
-                "long-mode signature={:#X} CS.attr=0x{:X} EFER=0x{:X}",
-                rax, cs_attr, efer
+                "long-mode signature={:#X} CS.attr=0x{:X} EFER=0x{:X} preempted={}",
+                rax, cs_attr, efer, preempted_total
             ),
         })
     } else {

@@ -99,10 +99,15 @@ fn keymap_roundtrip() -> bool {
     let c = km.place(WidgetKind::FpsAim, 0.75, 0.50);
     km.bind(c, 0x01); // VK_LBUTTON
     km.place(WidgetKind::Macro, 0.60, 0.15);
-    if km.save().is_err() {
-        return false;
-    }
-    Keymapper::load().widgets == km.widgets
+    // Temp path only — the self-test must never touch the user's real
+    // %LOCALAPPDATA%\GorillaLuxe\keymap.json.
+    let tmp = std::env::temp_dir().join(format!(
+        "gorillaluxe-selftest-keymap-{}.json",
+        std::process::id()
+    ));
+    let ok = km.save_to(&tmp).is_ok() && Keymapper::load_from(&tmp).widgets == km.widgets;
+    let _ = std::fs::remove_file(&tmp);
+    ok
 }
 
 fn wasapi_probe() -> (bool, f64, String) {

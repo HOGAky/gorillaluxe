@@ -31,8 +31,8 @@ Zero CPU pixel copies in steady state
 
 | File | Role | Роль |
 |---|---|---|
-| `device.rs` | Adapter pick (HW first, WARP with `--ci-software-gpu`), device/queue/fence, `submit_wait`, `wait_idle` | Выбор адаптера, устройство/очередь/фенс |
-| `buffers.rs` | Committed resources, barriers, shared NT handles (`CreateSharedHandle`/`OpenSharedHandle` for resources **and fences**), upload/readback | Ресурсы, барьеры, общие NT-хэндлы, upload/readback |
+| `device.rs` | Adapter pick (HW first, `--ci-software-gpu` forces WARP), device/queue/fence, cached reusable command allocator/list pair (`cmd()` resets only after `submit_wait` drains the GPU), `submit_wait`, `wait_idle`, `device_removed_reason()` | Выбор адаптера, устройство/очередь/фенс, кэшированная пара allocator/list, диагностика device-lost |
+| `buffers.rs` | Committed resources, barriers, shared NT handles (`CreateSharedHandle`/`OpenSharedHandle` for resources **and fences**), upload/readback, `FrameUploader` — cached UPLOAD staging buffer with caller-tracked `before`/`after` states for the per-frame guest texture | Ресурсы, барьеры, общие NT-хэндлы, upload/readback, FrameUploader для горячего пути кадров |
 | `shader.rs` | Runtime HLSL via `d3dcompiler_47.dll`; sources: `PATTERN_SRC` (selftest checker), `AMBIENT_SRC` (Luxe Dark backdrop), `CAS_SRC`, `BLIT_*`, `UI_*` | Компиляция HLSL в рантайме; все шейдеры |
 | `pattern.rs` | Procedural guest frame (compute pass); CPU twin `pattern_image` for verification; ambient pass | Процедурный кадр гостя + ambient-фон |
 | `cas.rs` | AMD FidelityFX CAS compute (sharpness `0.0..1.0`), Rust reference + SSIM | CAS-шарпинг, эталон и SSIM |
@@ -103,8 +103,12 @@ Zero CPU pixel copies in steady state
   generator to `sensors.gorillaluxe.so`. Перлин-шум сенсоров.
 - **`shm_publisher.rs`** — named shared memory
   `Global\GorillaLuxe_Frame_<ID>` + named event
-  `Global\GorillaLuxe_Event_<ID>`; `[seq][len][payload]` layout,
-  publisher + reader. Именованная память кадров + событие.
+  `Global\GorillaLuxe_Event_<ID>` with automatic `Local\` namespace
+  fallback when the token lacks `SeCreateGlobalPrivilege`;
+  `[seq][len][payload]` layout, prefaulted pages at `create()`,
+  `write_frame` copy path + zero-copy `payload_mut`/`commit_frame`,
+  publisher + reader. Именованная память кадров с Local-fallback,
+  префолтингом страниц и zero-copy API.
 - **`snapshot.rs`** — LZ4 VM snapshot save/restore (`lz4_flex`,
   size-prepended frames). LZ4-снимки ВМ.
 - **`cpu_pinning.rs`** — hybrid P/E topology via
@@ -136,7 +140,8 @@ Downloads are native Rust (`system/downloader.rs`) — the PowerShell
 bootstrapper was removed; `emulator.exe` runs inside a Job Object with
 `KILL_ON_JOB_CLOSE` (no orphan qemu), input flows through a persistent
 `adb shell` stdin pipe (<5 ms), and frames arrive as raw `screencap`
-(12-byte header + RGBA8888 — no PNG/GDI+).
+(12-byte header on Android ≤11, 16-byte with `dataspace` on
+Android 12/13 — auto-detected by length — + RGBA8888, no PNG/GDI+).
 
 ### `i18n` + `config`
 - **`i18n.rs`** — atomic `set_lang`/`current_lang`, `tr()` table for

@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
 use gorillaluxe_core::config::Config;
-use gorillaluxe_core::gfx::buffers::{barrier, create_texture_rgba, upload_texture};
+use gorillaluxe_core::gfx::buffers::{barrier, create_texture_rgba, FrameUploader};
 use gorillaluxe_core::gfx::composite::Composite;
 use gorillaluxe_core::gfx::device::Dx12;
 use gorillaluxe_core::gfx::swapchain::SwapChain;
@@ -584,12 +584,12 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 }
 
 fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
-    let dx = Dx12::new(cfg.ci_software_gpu)?;
+    let mut dx = Dx12::new(cfg.ci_software_gpu)?;
     let (mut win_w, mut win_h) = client_size(hwnd);
     let mut swap = SwapChain::new(&dx, hwnd, win_w, win_h)?;
-    let comp = Composite::new(&dx)?;
+    let mut comp = Composite::new(&dx)?;
     let atlas = atlas::build_ui_atlases()?;
-    let ui = UiRenderer::new(&dx, &atlas)?;
+    let mut ui = UiRenderer::new(&dx, &atlas)?;
 
     // Guest framebuffer analog at the compositor resolution preset.
     let mut res = (cfg.res_w, cfg.res_h);
@@ -615,6 +615,11 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
     // Phase 4: live Android framebuffer texture (created on first frame).
     let mut android_tex: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> = None;
     let mut android_tex_dims: (u32, u32) = (0, 0);
+    // Tracked resource state of `android_tex` + its cached uploader —
+    // the texture's steady state is NON_PIXEL_SHADER_RESOURCE, never
+    // COMMON, so a one-shot `upload_texture` barrier set is invalid here.
+    let mut android_tex_state = D3D12_RESOURCE_STATE_COMMON;
+    let mut android_uploader = FrameUploader::new();
     let mut frames = 0u64;
     let mut last = std::time::Instant::now();
     let mut fps = 0u32;
@@ -837,6 +842,14 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 }
             }
 
+            // Minimized window: the swapchain has no visible surface —
+            // skip the render pass entirely (Present would fail with
+            // DXGI_STATUS_OCCLUDED / INVALID_CALL anyway).
+            if IsIconic(hwnd).as_bool() {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                continue 'outer;
+            }
+
             // FPS cap pacing (plus the swapchain latency waitable).
             let frame_target =
                 std::time::Duration::from_secs_f64(1.0 / app().lock().unwrap().fps_cap as f64);
@@ -847,93 +860,155 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
             }
             frame_deadline = std::time::Instant::now() + frame_target;
 
-            let (_alloc, list) = dx.cmd()?;
-            let sharpness = app().lock().unwrap().ui.sharpness;
-            // CAS source: the real Android framebuffer when a guest is
-            // attached, else the Luxe Dark ambient backdrop.
-            let src_res;
-            let src_tex;
-            if let Some((rgba, w, h)) = latest {
-                if android_tex.is_none() || android_tex_dims != (w, h) {
-                    dx.wait_idle()?;
-                    android_tex = Some(create_texture_rgba(
+            let render_result: Result<(), String> = (|| {
+                // Guest-frame upload runs FIRST — its own cmd+submit
+                // must drain before the frame command list opens.
+                let mut android_src = false;
+                if let Some((rgba, w, h)) = latest {
+                    if android_tex.is_none() || android_tex_dims != (w, h) {
+                        dx.wait_idle()?;
+                        android_tex = Some(create_texture_rgba(
+                            &dx,
+                            w,
+                            h,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            false,
+                        )?);
+                        android_tex_dims = (w, h);
+                        android_tex_state = D3D12_RESOURCE_STATE_COMMON;
+                    }
+                    let t = android_tex.as_ref().unwrap();
+                    android_uploader.upload(
                         &dx,
+                        t,
                         w,
                         h,
+                        DXGI_FORMAT_R8G8B8A8_UNORM,
+                        &rgba,
+                        4,
+                        android_tex_state,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )?;
+                    android_tex_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    android_src = true;
+                }
+
+                let (_alloc, list) = dx.cmd()?;
+                let sharpness = app().lock().unwrap().ui.sharpness;
+                // CAS source: the real Android framebuffer when a guest
+                // is attached, else the Luxe Dark ambient backdrop.
+                let src_res;
+                let src_tex;
+                if android_src {
+                    src_tex = android_tex.as_ref().unwrap();
+                    src_res = android_tex_dims;
+                } else {
+                    comp.ambient_frame(&dx, &list, &guest, res.0, res.1, guest_state)?;
+                    guest_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    src_tex = &guest;
+                    src_res = res;
+                }
+                comp.sharpen(
+                    &dx,
+                    &list,
+                    src_tex,
+                    &sharpened,
+                    src_res,
+                    (win_w, win_h),
+                    sharpness,
+                    out_state,
+                )?;
+                out_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+                let idx = swap.current_index();
+                let rt = &swap.buffers[idx as usize];
+                list.ResourceBarrier(&[barrier(
+                    rt,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                )]);
+                let stats = HudStats {
+                    fps,
+                    frame_ms: if fps > 0 { 1000.0 / fps as f32 } else { 0.0 },
+                    backend: if dx.is_warp {
+                        "DX12 Zero-Copy | WARP"
+                    } else {
+                        "DX12 Zero-Copy"
+                    },
+                };
+                let frame: Frame = {
+                    let a = app().lock().unwrap();
+                    build_frame(sw, sh, &a.ui, &atlas, &stats)
+                };
+                {
+                    let mut a = app().lock().unwrap();
+                    a.regions = frame.regions;
+                }
+                comp.present_frame(
+                    &dx,
+                    &ui,
+                    &list,
+                    &sharpened,
+                    &frame.instances,
+                    swap.rtv_for(&dx, idx),
+                    win_w,
+                    win_h,
+                )?;
+                list.ResourceBarrier(&[barrier(
+                    rt,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                dx.submit_wait(&list)?;
+                swap.present()
+            })();
+
+            if let Err(e) = render_result {
+                if let Some(hr) = dx.device_removed_reason() {
+                    gorillaluxe_core::system::logger::error(&format!(
+                        "GPU device lost ({e}, reason {hr:?}) — recreating DX12 pipeline"
+                    ));
+                    // Release old device children first (textures,
+                    // uploader, renderer, compositor, swapchain), the
+                    // device itself last, then rebuild everything.
+                    android_tex = None;
+                    android_tex_dims = (0, 0);
+                    android_uploader = FrameUploader::new();
+                    drop(ui);
+                    drop(comp);
+                    drop(swap);
+                    drop(dx);
+                    dx = Dx12::new(cfg.ci_software_gpu)?;
+                    swap = SwapChain::new(&dx, hwnd, win_w, win_h)?;
+                    comp = Composite::new(&dx)?;
+                    ui = UiRenderer::new(&dx, &atlas)?;
+                    guest = create_texture_rgba(
+                        &dx,
+                        res.0,
+                        res.1,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        true,
+                    )?;
+                    guest_state = D3D12_RESOURCE_STATE_COMMON;
+                    sharpened = create_texture_rgba(
+                        &dx,
+                        win_w,
+                        win_h,
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_COMMON,
                         false,
-                    )?);
-                    android_tex_dims = (w, h);
+                    )?;
+                    out_state = D3D12_RESOURCE_STATE_COMMON;
+                    android_tex_state = D3D12_RESOURCE_STATE_COMMON;
+                    gorillaluxe_core::system::logger::info(
+                        "DX12 pipeline recreated after device loss",
+                    );
+                    continue 'outer;
                 }
-                let t = android_tex.as_ref().unwrap();
-                upload_texture(&dx, t, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &rgba, 4)?;
-                list.ResourceBarrier(&[barrier(
-                    t,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
-                src_tex = t;
-                src_res = (w, h);
-            } else {
-                comp.ambient_frame(&dx, &list, &guest, res.0, res.1, guest_state)?;
-                guest_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                src_tex = &guest;
-                src_res = res;
+                return Err(e);
             }
-            comp.sharpen(
-                &dx,
-                &list,
-                src_tex,
-                &sharpened,
-                src_res,
-                (win_w, win_h),
-                sharpness,
-                out_state,
-            )?;
-            out_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
-            let idx = swap.current_index();
-            let rt = &swap.buffers[idx as usize];
-            list.ResourceBarrier(&[barrier(
-                rt,
-                D3D12_RESOURCE_STATE_COMMON,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-            )]);
-            let stats = HudStats {
-                fps,
-                frame_ms: if fps > 0 { 1000.0 / fps as f32 } else { 0.0 },
-                backend: if dx.is_warp {
-                    "DX12 Zero-Copy | WARP"
-                } else {
-                    "DX12 Zero-Copy"
-                },
-            };
-            let frame: Frame = {
-                let a = app().lock().unwrap();
-                build_frame(sw, sh, &a.ui, &atlas, &stats)
-            };
-            {
-                let mut a = app().lock().unwrap();
-                a.regions = frame.regions;
-            }
-            comp.present_frame(
-                &dx,
-                &ui,
-                &list,
-                &sharpened,
-                &frame.instances,
-                swap.rtv_for(&dx, idx),
-                win_w,
-                win_h,
-            )?;
-            list.ResourceBarrier(&[barrier(
-                rt,
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                D3D12_RESOURCE_STATE_PRESENT,
-            )]);
-            dx.submit_wait(&list)?;
-            swap.present()?;
 
             frames += 1;
             if last.elapsed().as_secs_f64() >= 1.0 {

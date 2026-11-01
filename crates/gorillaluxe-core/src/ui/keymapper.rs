@@ -172,11 +172,28 @@ impl Keymapper {
     pub fn save(&self) -> std::io::Result<()> {
         let dir = data_dir();
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(Self::path(), self.to_json())
+        self.save_to(&Self::path())
+    }
+
+    /// Atomic-ish save to an explicit path: temp file + rename over the
+    /// target (same pattern as `Config::save`) so a crash mid-write
+    /// can never leave a truncated `keymap.json`.
+    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, self.to_json())?;
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(())
     }
 
     pub fn load() -> Keymapper {
-        std::fs::read_to_string(Self::path())
+        Self::load_from(&Self::path())
+    }
+
+    pub fn load_from(path: &std::path::Path) -> Keymapper {
+        std::fs::read_to_string(path)
             .map(|t| Self::from_json(&t))
             .unwrap_or_default()
     }

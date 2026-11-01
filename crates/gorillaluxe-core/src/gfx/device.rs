@@ -11,6 +11,16 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::{hr, GResult};
 
+/// Reusable direct command allocator + list pair. `in_use` marks the
+/// window between `cmd()` hand-out and `submit_wait` draining the
+/// queue — the pair must never be reset while its list may still be
+/// recording or executing.
+struct CmdPair {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    in_use: bool,
+}
+
 pub struct Dx12 {
     pub factory: IDXGIFactory6,
     pub device: ID3D12Device,
@@ -20,6 +30,7 @@ pub struct Dx12 {
     fence: ID3D12Fence,
     fence_value: std::cell::Cell<u64>,
     fence_event: HANDLE,
+    cmd_pair: std::sync::Mutex<Option<CmdPair>>,
 }
 
 impl Dx12 {
@@ -38,10 +49,10 @@ impl Dx12 {
         0x0D1E, 0x0D22, 0x0D26, 0x0D2A, 0x0D2B, 0x0D2E,
     ];
 
-    /// Pick the best adapter: capable hardware first; WARP whenever no
-    /// suitable hardware exists — NEVER crash on old iGPUs.
-    /// `allow_software` (`--ci-software-gpu`) remains for forcing WARP
-    /// on capable hardware in CI.
+    /// Pick the adapter: `--ci-software-gpu` forces WARP first
+    /// (deterministic CI rendering even when hardware exists);
+    /// otherwise capable hardware first, WARP whenever no suitable
+    /// hardware exists — NEVER crash on old iGPUs.
     pub fn new(allow_software: bool) -> GResult<Dx12> {
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
@@ -49,34 +60,47 @@ impl Dx12 {
 
             let mut chosen: Option<(IDXGIAdapter1, DXGI_ADAPTER_DESC1, bool)> = None;
 
+            // `--ci-software-gpu`: deterministic WARP for CI runs even
+            // when a hardware GPU is present. Falls through to the
+            // hardware loop only if WARP can't create a device.
+            if allow_software {
+                if let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+                    if let Ok(desc) = adapter.GetDesc1() {
+                        if Self::try_device(&adapter).is_some() {
+                            chosen = Some((adapter, desc, true));
+                        }
+                    }
+                }
+            }
+
             // Hardware adapters first (always preferred).
-            for i in 0..32u32 {
-                let Ok(adapter) = factory.EnumAdapters1(i) else {
-                    break;
-                };
-                let Ok(desc) = adapter.GetDesc1() else {
-                    continue;
-                };
-                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
-                    continue;
-                }
-                // Skip known pre-D3D12 Intel parts even if a shim
-                // driver claims support — they corrupt under our CS.
-                if desc.VendorId == 0x8086 && Self::LEGACY_INTEL.contains(&desc.DeviceId) {
-                    continue;
-                }
-                if Self::try_device(&adapter).is_some() {
-                    chosen = Some((adapter, desc, false));
-                    break;
+            if chosen.is_none() {
+                for i in 0..32u32 {
+                    let Ok(adapter) = factory.EnumAdapters1(i) else {
+                        break;
+                    };
+                    let Ok(desc) = adapter.GetDesc1() else {
+                        continue;
+                    };
+                    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                        continue;
+                    }
+                    // Skip known pre-D3D12 Intel parts even if a shim
+                    // driver claims support — they corrupt under our CS.
+                    if desc.VendorId == 0x8086 && Self::LEGACY_INTEL.contains(&desc.DeviceId) {
+                        continue;
+                    }
+                    if Self::try_device(&adapter).is_some() {
+                        chosen = Some((adapter, desc, false));
+                        break;
+                    }
                 }
             }
 
             // WARP fallback — unconditional when no hardware adapter
-            // qualified (old iGPU laptops included). `allow_software`
-            // is kept for API compat / CI forcing; production never
+            // qualified (old iGPU laptops included): production never
             // crashes on missing D3D12 hardware.
             if chosen.is_none() {
-                let _ = allow_software; // honored implicitly — kept for call-site compat
                 if let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
                     if let Ok(desc) = adapter.GetDesc1() {
                         if Self::try_device(&adapter).is_some() {
@@ -126,6 +150,7 @@ impl Dx12 {
                 fence,
                 fence_value: std::cell::Cell::new(0),
                 fence_event,
+                cmd_pair: std::sync::Mutex::new(None),
             })
         }
     }
@@ -138,10 +163,29 @@ impl Dx12 {
         dev
     }
 
-    /// Fresh direct command allocator + list (single-shot submission model
-    /// is fine for the compositor's workload).
+    /// Direct command allocator + list. Reuses the cached pair when
+    /// the GPU has drained it (`submit_wait` blocks until completion),
+    /// so the frame hot path does not mint fresh WDDM objects per call.
     pub fn cmd(&self) -> GResult<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
         unsafe {
+            let mut slot = self.cmd_pair.lock().unwrap();
+            if let Some(p) = slot.as_mut() {
+                if !p.in_use {
+                    // Defensive Close: a list abandoned mid-record by an
+                    // erroring caller must not block the allocator reset.
+                    let _ = p.list.Close();
+                    p.alloc
+                        .Reset()
+                        .map_err(|e| hr("CommandAllocator::Reset", e))?;
+                    p.list
+                        .Reset(&p.alloc, None::<&ID3D12PipelineState>)
+                        .map_err(|e| hr("CommandList::Reset", e))?;
+                    p.in_use = true;
+                    return Ok((p.alloc.clone(), p.list.clone()));
+                }
+            }
+            // First use — or the cached pair is still recording — make a
+            // fresh pair. Never reset an in-flight list.
             let alloc = self
                 .device
                 .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -155,6 +199,11 @@ impl Dx12 {
                     None::<&ID3D12PipelineState>,
                 )
                 .map_err(|e| hr("CreateCommandList", e))?;
+            *slot = Some(CmdPair {
+                alloc: alloc.clone(),
+                list: list.clone(),
+                in_use: true,
+            });
             Ok((alloc, list))
         }
     }
@@ -176,8 +225,22 @@ impl Dx12 {
                     .map_err(|e| hr("SetEventOnCompletion", e))?;
                 WaitForSingleObject(self.fence_event, 30_000);
             }
+            // GPU drained — the cached pair becomes reusable by `cmd()`
+            // when this list is the one it handed out.
+            let mut slot = self.cmd_pair.lock().unwrap();
+            if let Some(p) = slot.as_mut() {
+                if p.list.as_raw() == list.as_raw() {
+                    p.in_use = false;
+                }
+            }
             Ok(())
         }
+    }
+
+    /// `Some(hr)` once the device reports `DXGI_ERROR_DEVICE_REMOVED` /
+    /// `DEVICE_RESET` — drives pipeline recreation in the render loop.
+    pub fn device_removed_reason(&self) -> Option<windows::core::HRESULT> {
+        unsafe { self.device.GetDeviceRemovedReason().err().map(|e| e.code()) }
     }
 
     /// Block until all submitted queue work completes (used before

@@ -1019,9 +1019,14 @@ pub fn install_apk(path: &Path) -> Result<String, String> {
     install_package(path)
 }
 
-/// Parse the raw `screencap` (no `-p`) 12-byte header:
-/// `u32 width, u32 height, u32 format` where `1 = RGBA_8888`.
-/// Returns `(w, h, pixel_offset)` — pure, unit-testable.
+/// Parse the raw `screencap` (no `-p`) header.
+/// Android ≤11 writes 12 bytes `(w: u32, h: u32, fmt: u32)`; Android
+/// 12/13 (API 31+) appends a `dataspace: u32` — a 16-byte header.
+/// `fmt == 1` means RGBA_8888. Returns `(w, h, pixel_offset)` — the
+/// offset is derived from the total length so a 16-byte capture is
+/// never misparsed as 12 (the `dataspace` u32 would otherwise be read
+/// as pixel 0 and shift the whole image by one pixel).
+/// Pure, unit-testable.
 pub fn parse_screencap_header(b: &[u8]) -> Option<(u32, u32, usize)> {
     if b.len() < 12 {
         return None;
@@ -1029,13 +1034,13 @@ pub fn parse_screencap_header(b: &[u8]) -> Option<(u32, u32, usize)> {
     let w = u32::from_le_bytes(b[0..4].try_into().unwrap());
     let h = u32::from_le_bytes(b[4..8].try_into().unwrap());
     let fmt = u32::from_le_bytes(b[8..12].try_into().unwrap());
-    if fmt == 1
-        && w > 0
-        && w <= 8192
-        && h > 0
-        && h <= 8192
-        && b.len() >= 12 + (w as usize) * (h as usize) * 4
-    {
+    if fmt != 1 || w == 0 || w > 8192 || h == 0 || h > 8192 {
+        return None;
+    }
+    let px = (w as usize) * (h as usize) * 4;
+    if b.len() == 16 + px {
+        Some((w, h, 16))
+    } else if b.len() >= 12 + px {
         Some((w, h, 12))
     } else {
         None
@@ -1145,10 +1150,17 @@ pub fn cmdline_quote(path: &Path) -> String {
 /// The guest pushes back-to-back `[u32 w][u32 h][u32 fmt][pixels]`
 /// records over a single stdout channel — no `adb.exe` process is
 /// ever created per frame (~10 FPS spawn-limited → display-limited).
+/// Android 12+ appends `dataspace: u32` (16-byte header) — detected
+/// once by peeking at the NEXT record's header.
 pub struct FrameStream {
     child: Child,
     stdout: std::process::ChildStdout,
     buf: Vec<u8>,
+    /// Record header size: 0 = undetected, else 12 (Android ≤11) or
+    /// 16 (Android 12+, with trailing `dataspace`).
+    hdr_size: usize,
+    /// Bytes of the NEXT record already consumed by the sniff read.
+    pending: Vec<u8>,
 }
 
 impl FrameStream {
@@ -1171,19 +1183,81 @@ impl FrameStream {
             child,
             stdout,
             buf: Vec::new(),
+            hdr_size: 0,
+            pending: Vec::new(),
         })
     }
 
-    /// Block for the next `[w,h,fmt,rgba]` record. Err = pipe dead
-    /// (caller reopens or falls back to per-frame `grab_frame`).
-    /// The pixel buffer is moved out — zero per-frame memcpy; the
-    /// allocator reuses the freed block on the next `resize`.
-    pub fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+    /// Fill `dst` from `pending` (sniff over-read) then the pipe.
+    fn fill_exact(&mut self, dst: &mut [u8]) -> Result<(), String> {
         use std::io::Read;
-        let mut hdr = [0u8; 12];
+        let take = self.pending.len().min(dst.len());
+        dst[..take].copy_from_slice(&self.pending[..take]);
+        self.pending.drain(..take);
+        if take < dst.len() {
+            self.stdout
+                .read_exact(&mut dst[take..])
+                .map_err(|e| format!("stream read: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// First record: read header(12) + payload + 16 look-ahead bytes
+    /// covering the NEXT record's header under both layouts; the one
+    /// whose trailing header re-validates fixes `hdr_size` for the
+    /// stream's lifetime.
+    fn sniff_first_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        use std::io::Read;
+        let mut rec = vec![0u8; 12];
         self.stdout
-            .read_exact(&mut hdr)
+            .read_exact(&mut rec)
             .map_err(|e| format!("stream hdr: {e}"))?;
+        let w = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+        let h = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+        let fmt = u32::from_le_bytes(rec[8..12].try_into().unwrap());
+        if fmt != 1 || w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return Err(format!("stream bad hdr {w}x{h} fmt={fmt}"));
+        }
+        let n = (w as usize) * (h as usize) * 4;
+        let mut extra = vec![0u8; n + 16];
+        self.stdout
+            .read_exact(&mut extra)
+            .map_err(|e| format!("stream px: {e}"))?;
+        let hdr_ok = |b: &[u8]| -> bool {
+            if b.len() < 12 {
+                return false;
+            }
+            let w2 = u32::from_le_bytes(b[0..4].try_into().unwrap());
+            let h2 = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            let f2 = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            w2 == w && h2 == h && f2 == 1
+        };
+        let (hdr_size, px_off) = if hdr_ok(&extra[n..n + 12]) {
+            (12usize, 0usize) // next hdr right after 12+n -> 12B layout
+        } else if hdr_ok(&extra[n + 4..n + 16]) {
+            (16usize, 4usize) // 4-byte dataspace shifted it -> 16B
+        } else {
+            (12usize, 0usize) // undetermined — assume legacy layout
+        };
+        self.hdr_size = hdr_size;
+        // Everything past this record is the start of the next one.
+        let record_len = hdr_size + n;
+        let consumed = 12 + extra.len();
+        self.pending = extra[record_len - 12..consumed - 12].to_vec();
+        Ok((extra[px_off..px_off + n].to_vec(), w, h))
+    }
+
+    /// Block for the next `[w,h,fmt,(dataspace),rgba]` record.
+    /// Err = pipe dead (caller reopens or falls back to per-frame
+    /// `grab_frame`). The pixel buffer is moved out — zero per-frame
+    /// memcpy; the allocator reuses the freed block on the next
+    /// `resize`.
+    pub fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
+        if self.hdr_size == 0 {
+            return self.sniff_first_frame();
+        }
+        let mut hdr = [0u8; 16];
+        self.fill_exact(&mut hdr[..self.hdr_size])?;
         let w = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
         let h = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
         let fmt = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
@@ -1191,11 +1265,10 @@ impl FrameStream {
             return Err(format!("stream bad hdr {w}x{h} fmt={fmt}"));
         }
         let n = (w as usize) * (h as usize) * 4;
-        self.buf.resize(n, 0);
-        self.stdout
-            .read_exact(&mut self.buf)
-            .map_err(|e| format!("stream px: {e}"))?;
-        Ok((std::mem::take(&mut self.buf), w, h))
+        let mut buf = std::mem::take(&mut self.buf);
+        buf.resize(n, 0);
+        self.fill_exact(&mut buf)?;
+        Ok((buf, w, h))
     }
 }
 
@@ -1407,5 +1480,45 @@ impl FastInput {
     pub fn tap(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
         self.down(shell, x, y)?;
         self.up(shell)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_screencap_header;
+
+    fn cap(w: u32, h: u32, hdr: usize, dataspace: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // fmt = RGBA_8888
+        if hdr == 16 {
+            b.extend_from_slice(&dataspace.to_le_bytes());
+        }
+        // Sentinel first pixel — verifies the payload is not shifted
+        // by a misparsed header length.
+        b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        b.resize(12.max(hdr) + (w as usize) * (h as usize) * 4, 0x7F);
+        b
+    }
+
+    #[test]
+    fn screencap_12b_and_16b_headers() {
+        let (w, h) = (640u32, 480u32);
+        // Android <=11: 12-byte header.
+        let b12 = cap(w, h, 12, 0);
+        let (pw, ph, off) = parse_screencap_header(&b12).unwrap();
+        assert_eq!((pw, ph, off), (w, h, 12));
+        assert_eq!(&b12[off..off + 4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        // Android 12/13: same record + `dataspace` u32 -> 16-byte header.
+        let b16 = cap(w, h, 16, 0x0000_0000);
+        let (pw, ph, off) = parse_screencap_header(&b16).unwrap();
+        assert_eq!((pw, ph, off), (w, h, 16));
+        assert_eq!(&b16[off..off + 4], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        // Truncated payload rejected; bogus format rejected.
+        assert!(parse_screencap_header(&b12[..b12.len() - 8]).is_none());
+        let mut bad = b12.clone();
+        bad[8..12].copy_from_slice(&9u32.to_le_bytes());
+        assert!(parse_screencap_header(&bad).is_none());
     }
 }

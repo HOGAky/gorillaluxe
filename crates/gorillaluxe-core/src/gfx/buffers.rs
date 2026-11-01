@@ -19,6 +19,7 @@ pub fn write_upload(buf: &ID3D12Resource, data: &[u8]) -> GResult<()> {
         buf.Map(0, None, Some(&mut ptr))
             .map_err(|e| hr("Map(upload)", e))?;
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+        buf.Unmap(0, None);
         Ok(())
     }
 }
@@ -257,6 +258,108 @@ pub fn upload_texture(
         )]);
         dx.submit_wait(&list)?;
         Ok(())
+    }
+}
+
+/// Per-frame UPLOAD-heap uploader for the guest-frame hot path.
+/// Caches one staging buffer (reallocated only when the payload
+/// outgrows `capacity`) and takes explicit `before`/`after` texture
+/// states — `upload_texture`'s hardcoded COMMON->COPY_DEST->PSR
+/// transition is wrong for a texture whose steady state is
+/// NON_PIXEL_SHADER_RESOURCE.
+#[derive(Default)]
+pub struct FrameUploader {
+    buf: Option<ID3D12Resource>,
+    capacity: u64,
+}
+
+impl FrameUploader {
+    pub fn new() -> Self {
+        FrameUploader {
+            buf: None,
+            capacity: 0,
+        }
+    }
+
+    /// Stage `data` through the cached UPLOAD buffer into `dst` and
+    /// leave `dst` in `after`. `before` must be the texture's tracked
+    /// current state (COMMON on first use).
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload(
+        &mut self,
+        dx: &Dx12,
+        dst: &ID3D12Resource,
+        w: u32,
+        h: u32,
+        format: DXGI_FORMAT,
+        data: &[u8],
+        bytes_per_pixel: u32,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> GResult<()> {
+        unsafe {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut row_size = 0u64;
+            let mut total = 0u64;
+            dx.device.GetCopyableFootprints(
+                &tex_desc(w, h, format, D3D12_RESOURCE_FLAG_NONE),
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                Some(&mut row_size),
+                Some(&mut total),
+            );
+
+            if total > self.capacity {
+                self.buf = Some(create_upload_buffer(dx, total)?);
+                self.capacity = total;
+            }
+            let upload = self.buf.as_ref().unwrap();
+
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            upload
+                .Map(0, None, Some(&mut ptr))
+                .map_err(|e| hr("Map(upload)", e))?;
+            let src_pitch = (w * bytes_per_pixel) as usize;
+            let dst_pitch = footprint.Footprint.RowPitch as usize;
+            for row in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().add(row * src_pitch),
+                    (ptr as *mut u8).add(row * dst_pitch),
+                    src_pitch.min(row_size as usize),
+                );
+            }
+            upload.Unmap(0, None);
+
+            let (_alloc, list) = dx.cmd()?;
+            if before != D3D12_RESOURCE_STATE_COPY_DEST {
+                list.ResourceBarrier(&[barrier(dst, before, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(dst.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: ManuallyDrop::new(Some(upload.clone())),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+            if after != D3D12_RESOURCE_STATE_COPY_DEST {
+                list.ResourceBarrier(&[barrier(dst, D3D12_RESOURCE_STATE_COPY_DEST, after)]);
+            }
+            // Wait for the GPU before returning so the cached staging
+            // buffer is safe to overwrite on the next frame.
+            dx.submit_wait(&list)?;
+            Ok(())
+        }
     }
 }
 
