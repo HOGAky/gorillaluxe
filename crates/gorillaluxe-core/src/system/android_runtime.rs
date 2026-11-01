@@ -1248,9 +1248,52 @@ pub fn start_liveness_poller() {
                         let _ = adb_run(&[
                             "-e",
                             "shell",
-                            "cmd package bg-dexopt-job --cancel >/dev/null 2>&1",
+                            concat!(
+                                "cmd package bg-dexopt-job --cancel >/dev/null 2>&1;",
+                                // Gesture-nav monitors ([Gesture Monitor]
+                                // edge-swipe / swipe-up) are owned by
+                                // SystemUI — while it ANRs they eat EVERY
+                                // touch systemwide (verified live: taps
+                                // reached /dev/input/event2 but no window
+                                // acted). 3-button nav removes them; the
+                                // hidden nav bar costs nothing since our
+                                // UI has its own Back/Home dock.
+                                "settings put secure navigation_mode 0"
+                            ),
                         ]);
                         calmed_store = true;
+                    }
+                    // Post-ANR focus wedge: after the boot storm WMS
+                    // can sit with FocusedWindows EMPTY — every tap
+                    // then dispatches nowhere (verified live: launcher
+                    // resumed, channel NORMAL, zero focus). Refocus the
+                    // home task once; an `am start` no-ops when a
+                    // window already holds focus.
+                    let _ = adb_run(&[
+                        "-e",
+                        "shell",
+                        "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1",
+                    ]);
+                }
+                // Focus watchdog — ANR storms can re-wedge focus later
+                // (SystemUI restarts re-create empty-focus states).
+                // Re-fire the home intent whenever FocusedWindows is
+                // empty again; cheap dumpsys every ~12 s only.
+                if BOOT_COMPLETED.load(Ordering::Acquire) && anr_tick == 3 {
+                    let focused = adb_run(&[
+                        "-e",
+                        "shell",
+                        "dumpsys input | grep -A1 FocusedWindows | grep -c 'displayId'",
+                    ])
+                    .map(|s| s.trim().parse::<u32>().unwrap_or(0))
+                    .unwrap_or(0);
+                    if focused == 0 {
+                        let _ = adb_run(&[
+                            "-e",
+                            "shell",
+                            "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1",
+                        ]);
+                        log_line("input focus wedge detected — re-focused home task");
                     }
                 }
                 anr_tick += 1;
@@ -1311,52 +1354,131 @@ fn dismiss_anr_dialogs(_streak: u32) -> usize {
     let Ok(dump) = adb_run(&["-e", "shell", "dumpsys", "window", "windows"]) else {
         return 0;
     };
-    let found = dump
-        .lines()
-        .filter(|l| l.contains("Window #") && l.contains("Application Not Responding:"))
-        .count();
-    if found == 0 {
+    // Collect every ANR window's mFrame — dumpsys is always fresh,
+    // unlike the a11y tree which freezes while SystemUI is ANR'd
+    // (observed: uiautomator kept reporting a dismissed dialog's
+    // Wait bounds for minutes).
+    let mut frames: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut pkgs: Vec<String> = Vec::new();
+    let mut in_anr = false;
+    for line in dump.lines() {
+        if line.contains("Window #") {
+            in_anr = line.contains("Application Not Responding:");
+            if in_anr {
+                if let Some(p) = line.rfind("Application Not Responding:") {
+                    pkgs.push(
+                        line[p + 27..]
+                            .trim_end_matches(['}', ':', ' '])
+                            .trim()
+                            .to_string(),
+                    );
+                }
+            }
+            continue;
+        }
+        if in_anr {
+            if let Some(pos) = line.find("frame=[") {
+                let c = p_split_bounds(&line[pos + 6..]);
+                if c.len() >= 4 && c[2] > c[0] && c[3] > c[1] {
+                    frames.push((c[0], c[1], c[2], c[3]));
+                }
+                in_anr = false;
+            }
+        }
+    }
+    if frames.is_empty() {
         return 0;
     }
-    // Precise "Wait" hit: the ANR mFrame only loosely tracks the
-    // visible AlertDialog (verified live — 78%-of-frame taps landed
-    // between the title and the buttons). `uiautomator dump` hands us
-    // the real button bounds; tap each `Wait`/`Подождать` node center.
-    // "Close app"/"Закрыть" is NEVER tapped (killing SystemUI blanks
-    // the wallpaper surface to all-black).
+    // Fresh "Wait"/"Подождать" button bounds from uiautomator — but
+    // only TRUSTED when the bounds fall inside a live ANR mFrame;
+    // a frozen a11y tree yields stale boxes we then ignore.
+    let mut waits: Vec<(u32, u32)> = Vec::new();
     let _ = adb_run(&["-e", "shell", "uiautomator", "dump", "/sdcard/glx_ui.xml"]);
     if let Ok(ui) = adb_run(&["-e", "shell", "cat", "/sdcard/glx_ui.xml"]) {
         let mut rest = ui.as_str();
         while let Some(p) = rest.find("bounds=\"[") {
             let seg = &rest[..p];
-            let node_start = seg.rfind("<node").unwrap_or(0);
-            let node = &seg[node_start..];
+            let node = &seg[seg.rfind("<node").unwrap_or(0)..];
             let is_wait = ["\"Wait\"", "\"Подождать\""]
                 .iter()
                 .any(|t| node.contains(&format!("text={t}")));
-            rest = &rest[p + 8..];
+            let body = &rest[p + 8..];
+            rest = body;
             if !is_wait {
                 continue;
             }
-            let coords: Vec<i32> = p_split_bounds(&rest[..rest.find('"').unwrap_or(40)]);
-            if coords.len() >= 4 {
-                let tx = ((coords[0] + coords[2]) / 2).max(0) as u32;
-                let ty = ((coords[1] + coords[3]) / 2).max(0) as u32;
-                if console_tap(tx, ty).is_err() {
-                    let _ = adb_run(&[
-                        "-e",
-                        "shell",
-                        "input",
-                        "tap",
-                        &tx.to_string(),
-                        &ty.to_string(),
-                    ]);
+            let c = p_split_bounds(&body[..body.find('"').unwrap_or(40)]);
+            if c.len() >= 4 {
+                let (tx, ty) = ((c[0] + c[2]) / 2, (c[1] + c[3]) / 2);
+                if frames
+                    .iter()
+                    .any(|f| tx >= f.0 && tx <= f.2 && ty >= f.1 && ty <= f.3)
+                {
+                    waits.push((tx.max(0) as u32, ty.max(0) as u32));
                 }
-                log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
             }
         }
     }
-    found
+    for (x1, y1, x2, y2) in &frames {
+        let hit = waits.iter().copied().find(|(tx, ty)| {
+            *tx as i32 >= *x1 && *tx as i32 <= *x2 && *ty as i32 >= *y1 && *ty as i32 <= *y2
+        });
+        let (tx, ty) = hit.unwrap_or_else(|| {
+            // Fallback: the ANR AlertDialog stacks buttons in its
+            // bottom band — "Wait" is the LAST button ≈88% of the
+            // window frame. "Close app" (~60%) is never touched:
+            // killing SystemUI blanks the wallpaper surface.
+            let cx = ((*x1 + *x2) / 2).max(0) as u32;
+            let cy = (*y1 + (*y2 - *y1) * 88 / 100).max(0) as u32;
+            (cx, cy)
+        });
+        if console_tap(tx, ty).is_err() {
+            let _ = adb_run(&[
+                "-e",
+                "shell",
+                "input",
+                "tap",
+                &tx.to_string(),
+                &ty.to_string(),
+            ]);
+        }
+        log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
+    }
+    // Root cause, not just the symptom: a package that keeps raising
+    // fresh ANR dialogs is genuinely wedged — Wait-tapping forever
+    // only hides the zombie. After 6 dismissed dialogs for the same
+    // package, kill the app process: `system_server` respawns
+    // persistent apps (systemui) cleanly and a plain app gets a
+    // fresh start instead of a permanent dialog loop.
+    static ANR_COUNT: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+    {
+        let mut counts = ANR_COUNT.lock().unwrap_or_else(|e| e.into_inner());
+        for pkg in &pkgs {
+            let n = {
+                let e = counts.iter_mut().find(|(p, _)| p == pkg).map(|(_, n)| n);
+                match e {
+                    Some(n) => {
+                        *n += 1;
+                        *n
+                    }
+                    None => {
+                        counts.push((pkg.clone(), 1));
+                        1
+                    }
+                }
+            };
+            if n == 6 {
+                log_line(&format!(
+                    "ANR loop for {pkg} (6 dialogs) — restarting the process"
+                ));
+                let _ = adb_run(&["-e", "shell", "am", "crash", pkg]);
+                let _ = adb_run(&["-e", "shell", "am", "force-stop", pkg]);
+                let _ = adb_run(&["-e", "shell", "killall", pkg]);
+            }
+        }
+        counts.retain(|(p, _)| pkgs.iter().any(|q| q == p));
+    }
+    frames.len()
 }
 
 /// Parse `[x1,y1][x2,y2]` from a uiautomator `bounds` attribute body.
