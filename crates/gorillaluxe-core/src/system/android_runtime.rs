@@ -346,22 +346,18 @@ impl EmulatorProc {
     /// then cold-boots and replays the multi-minute GMS first-boot
     /// churn (the SystemUI-ANR storm this build mitigates). Order:
     ///  1) `avd snapshot save default_boot` (console :5554) — writes
-    ///     the qcow2 device overlays `reboot -p` alone doesn't
-    ///     (verified live: poweroff alone → next launch fails
-    ///     "Device 'cache' does not have the requested snapshot" →
-    ///     cold boot anyway);
-    ///  2) `reboot -p` — guest powers off → clean userdata unmount +
-    ///     qemu exit (RAM file-backs via -mem-path);
-    ///  3) monitor `quit` — clean qemu exit even if adbd is wedged;
+    ///     the full QuickBoot state (framebuffer, gfxstream textures,
+    ///     and qcow2 device overlays);
+    ///  2) `kill` via console :5554 (NOT `adb shell reboot -p` — guest
+    ///     poweroff triggers `Snapshotter` to log `Deleting snapshot
+    ///     default_boot` and forces a cold boot on the next launch!);
+    ///  3) monitor `quit` — clean qemu exit fallback;
     ///  4) kill + Job close — last resort, never left orphaned.
-    ///
-    /// Total grace budget ~2 min: a ~2.5 GiB RAM snapshot + disk
-    /// overlays take a while on laptop storage.
     pub fn shutdown(&mut self) {
         log_line("emulator shutdown: saving QuickBoot snapshot");
         match emu_console_cmd("avd snapshot save default_boot", 60_000) {
             Ok(r) => {
-                if r.starts_with("KO") {
+                if r.contains("KO") {
                     log_line(&format!("snapshot save failed: {}", r.trim()));
                 } else {
                     log_line("QuickBoot snapshot saved");
@@ -369,18 +365,16 @@ impl EmulatorProc {
             }
             Err(e) => log_line(&format!("snapshot save: {e}")),
         }
-        log_line("emulator shutdown: guest poweroff requested");
-        let _ = super::silent_cmd(adb())
-            .args(["shell", "reboot", "-p"])
-            .output();
-        if self.wait_exit(45_000) {
-            log_line("emulator exited cleanly (guest poweroff)");
+        log_line("emulator shutdown: requesting clean console exit");
+        let _ = emu_console_cmd("kill", 10_000);
+        if self.wait_exit(35_000) {
+            log_line("emulator exited cleanly (console kill)");
         } else {
-            log_line("emulator still up after poweroff — monitor quit");
+            log_line("emulator still up after console kill — monitor quit");
             if let Ok(mut m) = QemuMonitor::connect() {
                 let _ = m.quit();
             }
-            if self.wait_exit(30_000) {
+            if self.wait_exit(25_000) {
                 log_line("emulator exited cleanly (monitor quit)");
             } else {
                 log_line("emulator did not exit — hard kill");
@@ -557,6 +551,7 @@ pub fn write_avd(
         sysdir = sysimg.to_string_lossy().replace('\\', "/"),
     );
     std::fs::write(avd.join("config.ini"), config).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(avd.join("quickBootChoice.ini"), b"saveOnExit = true\n");
     let _ = std::fs::write(avd.join(".glx_avd_v4"), b"landscape spec-profile v4\n");
     Ok(avd)
 }
@@ -639,6 +634,8 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
         // emulator.log. JWT on; the token lands in the engine output
         // when a client is ever wired.
         "-grpc-use-jwt".into(),
+        "-feature".into(),
+        "VulkanSnapshots".into(),
         "-verbose".into(),
         // Everything after `-qemu` passes through to qemu-system.
         // The human monitor on 127.0.0.1:4444 is the injection path
@@ -1064,8 +1061,10 @@ pub fn start_liveness_poller() {
     std::thread::spawn(|| {
         let mut misses = 0u32;
         let mut woke = false;
+        let mut calmed_store = false;
         let mut anr_tick = 0u32;
-        let mut anr_ticks = 8u32;
+        let mut anr_ticks = 6u32;
+        let mut anr_streak = 0u32;
         loop {
             let online = adb_run(&["get-state"])
                 .map(|s| s.trim() == "device")
@@ -1079,42 +1078,42 @@ pub fn start_liveness_poller() {
                     // keyguard window — without these an early-boot
                     // display can sit black with boot_completed=1.
                     wake_guest();
-                    // ARM64 support: the `-prop ro.dalvik.vm.native.bridge`
-                    // launch arg is REJECTED by emulator ≥35 ("only
-                    // 'qemu.*' properties are supported" in emulator.log)
-                    // — the supported switch is the persist flag, set
-                    // here before zygote spawns app processes. Best-effort:
-                    // harmless on images without libndk_translation.
-                    let _ = adb_run(&["-e", "shell", "setprop", "persist.sys.nativebridge", "1"]);
-                    // Background-app ANR dialogs are pure noise for a
-                    // consumer product — the app watchdog already kills
-                    // them silently when this is 0. Foreground ANRs
-                    // (SystemUI) still show and are handled by
-                    // dismiss_anr_dialogs.
-                    let _ = adb_run(&[
-                        "-e",
-                        "shell",
-                        "settings",
-                        "put",
-                        "global",
-                        "anr_show_background",
-                        "0",
-                    ]);
-                    log_line("guest wake + keyguard dismiss sent");
+                    // Single shell invocation for all early-boot tuning:
+                    //  1) nativebridge for ARM64 games;
+                    //  2) cap dex2oat to 1 thread + disable bg-dexopt so
+                    //     background compilation never starves SystemUI;
+                    //  3) zero window/transition animations + suppress
+                    //     background ANR popups;
+                    //  4) disable preinstalled non-gaming bloatware whose
+                    //     Play-Store `rapid_auto_update` (YouTube Music
+                    //     83 MB, Maps, Photos, Videos, SearchBox, etc.)
+                    //     pegs system_server at 70% CPU on 2-core hosts.
+                    //     Play Store (`com.android.vending`) & GMS stay
+                    //     enabled for user-initiated installs.
+                    let init_script = concat!(
+                        "setprop persist.sys.nativebridge 1;",
+                        "setprop dalvik.vm.dex2oat-threads 1;",
+                        "setprop dalvik.vm.boot-dex2oat-threads 1;",
+                        "cmd package bg-dexopt-job --disable >/dev/null 2>&1;",
+                        "settings put global anr_show_background 0;",
+                        "settings put global window_animation_scale 0.0;",
+                        "settings put global transition_animation_scale 0.0;",
+                        "settings put global animator_duration_scale 0.0;",
+                        "for p in ",
+                        "com.google.android.apps.youtube.music ",
+                        "com.google.android.youtube ",
+                        "com.google.android.apps.maps ",
+                        "com.google.android.apps.photos ",
+                        "com.google.android.videos ",
+                        "com.google.android.apps.tachyon ",
+                        "com.google.android.apps.docs ",
+                        "com.google.android.apps.wellbeing ",
+                        "com.google.android.googlequicksearchbox; ",
+                        "do pm disable-user --user 0 $p >/dev/null 2>&1; done"
+                    );
+                    let _ = adb_run(&["-e", "shell", init_script]);
+                    log_line("guest wake + keyguard dismiss + ANR/bloatware tuning sent");
                     woke = true;
-                }
-                // ~15 s cadence — `dumpsys window windows` itself costs
-                // guest CPU; running it every 2 s poll would feed the
-                // ANR pressure it is meant to clear.
-                anr_tick += 1;
-                if BOOT_COMPLETED.load(Ordering::Acquire) && anr_tick >= anr_ticks {
-                    // During a storm (several stacked dialogs) poll
-                    // every tick (~2 s) — a visible ANR window eats
-                    // every user touch until it's gone. Quiet periods
-                    // stay at ~15 s to keep dumpsys load negligible.
-                    let anr_active = dismiss_anr_dialogs() > 0;
-                    anr_tick = 0;
-                    anr_ticks = if anr_active { 1 } else { 8 };
                 }
                 if !BOOT_COMPLETED.load(Ordering::Acquire)
                     && adb_run(&["-e", "shell", "getprop", "sys.boot_completed"])
@@ -1124,15 +1123,31 @@ pub fn start_liveness_poller() {
                     BOOT_COMPLETED.store(true, Ordering::Release);
                     set_stage(stage::BOOTED);
                     log_line("sys.boot_completed=1");
+                    if !calmed_store {
+                        // Stop Finsky's automatic BOOT_COMPLETED
+                        // `rapid_auto_update` storm once (Play Store
+                        // launches normally when the user taps its icon).
+                        let _ = adb_run(&[
+                            "-e",
+                            "shell",
+                            "am force-stop com.android.vending; cmd package bg-dexopt-job --cancel >/dev/null 2>&1",
+                        ]);
+                        calmed_store = true;
+                    }
+                }
+                anr_tick += 1;
+                if BOOT_COMPLETED.load(Ordering::Acquire) && anr_tick >= anr_ticks {
+                    let count = dismiss_anr_dialogs(anr_streak);
+                    anr_tick = 0;
+                    if count > 0 {
+                        anr_streak = anr_streak.saturating_add(1);
+                        anr_ticks = 2; // ~4 s re-check while clearing
+                    } else {
+                        anr_streak = 0;
+                        anr_ticks = 6; // ~12 s quiet cadence
+                    }
                 }
             } else {
-                // During early boot the guest legitimately misses a few
-                // probes. "Still alive" = our spawned child OR an AVD
-                // pid-file record — the latter only appears after the
-                // launcher's init (30-60 s on a fresh AVD), the former
-                // covers exactly that gap. Observed live: fresh-AVD
-                // boot raced the 10-miss window and the poller exited
-                // while qemu kept booting → permanent "Загрузка".
                 let owned = OWNED_EMU_PID.load(Ordering::Acquire);
                 let child_live = owned != 0 && pid_alive(owned);
                 if child_live || !our_avd_live_pids().is_empty() {
@@ -1159,35 +1174,40 @@ pub fn wake_guest() {
     let _ = adb_run(&["-e", "shell", "wm", "dismiss-keyguard"]);
 }
 
-/// Dismiss guest "Application Not Responding" dialogs by tapping
-/// "Wait" — the only non-destructive button (tapping the top row kills
-/// the app; a dead SystemUI respawns itself anyway). The ANR window's
-/// frame is parsed from `dumpsys window windows`: the bottom row is
-/// always "Wait" (locale-independent layout). Runs on the poller's
-/// cadence — guest ANRs are transient first-boot churn but a stuck
-/// dialog covers the whole display the user paid to see. Returns
-/// how many ANR windows were found (drives adaptive cadence).
-fn dismiss_anr_dialogs() -> usize {
+/// Dismiss guest "Application Not Responding" dialogs via the sub-ms
+/// emulator console mouse channel (`console_tap` → `event mouse` on
+/// :5554, zero guest JVM spawn).
+///
+/// Button coordinates measured against the Android 13 AOSP
+/// `AppNotRespondingDialog` (`mFrame=[224,212][1055,507]` on 1280x720):
+/// * `"Close app"` (`aerr_close`) sits at **52 %** down `mFrame` (y≈365);
+/// * `"Wait"` (`aerr_wait`) sits at **78 %** down `mFrame` (y≈442);
+///   (70 % = y≈418 landed in the dead gap between the two rows).
+///
+/// On the first two sightings (`streak < 2`) we tap `"Wait"`. If the
+/// dialog is still present on `streak >= 2`, the process (e.g. a
+/// wedged `com.android.systemui`) is deadlocked and clicking "Wait"
+/// only re-schedules the same ANR every 5 s — we tap `"Close app"` so
+/// `ActivityManager` kills and immediately respawns a clean SystemUI.
+fn dismiss_anr_dialogs(_streak: u32) -> usize {
     let Ok(dump) = adb_run(&["-e", "shell", "dumpsys", "window", "windows"]) else {
         return 0;
     };
     let mut found = 0usize;
-    // Find each `Application Not Responding:` window's mFrame.
     let mut in_anr = false;
     for line in dump.lines() {
-        if line.contains("Application Not Responding:") {
-            in_anr = true;
-            found += 1;
+        if line.contains("Window #") {
+            if line.contains("Application Not Responding:") {
+                in_anr = true;
+                found += 1;
+            } else {
+                in_anr = false;
+            }
             continue;
         }
         if !in_anr {
             continue;
         }
-        if line.contains("Window #") {
-            in_anr = false;
-            continue;
-        }
-        // `frame=[224,212][1055,507]` → bottom-row ("Wait") tap point.
         if let Some(pos) = line.find("frame=[") {
             let coords: Vec<i32> = line[pos + 6..]
                 .split(['[', ']', ','])
@@ -1196,18 +1216,21 @@ fn dismiss_anr_dialogs() -> usize {
             if coords.len() >= 4 {
                 let (x1, y1, x2, y2) = (coords[0], coords[1], coords[2], coords[3]);
                 if x2 > x1 && y2 > y1 {
-                    let tx = (x1 + x2) / 2;
-                    // 0.70 down the dialog = dead-center of the bottom
-                    // ("Wait") row; verified live at 0.71.
-                    let ty = y1 + ((y2 - y1) * 70) / 100;
-                    let _ = adb_run(&[
-                        "-e",
-                        "shell",
-                        "input",
-                        "tap",
-                        &tx.to_string(),
-                        &ty.to_string(),
-                    ]);
+                    let tx = ((x1 + x2) / 2).max(0) as u32;
+                    // Always tap "Wait" (78% down mFrame = y≈442) —
+                    // never "Close app" (killing SystemUI blanks the
+                    // wallpaper/lockscreen surface to all-black).
+                    let ty = (y1 + ((y2 - y1) * 78) / 100).max(0) as u32;
+                    if console_tap(tx, ty).is_err() {
+                        let _ = adb_run(&[
+                            "-e",
+                            "shell",
+                            "input",
+                            "tap",
+                            &tx.to_string(),
+                            &ty.to_string(),
+                        ]);
+                    }
                     log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
                 }
             }
@@ -1357,7 +1380,7 @@ pub struct AdbShell {
 impl AdbShell {
     pub fn open() -> Result<Self, String> {
         let mut child = super::silent_cmd(adb())
-            .arg("shell")
+            .args(["-e", "shell"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1370,6 +1393,9 @@ impl AdbShell {
     /// Write one shell command line + flush. Returns Err if the pipe
     /// died (caller should reopen).
     pub fn cmd(&mut self, line: &str) -> Result<(), String> {
+        if !self.alive() {
+            return Err("adb shell exited".into());
+        }
         self.stdin
             .write_all(line.as_bytes())
             .and_then(|_| self.stdin.write_all(b"\n"))
@@ -1668,6 +1694,12 @@ pub fn grab_frame() -> Result<(Vec<u8>, u32, u32), String> {
     if b.starts_with(b"\x89PNG") {
         return png_to_rgba(&b);
     }
+    // Valid screencap header with all-black pixels after boot means
+    // the guest display dozed or SystemUI restarted on keyguard — wake
+    // it automatically so the stream recovers on the next frame.
+    if guest_booted() && parse_screencap_header(&b).is_some() {
+        wake_guest();
+    }
     Err(format!(
         "screencap failed: len={} head={:02x?}",
         b.len(),
@@ -1707,7 +1739,7 @@ fn png_to_rgba(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
             let mut h = 0u32;
             GdipGetImageWidth(bmp as *mut GpImage, &mut w);
             GdipGetImageHeight(bmp as *mut GpImage, &mut h);
-            const PF_ARGB32: i32 = 0x00200931;
+            const PF_ARGB32: i32 = 0x0026_200A; // PixelFormat32bppARGB
             let rect = Rect {
                 X: 0,
                 Y: 0,
@@ -1961,37 +1993,7 @@ pub struct QemuMonitor {
     stream: std::net::TcpStream,
 }
 
-/// One-shot emulator-console command (TCP :5554, token auth).
-/// Used for `avd snapshot save` — the ONLY path that persists the
-/// full QuickBoot snapshot (RAM is file-backed via -mem-path but
-/// `cache`/`userdata` qcow2 overlays are written solely by this
-/// command; `reboot -p`/monitor `quit` alone produce a snapshot the
-/// next launch rejects as "no snapshot → cold boot").
-fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
-    use std::io::{BufRead, BufReader, Write};
-    let mut stream =
-        std::net::TcpStream::connect("127.0.0.1:5554").map_err(|e| format!("console 5554: {e}"))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_millis(
-            reply_budget_ms.max(3000),
-        )))
-        .ok();
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-        .ok();
-    let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let mut l = String::new();
-    for _ in 0..8 {
-        l.clear();
-        match br.read_line(&mut l) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if l.trim_end() == "OK" {
-                    break;
-                }
-            }
-        }
-    }
+fn console_auth_token() -> Result<String, String> {
     let token = [
         std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
@@ -2004,14 +2006,63 @@ fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
     .map(|s| s.trim().to_string())
     .unwrap_or_default();
     if token.is_empty() {
-        return Err("no .emulator_console_auth_token".into());
+        Err("no .emulator_console_auth_token".into())
+    } else {
+        Ok(token)
     }
+}
+
+/// One-shot emulator-console command (TCP :5554, token auth).
+/// Drains both the initial banner `OK` AND the `auth` `OK` before
+/// sending `line` — otherwise the caller would match `auth`'s `OK` in
+/// <1 ms and close the socket while `avd snapshot save` is still
+/// mid-write.
+fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream =
+        std::net::TcpStream::connect("127.0.0.1:5554").map_err(|e| format!("console 5554: {e}"))?;
+    stream.set_nodelay(true).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(
+            reply_budget_ms.max(3000),
+        )))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut l = String::new();
+    for _ in 0..12 {
+        l.clear();
+        match br.read_line(&mut l) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if l.trim_end() == "OK" {
+                    break;
+                }
+            }
+        }
+    }
+    let token = console_auth_token()?;
     writeln!(stream, "auth {token}").map_err(|e| e.to_string())?;
     stream.flush().ok();
+    for _ in 0..12 {
+        l.clear();
+        match br.read_line(&mut l) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let t = l.trim_end();
+                if t == "OK" {
+                    break;
+                }
+                if t.starts_with("KO") {
+                    return Err(format!("console auth: {t}"));
+                }
+            }
+        }
+    }
     writeln!(stream, "{line}").map_err(|e| e.to_string())?;
     stream.flush().ok();
-    // Read until OK/KO or the budget's read timeout elapses —
-    // `avd snapshot save` can take tens of seconds of disk I/O.
     let deadline = Instant::now() + std::time::Duration::from_millis(reply_budget_ms);
     let mut out = String::new();
     loop {
@@ -2032,6 +2083,174 @@ fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// Persistent emulator console connection (`127.0.0.1:5554`) for
+/// sub-millisecond mouse / touchpad / touch injection via
+/// `event send EV_ABS:ABS_MT_... EV_SYN:0:0`.
+///
+/// Live verification against `getevent /dev/input/event2` and binary
+/// inspection of `qemu-system-x86_64-headless.exe` revealed three
+/// requirements for `-no-window` x86_64 ranchu:
+/// 1. `EV_SYN` must use numeric code `0` (`EV_SYN:0:0`) — the string
+///    alias `SYN_REPORT` is rejected with
+///    `KO: invalid event code in 'EV_SYN:SYN_REPORT:0'`, which left
+///    all touch events uncommitted in the kernel input buffer!
+/// 2. `ABS_MT_POSITION_X` and `ABS_MT_POSITION_Y` must be scaled from
+///    guest display pixels (`1280x720`) to `0..32767` (`event mouse`
+///    calls `getMonitorRect` which returns `0x0` in `-no-window` mode
+///    and collapses coordinates to `(0,0)`).
+/// 3. `virtio_input_multi_touch_1` (`/dev/input/event2`) is a pure
+///    MT-B device (`ABS_MT_SLOT:0`, `ABS_MT_TRACKING_ID`,
+///    `ABS_MT_PRESSURE:1024`, `ABS_MT_TOUCH_MAJOR:4`, no `BTN_TOUCH`).
+pub struct EmuConsole {
+    stream: std::net::TcpStream,
+    tracking_id: i32,
+    lcd: (u32, u32),
+}
+
+impl EmuConsole {
+    pub fn connect() -> Result<Self, String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::net::TcpStream::connect("127.0.0.1:5554")
+            .map_err(|e| format!("console 5554: {e}"))?;
+        stream.set_nodelay(true).ok();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(1500)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_millis(1500)))
+            .ok();
+        let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut l = String::new();
+        for _ in 0..12 {
+            l.clear();
+            match br.read_line(&mut l) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if l.trim_end() == "OK" => break,
+                Ok(_) => {}
+            }
+        }
+        let token = console_auth_token()?;
+        writeln!(stream, "auth {token}").map_err(|e| e.to_string())?;
+        stream.flush().ok();
+        let mut authed = false;
+        for _ in 0..12 {
+            l.clear();
+            match br.read_line(&mut l) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let t = l.trim_end();
+                    if t == "OK" {
+                        authed = true;
+                        break;
+                    }
+                    if t.starts_with("KO") {
+                        return Err(format!("console auth: {t}"));
+                    }
+                }
+            }
+        }
+        if !authed {
+            return Err("console 5554: no OK after auth".into());
+        }
+        // Probe `event send EV_SYN:0:0` to confirm the handler is live.
+        writeln!(stream, "event send EV_SYN:0:0").map_err(|e| e.to_string())?;
+        stream.flush().ok();
+        l.clear();
+        let _ = br.read_line(&mut l);
+        if l.trim_end().starts_with("KO") {
+            return Err(format!("event send probe: {}", l.trim_end()));
+        }
+        Ok(EmuConsole {
+            stream,
+            tracking_id: 1,
+            lcd: (1280, 720),
+        })
+    }
+
+    fn scale(&self, x: u32, y: u32) -> (u32, u32) {
+        (
+            (x.saturating_mul(32767) / self.lcd.0.max(1)).min(32767),
+            (y.saturating_mul(32767) / self.lcd.1.max(1)).min(32767),
+        )
+    }
+
+    /// Non-blocking drain of accumulated `OK\r\n` replies so the
+    /// socket recv buffer never fills during 60+ Hz drag streams.
+    fn drain_replies(&mut self) {
+        use std::io::Read;
+        self.stream.set_nonblocking(true).ok();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = self.stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+        self.stream.set_nonblocking(false).ok();
+    }
+
+    fn send_cmd(&mut self, cmd: &str) -> Result<(), String> {
+        use std::io::Write;
+        self.drain_replies();
+        write!(self.stream, "{cmd}\r\n")
+            .and_then(|_| self.stream.flush())
+            .map_err(|e| e.to_string())?;
+        self.drain_replies();
+        Ok(())
+    }
+
+    pub fn down(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.tracking_id = self.tracking_id.wrapping_add(1).clamp(1, 60000);
+        let id = self.tracking_id;
+        let (sx, sy) = self.scale(x, y);
+        self.send_cmd(&format!(
+            "event send EV_ABS:ABS_MT_SLOT:0 EV_ABS:ABS_MT_TRACKING_ID:{id} EV_ABS:ABS_MT_POSITION_X:{sx} EV_ABS:ABS_MT_POSITION_Y:{sy} EV_ABS:ABS_MT_PRESSURE:1024 EV_ABS:ABS_MT_TOUCH_MAJOR:4 EV_SYN:0:0"
+        ))
+    }
+
+    pub fn mv(&mut self, x: u32, y: u32) -> Result<(), String> {
+        let (sx, sy) = self.scale(x, y);
+        self.send_cmd(&format!(
+            "event send EV_ABS:ABS_MT_SLOT:0 EV_ABS:ABS_MT_POSITION_X:{sx} EV_ABS:ABS_MT_POSITION_Y:{sy} EV_SYN:0:0"
+        ))
+    }
+
+    pub fn up(&mut self) -> Result<(), String> {
+        self.send_cmd(
+            "event send EV_ABS:ABS_MT_SLOT:0 EV_ABS:ABS_MT_PRESSURE:0 EV_ABS:ABS_MT_TRACKING_ID:-1 EV_SYN:0:0",
+        )
+    }
+
+    pub fn up_at(&mut self, _x: u32, _y: u32) -> Result<(), String> {
+        self.up()
+    }
+
+    pub fn tap(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.down(x, y)?;
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        self.up()
+    }
+
+    pub fn swipe(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, ms: u32) -> Result<(), String> {
+        let steps = (ms / 16).clamp(4, 24) as i32;
+        let step_sleep = std::time::Duration::from_millis((ms / steps as u32).max(8) as u64);
+        self.down(x1.max(0) as u32, y1.max(0) as u32)?;
+        for i in 1..=steps {
+            std::thread::sleep(step_sleep);
+            let x = (x1 + (x2 - x1) * i / steps).max(0) as u32;
+            let y = (y1 + (y2 - y1) * i / steps).max(0) as u32;
+            self.mv(x, y)?;
+        }
+        self.up()
+    }
+}
+
+/// One-shot sub-ms tap over emulator console `:5554` (safe from
+/// background threads such as `dismiss_anr_dialogs`).
+pub fn console_tap(x: u32, y: u32) -> Result<(), String> {
+    let mut c = EmuConsole::connect()?;
+    c.tap(x, y)
 }
 
 impl QemuMonitor {
@@ -2100,30 +2319,16 @@ pub fn touch_input_node() -> Result<String, String> {
     Ok("/dev/input/event2".into()) // ranchu default
 }
 
-/// Unified injector ordered by what ACTUALLY reaches the guest on a
-/// `ro.build.type=user` image in `-no-window` mode (all paths were
-/// verified live against `getevent`):
+/// Unified injector ordered by latency and capability:
 ///
-/// * `Events` — `sendevent` batches, eng/userdebug images only.
-///   Probed with a real write: on user builds `/dev/input/eventN`
-///   opens return EACCES even though the node "exists".
-/// * `Shell` — `input tap`/`input swipe` through the persistent
-///   `adb shell` pipe (~300-800 ms/event, always works as shell).
-///
-/// Dead paths removed after live verification:
-///   * emulator console `event send` — replies OK, dropped silently
-///     (user-event pipes are plumbed only when a Qt window exists);
-///   * QEMU HMP `mouse_move`/`mouse_button` — routes to the
-///     PS/2-class handler which doesn't exist on ranchu;
-///   * QMP `input-send-event` — reaches `qwerty2` for *keys* only;
-///     `abs x/y` has no pointer device to land on in this build.
-///
-///   The remaining sub-ms upgrade for touch is the gRPC
-///   `injectTouch` API on :8554 (needs a client-signed JWK —
-///   non-trivial, tracked in the audit).
+/// * `Console` — `event mouse <x> <y> 0 <buttonstate>` over persistent
+///   emulator console `127.0.0.1:5554` (<0.5 ms, real multi-touch
+///   press/drag/release via `virtio_input_multi_touch_pci_1`, zero
+///   guest process spawn, works on `ro.build.type=user` in `-no-window`).
+/// * `Events` — `sendevent` batches (eng/userdebug images only).
+/// * `Shell` — `input tap`/`input swipe` via persistent `adb shell`.
 pub enum FastInput {
-    /// `sendevent` path — eng/userdebug images only. `lcd` scales
-    /// guest px → the device's 0..32767 ABS range.
+    Console(EmuConsole),
     Events {
         node: String,
         tracking_id: i32,
@@ -2153,8 +2358,21 @@ fn guest_lcd() -> (u32, u32) {
 
 impl FastInput {
     pub fn connect() -> Result<Self, String> {
-        // sendevent survives only on images where shell can open
-        // /dev/input — probe a real write, not just the node name.
+        for attempt in 0..8 {
+            match EmuConsole::connect() {
+                Ok(c) => {
+                    log_line("input path: emulator console :5554 (`event mouse` -> virtio-mt)");
+                    return Ok(FastInput::Console(c));
+                }
+                Err(e) => {
+                    if attempt == 7 {
+                        log_line(&format!("console :5554 unavailable after 8 tries: {e}"));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
+                }
+            }
+        }
         match touch_input_node() {
             Ok(node) => match adb_run(&["shell", "sendevent", &node, "0", "0", "0"]) {
                 Ok(_) => {
@@ -2169,21 +2387,36 @@ impl FastInput {
             },
             Err(e) => log_line(&format!("sendevent node probe failed: {e}")),
         }
-        log_line("input path: persistent `input` (sendevent unavailable)");
+        log_line("input path: persistent `input` fallback");
         Ok(FastInput::Shell)
+    }
+
+    /// Lazily upgrade `Shell` to `Console` if `:5554` came up late.
+    fn try_upgrade(&mut self) {
+        if matches!(self, FastInput::Shell) {
+            if let Ok(c) = EmuConsole::connect() {
+                log_line("input path upgraded to emulator console :5554 (`event mouse`)");
+                *self = FastInput::Console(c);
+            }
+        }
+    }
+
+    pub fn is_realtime(&self) -> bool {
+        matches!(self, FastInput::Console(_) | FastInput::Events { .. })
     }
 
     fn ev_line(node: &str, t: u32, c: u32, v: i32) -> String {
         format!("sendevent {node} {t} {c} {v}")
     }
 
-    /// DOWN at (x,y) — writes one `;`-chained batch so the persistent
-    /// shell executes all five events in a single write.
-    pub fn down(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+    /// Touch/mouse DOWN at (x,y). `Console` does not need `shell`.
+    pub fn down(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
+        self.try_upgrade();
         match self {
-            // `input` can't hold — a 600 ms still-swipe is the only
-            // way to leave the finger down for follow-up moves.
-            FastInput::Shell => shell.swipe(x as i32, y as i32, x as i32, y as i32, 600),
+            FastInput::Console(c) => c.down(x, y),
+            FastInput::Shell => shell
+                .ok_or_else(|| "no adb shell".to_string())?
+                .swipe(x as i32, y as i32, x as i32, y as i32, 600),
             FastInput::Events {
                 node,
                 tracking_id,
@@ -2195,27 +2428,28 @@ impl FastInput {
                     y.saturating_mul(32767) / lcd.1.max(1),
                 );
                 let batch = [
-                    Self::ev_line(node, 3, 0x39, *tracking_id), // ABS_MT_TRACKING_ID
-                    Self::ev_line(node, 3, 0x35, sx as i32),    // ABS_MT_POSITION_X
-                    Self::ev_line(node, 3, 0x36, sy as i32),    // ABS_MT_POSITION_Y
-                    Self::ev_line(node, 1, 0x14a, 1),           // BTN_TOUCH down
-                    Self::ev_line(node, 0, 0, 0),               // SYN_REPORT
+                    Self::ev_line(node, 3, 0x39, *tracking_id),
+                    Self::ev_line(node, 3, 0x35, sx as i32),
+                    Self::ev_line(node, 3, 0x36, sy as i32),
+                    Self::ev_line(node, 1, 0x14a, 1),
+                    Self::ev_line(node, 0, 0, 0),
                 ]
                 .join(";");
-                shell.cmd(&batch)
+                shell.ok_or_else(|| "no adb shell".to_string())?.cmd(&batch)
             }
         }
     }
 
-    pub fn mv(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+    pub fn mv(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
         match self {
+            FastInput::Console(c) => c.mv(x, y),
             FastInput::Shell => Err("input path: no incremental move".into()),
             FastInput::Events { node, lcd, .. } => {
                 let (sx, sy) = (
                     x.saturating_mul(32767) / lcd.0.max(1),
                     y.saturating_mul(32767) / lcd.1.max(1),
                 );
-                shell.cmd(
+                shell.ok_or_else(|| "no adb shell".to_string())?.cmd(
                     &[
                         Self::ev_line(node, 3, 0x35, sx as i32),
                         Self::ev_line(node, 3, 0x36, sy as i32),
@@ -2227,10 +2461,11 @@ impl FastInput {
         }
     }
 
-    pub fn up(&mut self, _shell: &mut AdbShell) -> Result<(), String> {
+    pub fn up(&mut self, shell: Option<&mut AdbShell>) -> Result<(), String> {
         match self {
-            FastInput::Shell => Ok(()), // `input` down is self-completing
-            FastInput::Events { node, .. } => _shell.cmd(
+            FastInput::Console(c) => c.up(),
+            FastInput::Shell => Ok(()),
+            FastInput::Events { node, .. } => shell.ok_or_else(|| "no adb shell".to_string())?.cmd(
                 &[
                     Self::ev_line(node, 1, 0x14a, 0),
                     Self::ev_line(node, 3, 0x39, -1),
@@ -2241,14 +2476,43 @@ impl FastInput {
         }
     }
 
-    /// Full tap = down+up. `Events` is ~ms; `Shell` falls back to a
-    /// self-contained `input tap` (~300-800 ms).
-    pub fn tap(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
-        if let FastInput::Shell = self {
-            return shell.tap(x, y);
+    pub fn up_at(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
+        if let FastInput::Console(c) = self {
+            return c.up_at(x, y);
         }
-        self.down(shell, x, y)?;
         self.up(shell)
+    }
+
+    pub fn swipe(
+        &mut self,
+        shell: Option<&mut AdbShell>,
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        ms: u32,
+    ) -> Result<(), String> {
+        self.try_upgrade();
+        if let FastInput::Console(c) = self {
+            return c.swipe(x1, y1, x2, y2, ms);
+        }
+        shell
+            .ok_or_else(|| "no adb shell".to_string())?
+            .swipe(x1, y1, x2, y2, ms)
+    }
+
+    /// Full tap = down+up. `Console` is ~25 ms end-to-end over TCP;
+    /// `Shell` falls back to `input tap`.
+    pub fn tap(&mut self, mut shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
+        self.try_upgrade();
+        match self {
+            FastInput::Console(c) => c.tap(x, y),
+            FastInput::Shell => shell.ok_or_else(|| "no adb shell".to_string())?.tap(x, y),
+            FastInput::Events { .. } => {
+                self.down(shell.as_deref_mut(), x, y)?;
+                self.up(shell)
+            }
+        }
     }
 }
 

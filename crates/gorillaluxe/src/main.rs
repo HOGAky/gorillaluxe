@@ -52,7 +52,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
+    ReleaseCapture, SetCapture, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -75,12 +75,24 @@ const DWMWCP_ROUND: u32 = 2;
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
     None,
+    /// Clicked a HUD/UI control — prevents `WM_LBUTTONUP` from leaking
+    /// through into the guest if a panel closes under the cursor.
+    UiButton,
     /// Moving a placed keymapper widget.
     Widget(usize),
     /// Dragging a new widget kind from the Zone C palette.
     Palette(WidgetKind),
     /// Scrubbing the CAS sharpness slider.
     Slider,
+    /// Holding/dragging directly on the Android guest display with
+    /// mouse or touchpad.
+    Guest {
+        start: (u32, u32),
+        last: (u32, u32),
+        start_tick: u64,
+        moved: bool,
+        fast_active: bool,
+    },
 }
 
 /// Shared interactive state — owned by `static APP`, mutated by
@@ -307,6 +319,7 @@ fn start_android(a: &mut App) {
                             Ok((px, w, h)) => {
                                 fails = 0;
                                 streak = 0;
+                                png = false;
                                 n += 1;
                                 android_runtime::FRAME_COUNT
                                     .store(n, std::sync::atomic::Ordering::Release);
@@ -338,8 +351,10 @@ fn start_android(a: &mut App) {
                                 if fails >= 5 && !png {
                                     png = true;
                                     android_runtime::log_line(
-                                        "raw capture failing — switching to PNG mode",
+                                        "raw capture failing — trying PNG fallback",
                                     );
+                                } else if png {
+                                    png = false;
                                 }
                                 // Backoff under a sustained wedge:
                                 // 300 ms → 3 s cap, giving adbd/Surface-
@@ -414,10 +429,35 @@ fn start_android(a: &mut App) {
     });
 }
 
+/// Ensure `a.fast_input` is connected — reconnects `EmuConsole` on
+/// `:5554` on demand if it wasn't ready at early boot or was dropped.
+fn ensure_fast_input(a: &mut App) {
+    if a.fast_input.is_none() {
+        if let Some(fi) = input_slot().lock().unwrap().take() {
+            a.fast_input = Some(fi);
+        } else if let Ok(c) = android_runtime::EmuConsole::connect() {
+            android_runtime::log_line("fast input connected on demand (:5554 `event mouse`)");
+            a.fast_input = Some(android_runtime::FastInput::Console(c));
+        }
+    }
+    if a.shell.is_none() {
+        if let Some(sh) = shell_slot().lock().unwrap().take() {
+            a.shell = Some(sh);
+        }
+    }
+}
+
 /// Write one line into the persistent guest shell (<5 ms). Returns
 /// `false` when no shell is attached so the caller can fall back to a
 /// one-shot adb process.
 fn shell_cmd(a: &mut App, cmd: &str) -> bool {
+    if a.shell.is_none() {
+        if let Some(sh) = shell_slot().lock().unwrap().take() {
+            a.shell = Some(sh);
+        } else if let Ok(sh) = android_runtime::AdbShell::open() {
+            a.shell = Some(sh);
+        }
+    }
     if let Some(sh) = &mut a.shell {
         if sh.cmd(cmd).is_ok() {
             return true;
@@ -428,12 +468,12 @@ fn shell_cmd(a: &mut App, cmd: &str) -> bool {
     false
 }
 
-/// Tap through the low-latency injector (emulator console `event send`
-/// ~1 ms, or `sendevent` batch ~3 ms). `false` when the fast path is
-/// unavailable so the caller can degrade to a shell `input tap`.
+/// Tap through the low-latency injector (`event mouse` on :5554 or
+/// `sendevent`). `false` when unavailable so caller can degrade.
 fn fast_tap(a: &mut App, gx: u32, gy: u32) -> bool {
-    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
-        if fi.tap(sh, gx, gy).is_ok() {
+    ensure_fast_input(a);
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.tap(a.shell.as_mut(), gx, gy).is_ok() {
             return true;
         }
         android_runtime::log_line("fast input lost — degraded to shell");
@@ -442,15 +482,64 @@ fn fast_tap(a: &mut App, gx: u32, gy: u32) -> bool {
     false
 }
 
+/// Real-time mouse/touchpad DOWN on the guest display.
+fn fast_down(a: &mut App, gx: u32, gy: u32) -> bool {
+    ensure_fast_input(a);
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.is_realtime() {
+            if fi.down(a.shell.as_mut(), gx, gy).is_ok() {
+                return true;
+            }
+            a.fast_input = None;
+        }
+    }
+    false
+}
+
+/// Real-time mouse/touchpad MOVE while held on the guest display.
+fn fast_move(a: &mut App, gx: u32, gy: u32) -> bool {
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.mv(a.shell.as_mut(), gx, gy).is_ok() {
+            return true;
+        }
+        a.fast_input = None;
+    }
+    false
+}
+
+/// Real-time mouse/touchpad UP at `(gx, gy)`.
+fn fast_up_at(a: &mut App, gx: u32, gy: u32) -> bool {
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.up_at(a.shell.as_mut(), gx, gy).is_ok() {
+            return true;
+        }
+        a.fast_input = None;
+    }
+    false
+}
+
+/// Swipe through the fast injector.
+fn fast_swipe(a: &mut App, x1: i32, y1: i32, x2: i32, y2: i32, ms: u32) -> bool {
+    ensure_fast_input(a);
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.swipe(a.shell.as_mut(), x1, y1, x2, y2, ms).is_ok() {
+            return true;
+        }
+        a.fast_input = None;
+    }
+    false
+}
+
 /// Aim/touch move through the fast injector. `press` sends DOWN at the
 /// point (first feed of a drag), otherwise MOVE.
 fn fast_aim(a: &mut App, x: i32, y: i32, press: bool) -> bool {
+    ensure_fast_input(a);
     let (x, y) = (x.max(0) as u32, y.max(0) as u32);
-    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
+    if let Some(fi) = a.fast_input.as_mut() {
         let r = if press {
-            fi.down(sh, x, y)
+            fi.down(a.shell.as_mut(), x, y)
         } else {
-            fi.mv(sh, x, y)
+            fi.mv(a.shell.as_mut(), x, y)
         };
         if r.is_ok() {
             return true;
@@ -462,8 +551,8 @@ fn fast_aim(a: &mut App, x: i32, y: i32, press: bool) -> bool {
 
 /// Release a held touch (FPS aim off / drag end).
 fn fast_up(a: &mut App) {
-    if let (Some(fi), Some(sh)) = (a.fast_input.as_mut(), a.shell.as_mut()) {
-        let _ = fi.up(sh);
+    if let Some(fi) = a.fast_input.as_mut() {
+        let _ = fi.up(a.shell.as_mut());
     }
 }
 
@@ -751,6 +840,7 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
     let mut dx = Dx12::new(cfg.ci_software_gpu)?;
     let (mut win_w, mut win_h) = client_size(hwnd);
+    app().lock().unwrap().win = (win_w as f32, win_h as f32);
     let mut swap = SwapChain::new(&dx, hwnd, win_w, win_h)?;
     let mut comp = Composite::new(&dx)?;
     let atlas = atlas::build_ui_atlases()?;
@@ -973,6 +1063,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     a.frame_rx = None;
                     a.android_dims = None;
                     a.shell = None;
+                    a.fast_input = None;
                     a.wasd_held.clear();
                     has_guest_frame = false;
                     if was_booting {
@@ -1232,9 +1323,18 @@ fn toast(a: &mut App, title: String) {
     a.ui.toasts.push(title, 2200);
 }
 
-fn on_lbutton_down(a: &mut App, x: f32, y: f32) {
+/// Map window client `(x, y)` to Android guest pixel coordinates `(gx, gy)`.
+fn guest_xy(a: &App, x: f32, y: f32) -> (u32, u32) {
+    let (dw, dh) = a.android_dims.unwrap_or((1280, 720));
+    let gx = ((x / a.win.0.max(1.0)) * dw as f32).clamp(0.0, dw.saturating_sub(1) as f32) as u32;
+    let gy = ((y / a.win.1.max(1.0)) * dh as f32).clamp(0.0, dh.saturating_sub(1) as f32) as u32;
+    (gx, gy)
+}
+
+fn on_lbutton_down(a: &mut App, x: f32, y: f32, hwnd: HWND) {
     match hit(&a.regions, x, y) {
         Some(RegionId::DockLang) => {
+            a.drag = Drag::UiButton;
             let next = if current_lang() == Lang::Ru {
                 Lang::En
             } else {
@@ -1244,20 +1344,37 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32) {
             a.ui.lang = next;
             sync_guest_locale(a, next);
         }
-        Some(RegionId::DockKeymapper) => a.ui.keymap.toggle(),
-        Some(RegionId::DockSettings) => a.ui.settings.toggle(),
-        Some(RegionId::DockLog) => a.ui.log_open = !a.ui.log_open,
-        Some(RegionId::DockApk) => toast(a, tr(a.ui.lang, "ui.apk.hint").to_string()),
-        Some(RegionId::DockShot) => toast(a, tr(a.ui.lang, "ui.shot.saved").to_string()),
+        Some(RegionId::DockKeymapper) => {
+            a.drag = Drag::UiButton;
+            a.ui.keymap.toggle();
+        }
+        Some(RegionId::DockSettings) => {
+            a.drag = Drag::UiButton;
+            a.ui.settings.toggle();
+        }
+        Some(RegionId::DockLog) => {
+            a.drag = Drag::UiButton;
+            a.ui.log_open = !a.ui.log_open;
+        }
+        Some(RegionId::DockApk) => {
+            a.drag = Drag::UiButton;
+            toast(a, tr(a.ui.lang, "ui.apk.hint").to_string());
+        }
+        Some(RegionId::DockShot) => {
+            a.drag = Drag::UiButton;
+            toast(a, tr(a.ui.lang, "ui.shot.saved").to_string());
+        }
         Some(RegionId::CasSlider) => {
             a.drag = Drag::Slider;
             apply_slider(a, x);
         }
         Some(RegionId::ResPreset(i)) => {
+            a.drag = Drag::UiButton;
             a.ui.res_idx = i;
             a.pending_res = Some(RES_PRESETS[i]);
         }
         Some(RegionId::FpsPreset(i)) => {
+            a.drag = Drag::UiButton;
             a.ui.fps_idx = i;
             a.fps_cap = FPS_PRESETS[i];
         }
@@ -1270,16 +1387,54 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32) {
             a.ui.keymap.selected = Some(i);
         }
         Some(RegionId::WhpxEnable) => {
+            a.drag = Drag::UiButton;
             if let Err(e) = env_doctor::launch_elevated_setup() {
                 toast(a, format!("{}: {e}", tr(a.ui.lang, "ui.whpx.uac_denied")));
             }
         }
         Some(RegionId::WhpxRestart) => {
+            a.drag = Drag::UiButton;
             let _ = env_doctor::restart_pc();
         }
-        Some(RegionId::OnboardDownload) => start_android_download(a),
-        Some(RegionId::OnboardLaunch) => start_android(a),
-        _ => {}
+        Some(RegionId::OnboardDownload) => {
+            a.drag = Drag::UiButton;
+            start_android_download(a);
+        }
+        Some(RegionId::OnboardLaunch) => {
+            a.drag = Drag::UiButton;
+            start_android(a);
+        }
+        Some(RegionId::LogPanel | RegionId::OnboardClose) => {
+            a.drag = Drag::UiButton;
+        }
+        None => {
+            if !a.ui.keymap.open
+                && android_running(a)
+                && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
+            {
+                let (gx, gy) = guest_xy(a, x, y);
+                let fast_active = fast_down(a, gx, gy);
+                a.drag = Drag::Guest {
+                    start: (gx, gy),
+                    last: (gx, gy),
+                    start_tick: a.tick,
+                    moved: false,
+                    fast_active,
+                };
+                a.last_swipe_tick = a.tick;
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                }
+            } else {
+                android_runtime::log_line(&format!(
+                    "guest tap skipped: running={} onboard={:?} region=None at({x},{y}) win={:?} regions={}",
+                    android_running(a),
+                    a.ui.onboard,
+                    a.win,
+                    a.regions.len(),
+                ));
+            }
+        }
     }
 }
 
@@ -1315,31 +1470,92 @@ fn on_mouse_move(a: &mut App, x: f32, y: f32) {
             let (sw, sh) = a.win;
             a.ui.keymap.move_to(i, x / sw, y / sh);
         }
-        Drag::Palette(_) | Drag::None => {}
+        Drag::Guest {
+            start,
+            mut last,
+            start_tick,
+            mut moved,
+            mut fast_active,
+        } => {
+            let (gx, gy) = guest_xy(a, x, y);
+            let dx = gx as i32 - start.0 as i32;
+            let dy = gy as i32 - start.1 as i32;
+            if dx * dx + dy * dy > 36 {
+                moved = true;
+            }
+            if fast_active && (gx, gy) != last && a.tick.saturating_sub(a.last_swipe_tick) >= 12 {
+                last = (gx, gy);
+                a.last_swipe_tick = a.tick;
+                if !fast_move(a, gx, gy) {
+                    fast_active = false;
+                }
+            } else if !fast_active {
+                last = (gx, gy);
+            }
+            a.drag = Drag::Guest {
+                start,
+                last,
+                start_tick,
+                moved,
+                fast_active,
+            };
+        }
+        Drag::Palette(_) | Drag::UiButton | Drag::None => {}
     }
 }
 
 fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
-    if let Drag::Palette(kind) = a.drag {
-        let (sw, sh) = a.win;
-        // Drop only inside the game area (not on the palette itself).
-        if y < sh - 80.0 {
-            a.ui.keymap.place(kind, x / sw, y / sh);
-        }
-        a.ui.palette_drag = None;
+    unsafe {
+        let _ = ReleaseCapture();
     }
-    a.drag = Drag::None;
-    // Forward the tap into the running Android guest when the click
-    // landed on the game surface (no UI region hit). Persistent shell
-    // first (<5 ms), one-shot adb spawn as fallback.
-    if android_running(a)
-        && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
-        && hit(&a.regions, x, y).is_none()
-    {
-        if let Some((dw, dh)) = a.android_dims {
-            let gx = (x / a.win.0 * dw as f32) as u32;
-            let gy = (y / a.win.1 * dh as f32) as u32;
-            if fast_tap(a, gx, gy) || shell_cmd(a, &format!("input tap {gx} {gy}")) {
+    match std::mem::replace(&mut a.drag, Drag::None) {
+        Drag::Palette(kind) => {
+            let (sw, sh) = a.win;
+            if y < sh - 80.0 {
+                a.ui.keymap.place(kind, x / sw, y / sh);
+            }
+            a.ui.palette_drag = None;
+        }
+        Drag::Guest {
+            start: (sx, sy),
+            start_tick,
+            moved,
+            fast_active,
+            ..
+        } => {
+            let (gx, gy) = guest_xy(a, x, y);
+            if fast_active {
+                if moved {
+                    let _ = fast_move(a, gx, gy);
+                } else if a.tick.saturating_sub(start_tick) < 25 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if fast_up_at(a, gx, gy) {
+                    if moved {
+                        android_runtime::log_line(&format!("guest drag ({sx},{sy})->({gx},{gy})"));
+                    } else {
+                        android_runtime::log_line(&format!("guest tap ({gx},{gy})"));
+                    }
+                    return;
+                }
+            }
+            // Fallback path when real-time console wasn't active.
+            if moved {
+                let dur = (a.tick.saturating_sub(start_tick) as u32).clamp(80, 600);
+                let (x1, y1, x2, y2) = (sx as i32, sy as i32, gx as i32, gy as i32);
+                if fast_swipe(a, x1, y1, x2, y2, dur)
+                    || shell_cmd(a, &format!("input swipe {x1} {y1} {x2} {y2} {dur}"))
+                {
+                    android_runtime::log_line(&format!("guest swipe ({x1},{y1})->({x2},{y2})"));
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = android_runtime::send_swipe(x1, y1, x2, y2, dur);
+                    });
+                    android_runtime::log_line(&format!(
+                        "guest swipe ({x1},{y1})->({x2},{y2}) via spawn"
+                    ));
+                }
+            } else if fast_tap(a, gx, gy) || shell_cmd(a, &format!("input tap {gx} {gy}")) {
                 android_runtime::log_line(&format!("guest tap ({gx},{gy})"));
             } else {
                 std::thread::spawn(move || {
@@ -1348,15 +1564,42 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
                 android_runtime::log_line(&format!("guest tap ({gx},{gy}) via spawn"));
             }
         }
-    } else {
-        android_runtime::log_line(&format!(
-            "guest tap skipped: running={} onboard={:?} region={:?} at({x},{y}) win={:?} regions={}",
-            android_running(a),
-            a.ui.onboard,
-            hit(&a.regions, x, y),
-            a.win,
-            a.regions.len(),
-        ));
+        Drag::UiButton | Drag::Slider | Drag::Widget(_) | Drag::None => {}
+    }
+}
+
+/// Right-click / two-finger touchpad tap on the guest canvas sends
+/// Android `KEYCODE_BACK` (4).
+fn on_rbutton_down(a: &mut App, x: f32, y: f32) {
+    if !a.ui.keymap.open
+        && android_running(a)
+        && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
+        && hit(&a.regions, x, y).is_none()
+    {
+        if !shell_cmd(a, "input keyevent 4") {
+            std::thread::spawn(|| {
+                let _ = android_runtime::send_tap(0, 0);
+            });
+        }
+        android_runtime::log_line("guest back (right-click)");
+    }
+}
+
+/// Mouse wheel / touchpad two-finger scroll over the guest canvas.
+fn on_mouse_wheel(a: &mut App, delta: i16) {
+    let (mx, my) = a.ui.mouse;
+    if !a.ui.keymap.open
+        && android_running(a)
+        && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
+        && hit(&a.regions, mx, my).is_none()
+        && a.tick.saturating_sub(a.last_swipe_tick) >= 90
+    {
+        a.last_swipe_tick = a.tick;
+        let (gx, gy) = guest_xy(a, mx, my);
+        let (_, dh) = a.android_dims.unwrap_or((1280, 720));
+        let dy = if delta > 0 { 160i32 } else { -160i32 };
+        let y2 = (gy as i32 + dy).clamp(40, dh.saturating_sub(40) as i32);
+        let _ = fast_swipe(a, gx as i32, gy as i32, gx as i32, y2, 120);
     }
 }
 
@@ -1556,16 +1799,28 @@ unsafe extern "system" fn wnd_proc(
             on_mouse_move(&mut a, x, y);
             LRESULT(0)
         }
-        WM_LBUTTONDOWN => {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let (x, y) = lparam_xy(lparam);
             let mut a = app().lock().unwrap();
-            on_lbutton_down(&mut a, x, y);
+            on_lbutton_down(&mut a, x, y, hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let (x, y) = lparam_xy(lparam);
             let mut a = app().lock().unwrap();
             on_lbutton_up(&mut a, x, y);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            let (x, y) = lparam_xy(lparam);
+            let mut a = app().lock().unwrap();
+            on_rbutton_down(&mut a, x, y);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+            let mut a = app().lock().unwrap();
+            on_mouse_wheel(&mut a, delta);
             LRESULT(0)
         }
         WM_INPUT_MSG => {
