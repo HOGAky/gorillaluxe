@@ -32,6 +32,9 @@ pub struct ArtifactTarget {
     /// "Already installed" marker file — when this exists on disk the
     /// step is skipped entirely (retry only fetches what's missing).
     pub marker: Option<PathBuf>,
+    /// Manifest-declared archive size in bytes (0 = unknown) — feeds
+    /// the pre-download disk-space check.
+    pub size: u64,
 }
 
 /// Events emitted by the download worker thread.
@@ -77,7 +80,14 @@ pub fn start(targets: Vec<ArtifactTarget>) -> mpsc::Receiver<DlEvent> {
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
-        let mut b = ureq::AgentBuilder::new();
+        // timeout_read = per-chunk stall limit (30 s): a dead cable or
+        // stalled CDN node aborts the read so download_attempt can
+        // resume from the .part length instead of hanging forever.
+        // No overall request timeout — a 1.67 GB image legitimately
+        // takes minutes on slow links.
+        let mut b = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(30));
         if let Ok(c) = native_tls::TlsConnector::new() {
             b = b.tls_connector(std::sync::Arc::new(c));
         }
@@ -85,12 +95,81 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// Free bytes on the volume hosting `path` (walks up to the nearest
+/// existing ancestor — the runtime dir may not exist yet).
+pub fn free_disk_bytes(path: &Path) -> Option<u64> {
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut dir = path.to_path_buf();
+    while !dir.exists() {
+        dir = dir.parent()?.to_path_buf();
+    }
+    let wide: Vec<u16> = dir
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut free),
+            None,
+            None,
+        )
+        .ok()?;
+    }
+    Some(free)
+}
+
 fn emit(tx: &mpsc::Sender<DlEvent>, e: DlEvent) -> Result<(), String> {
     tx.send(e)
         .map_err(|_| "UI dropped download channel".to_string())
 }
 
+/// Bytes needed: archives still to download + extraction headroom
+/// (~2x the image) + AVD. Floored at 8 GiB per the production spec.
+fn required_disk_bytes(targets: &[ArtifactTarget]) -> u64 {
+    const FLOOR: u64 = 8 * 1024 * 1024 * 1024;
+    let needed: u64 = targets
+        .iter()
+        .filter(|t| !t.marker.as_ref().is_some_and(|m| m.is_file()) && !t.zip.is_file())
+        .map(|t| t.size.saturating_mul(2))
+        .sum();
+    FLOOR.max(needed)
+}
+
 fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), String> {
+    // Pre-flight disk check — refuse early with a clear bilingual
+    // message instead of dying mid-extract on a full volume.
+    if let Some(dest) = targets.first().map(|t| t.dest.as_path()) {
+        let need = required_disk_bytes(targets);
+        match free_disk_bytes(dest) {
+            Some(free) if free < need => {
+                let msg = format!(
+                    "insufficient disk space: {:.1} GiB free, {:.1} GiB required | \
+                     Недостаточно места на диске: свободно {:.1} ГБ, требуется {:.1} ГБ",
+                    free as f64 / (1u64 << 30) as f64,
+                    need as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64,
+                    need as f64 / (1u64 << 30) as f64,
+                );
+                emit(tx, DlEvent::Log(format!("ERROR {msg}")))?;
+                return Err(msg);
+            }
+            Some(free) => emit(
+                tx,
+                DlEvent::Log(format!(
+                    "disk check OK: {:.1} GiB free (need {:.1})",
+                    free as f64 / (1u64 << 30) as f64,
+                    need as f64 / (1u64 << 30) as f64
+                )),
+            )?,
+            None => emit(
+                tx,
+                DlEvent::Log("disk space probe failed — proceeding".into()),
+            )?,
+        }
+    }
     let of = targets.len();
     for t in targets {
         emit(
@@ -301,7 +380,9 @@ fn download_attempt(
     if total > 0 && have == total {
         return Ok(()); // fully downloaded previously
     }
-    let mut req = agent().get(&t.url).timeout(Duration::from_secs(60));
+    // No overall timeout — timeout_read on the agent bounds stalls;
+    // a 1.67 GB download legitimately exceeds any total-time budget.
+    let mut req = agent().get(&t.url);
     if have > 0 && total > have {
         req = req.set("Range", &format!("bytes={have}-"));
     }

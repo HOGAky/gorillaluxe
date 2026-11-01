@@ -270,6 +270,7 @@ fn downloader_check() -> Check {
         sha256: String::new(), // -latest alias publishes no checksum
         sha1: String::new(),
         marker: None,
+        size: 0,
     }]);
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut connected = false;
@@ -314,6 +315,7 @@ fn avd_quoting_check() -> Check {
         &sysdir,
         &device_profile::PRESETS[0],
         "angle_indirect",
+        &crate::config::spec_profile(8192),
     )
     .and_then(|avd| android_runtime::validate_avd(&avd))
     {

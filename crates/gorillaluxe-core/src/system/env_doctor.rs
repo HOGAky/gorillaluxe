@@ -51,6 +51,25 @@ pub fn diagnose_host() -> HostReport {
     }
 }
 
+/// Total physical host RAM in MiB via `GlobalMemoryStatusEx`
+/// (0 on failure — callers treat that as "unknown, assume capable").
+/// Drives the weak-PC spec profile: ≤4 GiB hosts get a 960x540 /
+/// 30 FPS / 1 GiB-guest-RAM profile so the host never swaps.
+pub fn host_ram_mb() -> u64 {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    unsafe {
+        let mut s = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut s).is_ok() {
+            s.ullTotalPhys / (1024 * 1024)
+        } else {
+            0
+        }
+    }
+}
+
 /// `true` when the current process token is elevated.
 pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::CloseHandle;

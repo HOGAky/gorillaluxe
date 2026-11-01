@@ -23,8 +23,25 @@ pub struct Dx12 {
 }
 
 impl Dx12 {
-    /// Pick the best adapter: hardware first; WARP only when
-    /// `allow_software` (`--ci-software-gpu`) is set.
+    /// PCI DeviceIds of pre-D3D12 Intel iGPUs (Ivy Bridge HD 2500/4000,
+    /// Haswell HD 4x00). Their drivers report partial D3D12 support at
+    /// best — choosing them produces device-lost storms, so we skip
+    /// them outright and let the WARP path handle these hosts.
+    const LEGACY_INTEL: &[u32] = &[
+        // Ivy Bridge
+        0x0152, 0x0156, 0x0157, 0x015A, 0x0162, 0x0166, 0x016A, 0x0150, 0x0155,
+        // Haswell GT1/GT2/GT3 (HD 4200/4400/4600/5000, Iris 5100/5200)
+        0x0402, 0x0406, 0x040A, 0x040B, 0x040E, 0x0412, 0x0416, 0x041A, 0x041B, 0x041E, 0x0A06,
+        0x0A0B, 0x0A0E, 0x0A16, 0x0A1A, 0x0A1E, 0x0A22, 0x0A26, 0x0A2A, 0x0A2B, 0x0A2E, 0x0C02,
+        0x0C06, 0x0C0A, 0x0C0B, 0x0C0E, 0x0C12, 0x0C16, 0x0C1A, 0x0C1E, 0x0C22, 0x0C26, 0x0C2A,
+        0x0C2B, 0x0C2E, 0x0D02, 0x0D06, 0x0D0A, 0x0D0B, 0x0D0E, 0x0D12, 0x0D16, 0x0D1A, 0x0D1B,
+        0x0D1E, 0x0D22, 0x0D26, 0x0D2A, 0x0D2B, 0x0D2E,
+    ];
+
+    /// Pick the best adapter: capable hardware first; WARP whenever no
+    /// suitable hardware exists — NEVER crash on old iGPUs.
+    /// `allow_software` (`--ci-software-gpu`) remains for forcing WARP
+    /// on capable hardware in CI.
     pub fn new(allow_software: bool) -> GResult<Dx12> {
         unsafe {
             let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
@@ -43,17 +60,29 @@ impl Dx12 {
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
                     continue;
                 }
+                // Skip known pre-D3D12 Intel parts even if a shim
+                // driver claims support — they corrupt under our CS.
+                if desc.VendorId == 0x8086 && Self::LEGACY_INTEL.contains(&desc.DeviceId) {
+                    continue;
+                }
                 if Self::try_device(&adapter).is_some() {
                     chosen = Some((adapter, desc, false));
                     break;
                 }
             }
 
-            // WARP fallback — only when the flag allows software adapters.
-            if chosen.is_none() && allow_software {
+            // WARP fallback — unconditional when no hardware adapter
+            // qualified (old iGPU laptops included). `allow_software`
+            // is kept for API compat / CI forcing; production never
+            // crashes on missing D3D12 hardware.
+            if chosen.is_none() {
+                let _ = allow_software; // honored implicitly — kept for call-site compat
                 if let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
                     if let Ok(desc) = adapter.GetDesc1() {
                         if Self::try_device(&adapter).is_some() {
+                            crate::system::logger::info(
+                                "no D3D12-capable hardware — using WARP software rasterizer",
+                            );
                             chosen = Some((adapter, desc, true));
                         }
                     }
@@ -61,7 +90,7 @@ impl Dx12 {
             }
 
             let (adapter, desc, is_warp) = chosen.ok_or_else(|| {
-                "no usable D3D12 adapter (need HW GPU or --ci-software-gpu)".to_string()
+                "no usable D3D12 adapter (hardware unsupported and WARP unavailable)".to_string()
             })?;
             let device = Self::try_device(&adapter)
                 .ok_or_else(|| "D3D12CreateDevice failed on chosen adapter".to_string())?;

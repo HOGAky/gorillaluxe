@@ -190,10 +190,23 @@ fn start_android(a: &mut App) {
     // Intel iGPUs crash `-gpu host` at Vulkan ext-mem init, so the
     // chain auto-advances when the engine dies inside 12 s.
     // WHPX accel first, `-accel auto` as the outer fallback.
-    let res =
-        android_runtime::launch_resilient(profile, "whpx", a.cfg.ci_software_gpu).or_else(|e| {
+    // Spec scales guest RAM/cores/LCD to host memory (≤4 GiB → 1 GiB,
+    // 2 cores, 960x540) so weak laptops never hit swap.
+    let spec = gorillaluxe_core::config::spec_profile(env_doctor::host_ram_mb());
+    android_runtime::log_line(&format!(
+        "spec profile: {} MiB guest / {} cores / {}x{}@{} / {} fps cap (host {} MiB)",
+        spec.guest_mem_mb,
+        spec.guest_cores,
+        spec.lcd_w,
+        spec.lcd_h,
+        spec.lcd_dpi,
+        spec.fps_cap,
+        env_doctor::host_ram_mb()
+    ));
+    let res = android_runtime::launch_resilient(profile, "whpx", a.cfg.ci_software_gpu, &spec)
+        .or_else(|e| {
             android_runtime::log_line(&format!("whpx chain exhausted ({e}); retry accel=auto"));
-            android_runtime::launch_resilient(profile, "auto", a.cfg.ci_software_gpu)
+            android_runtime::launch_resilient(profile, "auto", a.cfg.ci_software_gpu, &spec)
         });
     match res {
         Ok(emu) => {
@@ -208,10 +221,13 @@ fn start_android(a: &mut App) {
             a.frame_rx = Some(rx);
             // Frame bridge: ONE persistent `adb exec-out` screencap
             // pipe — zero process spawns per frame (60 FPS path).
-            // Starts IMMEDIATELY so the boot animation streams live.
+            // Guest-side `sleep` throttles capture to the UI FPS cap
+            // so a weak laptop CPU is never flooded. Starts
+            // IMMEDIATELY — the boot animation streams live.
             // Per-frame `grab_frame` stays as the fallback.
+            let frame_ms = (1000 / a.cfg.fps_cap.clamp(15, 120).max(1)) as u64;
             std::thread::spawn(move || {
-                let mut stream = match android_runtime::FrameStream::open() {
+                let mut stream = match android_runtime::FrameStream::open(frame_ms) {
                     Ok(s) => {
                         android_runtime::log_line("frame stream: persistent screencap pipe");
                         Some(s)
@@ -246,7 +262,7 @@ fn start_android(a: &mut App) {
                         }
                     }
                     if stream.is_none() {
-                        std::thread::sleep(std::time::Duration::from_millis(33));
+                        std::thread::sleep(std::time::Duration::from_millis(frame_ms));
                     }
                 }
             });

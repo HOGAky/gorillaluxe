@@ -292,6 +292,7 @@ impl DownloadJob {
                 sha256: a.sha256.clone(),
                 sha1: a.sha1.clone(),
                 marker,
+                size: a.size,
             });
         }
         Ok(DownloadJob {
@@ -388,12 +389,14 @@ fn avd_home() -> PathBuf {
 
 /// Create/refresh the `GorillaLuxe` AVD inside the runtime dir.
 /// Paths with spaces are safe — config values, not CLI args.
-/// `gpu_mode` lands in `hw.gpu.mode` so config and CLI agree.
+/// `gpu_mode` lands in `hw.gpu.mode` so config and CLI agree; `spec`
+/// scales RAM/cores/LCD to the host (weak laptops → 1 GiB/2c/540p).
 pub fn write_avd(
     root: &Path,
     sysimg: &Path,
     _profile: &DeviceProfile,
     gpu_mode: &str,
+    spec: &crate::config::SpecProfile,
 ) -> Result<PathBuf, String> {
     let home = root.join("avd");
     let avd = home.join("GorillaLuxe.avd");
@@ -421,13 +424,13 @@ pub fn write_avd(
         concat!(
             "avd.ini.encoding=UTF-8\n",
             "hw.cpu.arch=x86_64\n",
-            "hw.cpu.ncore=4\n",
-            "hw.ramSize=4096\n",
-            // Gaming tablet, landscape 720p — small raw frames for
-            // 60 FPS streaming; games upscale cleanly.
-            "hw.lcd.width=1280\n",
-            "hw.lcd.height=720\n",
-            "hw.lcd.density=240\n",
+            "hw.cpu.ncore={cores}\n",
+            "hw.ramSize={ram}\n",
+            // Landscape gaming panel — resolution/density scale to the
+            // host spec profile (960x540 on ≤4 GiB laptops).
+            "hw.lcd.width={lcd_w}\n",
+            "hw.lcd.height={lcd_h}\n",
+            "hw.lcd.density={lcd_dpi}\n",
             "hw.initialOrientation=landscape\n",
             "hw.keyboard=yes\n",
             "hw.mainKeys=no\n",
@@ -451,6 +454,11 @@ pub fn write_avd(
             "fastboot.forceColdBoot=no\n",
             "fastboot.forceFastBoot=yes\n"
         ),
+        cores = spec.guest_cores,
+        ram = spec.guest_mem_mb,
+        lcd_w = spec.lcd_w,
+        lcd_h = spec.lcd_h,
+        lcd_dpi = spec.lcd_dpi,
         gpu_mode = gpu_mode,
         sysdir = sysimg.to_string_lossy().replace('\\', "/"),
     );
@@ -496,10 +504,15 @@ pub fn validate_avd(avd_dir: &Path) -> Result<(), String> {
 /// NEVER pass `-prop ro.product.*` here — overriding
 /// hardware/board/device props makes Android 13 `init` fail to locate
 /// `init.ranchu.rc` and the guest bootloops (sys.boot_completed never 1).
-fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
+fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> Vec<String> {
     vec![
         "-avd".into(),
         "GorillaLuxe".into(),
+        // `-no-window` is deliberate: we evaluated embedding Google's
+        // Qt window (`-feature -Force32bit` / HWND reparenting) and it
+        // is strictly worse — it bypasses the DX12+CAS compositor and
+        // cannot be hit-tested/rotated with our input layer. The
+        // persistent screencap pipe is the CAS-compatible path.
         "-no-window".into(),
         // QuickBoot snapshots stay ON — never `-no-snapshot`: the
         // engine restores guest RAM in ~2-3 s on every launch after
@@ -513,9 +526,9 @@ fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
         "-gpu".into(),
         gpu.to_string(),
         "-memory".into(),
-        "4096".into(),
+        spec.guest_mem_mb.to_string(),
         "-cores".into(),
-        "4".into(),
+        spec.guest_cores.to_string(),
         "-netdelay".into(),
         "none".into(),
         "-netspeed".into(),
@@ -530,8 +543,14 @@ fn emulator_args(gpu: &str, accel: &str) -> Vec<String> {
 }
 
 /// Boot Android headlessly. `gpu` = `"host"` (gfxstream→ANGLE→D3D) or
-/// `"swiftshader_indirect"`; `accel` = `"whpx"` or `"auto"`.
-pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<EmulatorProc, String> {
+/// `"swiftshader_indirect"`; `accel` = `"whpx"` or `"auto"`; `spec`
+/// scales guest RAM/cores/LCD to host resources.
+pub fn launch(
+    profile: &DeviceProfile,
+    gpu: &str,
+    accel: &str,
+    spec: &crate::config::SpecProfile,
+) -> Result<EmulatorProc, String> {
     let InstallState::Ready {
         emulator, sysimg, ..
     } = install_state()
@@ -539,7 +558,7 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
         return Err("Android runtime not installed".into());
     };
     let root = runtime_dir();
-    write_avd(&root, &sysimg, profile, gpu)?;
+    write_avd(&root, &sysimg, profile, gpu, spec)?;
     // Engine stdout+stderr → logs\emulator.log so an early exit (e.g.
     // "PANIC: Cannot find AVD system path") is diagnosable.
     let logs = data_dir().join("logs");
@@ -551,7 +570,7 @@ pub fn launch(profile: &DeviceProfile, gpu: &str, accel: &str) -> Result<Emulato
         .map_err(|e| format!("emulator.log: {e}"))?;
     let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
     let child = super::silent_cmd(&emulator)
-        .args(emulator_args(gpu, accel))
+        .args(emulator_args(gpu, accel, spec))
         .current_dir(emulator.parent().unwrap())
         // Point the engine entirely inside our runtime dir — AVD and
         // SDK resolution never touch the user's global ~/.android.
@@ -752,6 +771,7 @@ pub fn launch_resilient(
     profile: &DeviceProfile,
     accel: &str,
     force_swiftshader: bool,
+    spec: &crate::config::SpecProfile,
 ) -> Result<EmulatorHandle, String> {
     // Two `emulator.exe` instances can never share an AVD — if one is
     // already serving `emulator-5554`, adopt it; otherwise clear the
@@ -770,7 +790,7 @@ pub fn launch_resilient(
         // Remove stale locks BEFORE qemu grabs the AVD — leftover
         // `*.lock` files from an unclean exit block cold relaunch.
         purge_stale_locks(&avd_home().join("GorillaLuxe.avd"));
-        let mut emu = match launch(profile, gpu, accel) {
+        let mut emu = match launch(profile, gpu, accel, spec) {
             Ok(e) => e,
             Err(e) => {
                 last = format!("gpu={gpu}: {e}");
@@ -1132,9 +1152,16 @@ pub struct FrameStream {
 }
 
 impl FrameStream {
-    pub fn open() -> Result<Self, String> {
+    /// `interval_ms` throttles the guest-side capture loop (a toybox
+    /// `sleep` between screencaps) so the pipe never floods a weak
+    /// host CPU — e.g. 33 ms for a 30 FPS cap.
+    pub fn open(interval_ms: u64) -> Result<Self, String> {
+        let script = format!(
+            "while true; do screencap; sleep {}; done",
+            interval_ms as f64 / 1000.0
+        );
         let mut child = super::silent_cmd(adb())
-            .args(["exec-out", "while true; do screencap; done"])
+            .args(["exec-out", &script])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -1149,6 +1176,8 @@ impl FrameStream {
 
     /// Block for the next `[w,h,fmt,rgba]` record. Err = pipe dead
     /// (caller reopens or falls back to per-frame `grab_frame`).
+    /// The pixel buffer is moved out — zero per-frame memcpy; the
+    /// allocator reuses the freed block on the next `resize`.
     pub fn next_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
         use std::io::Read;
         let mut hdr = [0u8; 12];
@@ -1166,7 +1195,7 @@ impl FrameStream {
         self.stdout
             .read_exact(&mut self.buf)
             .map_err(|e| format!("stream px: {e}"))?;
-        Ok((self.buf.clone(), w, h))
+        Ok((std::mem::take(&mut self.buf), w, h))
     }
 }
 

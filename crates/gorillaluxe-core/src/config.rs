@@ -31,6 +31,49 @@ impl Default for Config {
     }
 }
 
+/// Adaptive resource profile — weak laptops (≤4 GiB) get a small
+/// guest so the host never swaps; capable hosts get the gaming tablet.
+pub struct SpecProfile {
+    /// `emulator.exe -memory` / `hw.ramSize` (MiB).
+    pub guest_mem_mb: u32,
+    /// `emulator.exe -cores` / `hw.cpu.ncore`.
+    pub guest_cores: u32,
+    /// AVD `hw.lcd.*` (landscape).
+    pub lcd_w: u32,
+    pub lcd_h: u32,
+    pub lcd_dpi: u32,
+    /// Default frame cap when the user hasn't picked one.
+    pub fps_cap: u32,
+}
+
+/// `true` for hosts where the full guest profile would cause OOM/swap.
+pub fn is_low_spec(host_ram_mb: u64) -> bool {
+    host_ram_mb > 0 && host_ram_mb <= 4096
+}
+
+/// Pick the profile from host RAM (0 = probe failed → capable path).
+pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
+    if is_low_spec(host_ram_mb) {
+        SpecProfile {
+            guest_mem_mb: 1024,
+            guest_cores: 2,
+            lcd_w: 960,
+            lcd_h: 540,
+            lcd_dpi: 160,
+            fps_cap: 30,
+        }
+    } else {
+        SpecProfile {
+            guest_mem_mb: 2048,
+            guest_cores: 4,
+            lcd_w: 1280,
+            lcd_h: 720,
+            lcd_dpi: 240,
+            fps_cap: 60,
+        }
+    }
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(p) = std::env::var("LOCALAPPDATA") {
         return PathBuf::from(p).join("GorillaLuxe");
@@ -65,7 +108,28 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        Self::load_from(&Self::path())
+        let path = Self::path();
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut cfg = Self::load_from(&path);
+        // Weak-PC adaptive defaults — applied only when the user has
+        // never explicitly chosen a value in config.cfg.
+        let ram = crate::system::env_doctor::host_ram_mb();
+        if is_low_spec(ram) {
+            let spec = spec_profile(ram);
+            let has = |k: &str| {
+                saved
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{k}=")))
+            };
+            if !has("fps_cap") {
+                cfg.fps_cap = spec.fps_cap;
+            }
+            if !has("res") {
+                cfg.res_w = spec.lcd_w;
+                cfg.res_h = spec.lcd_h;
+            }
+        }
+        cfg
     }
 
     /// Load from an explicit path. Malformed/garbage lines are skipped
