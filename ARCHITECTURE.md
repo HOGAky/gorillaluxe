@@ -1,9 +1,14 @@
 # GorillaLuxe — Architecture / Архитектура
 
-Low-disk Windows Android virtualization engine: WHPX VMM, DX12
-zero-copy compositor, Luxe Dark bilingual UI.
-Низкодисковый движок виртуализации Android для Windows: VMM на WHPX,
-композитор DX12 zero-copy, двуязычный интерфейс Luxe Dark.
+Low-disk Windows Android virtualization engine. The production
+Android runtime is **Google's headless emulator**
+(`qemu-system-x86_64-headless` under WHPX) — the custom WHPX VMM in
+`vmm/` is an engineering verification substrate (Phase 1/4
+self-tests), not the Android boot path. Frames travel through a
+DX12/CAS compositor into a Luxe Dark bilingual UI.
+Низкодисковый движок виртуализации Android для Windows: реальный
+runtime — headless-эмулятор Google под WHPX; собственный VMM —
+проверочный стенд самотестов, а не путь загрузки Android.
 
 ## Workspace layout / Структура воркспейса
 
@@ -15,7 +20,7 @@ zero-copy compositor, Luxe Dark bilingual UI.
 
 ## `gorillaluxe-core` modules / Модули
 
-### `vmm` + `whpx` + `guest` (Phase 1 / Фаза 1)
+### `vmm` + `whpx` + `guest` (Phase 1 / Фаза 1) — verification substrate / проверочный стенд
 - **`whpx.rs`** — runtime-loaded `WinHvPlatform.dll` bindings
   (`WHv*Api` via `GetProcAddress`), capability query, partition/vCPU.
   Загрузка WHPX без link-time зависимости.
@@ -23,6 +28,11 @@ zero-copy compositor, Luxe Dark bilingual UI.
   smoke test (memory-mailbox completion at GPA `0x2000`).
   Жизненный цикл раздела, память, регистры, смоук-тест.
 - **`guest.rs`** — micro-payload executor used by the WHPX smoke test.
+- Scope: the VMM proves WHPX capability and vCPU bring-up (16→64-bit)
+  for self-tests. It does NOT boot Android — Android runs in Google's
+  `qemu-system-x86_64-headless` (`-accel on` ⇒ WHPX). A QEMU-class
+  replacement remains future work.
+  Собственный VMM не заменяет QEMU — Android грузится движком Google.
 
 ### `gfx` — DX12 compositor (Phase 2 / Фаза 2)
 Zero CPU pixel copies in steady state
@@ -54,8 +64,12 @@ Zero CPU pixel copies in steady state
 ### `input` (Phase 3 / Фаза 3)
 - **`virtio_input.rs`** — Linux Multi-Touch Protocol Type B event model
   (`ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`,
-  `SYN_REPORT`); event batches destined for the virtio-input queue.
-  Модель MT-B — события для будущего virtio-input.
+  `SYN_REPORT`). FUTURE component — no virtio-input transport is wired
+  to the Android runtime today; guest input actually travels through
+  the emulator console (`event send` on 127.0.0.1:5554) or `sendevent`
+  batches over the persistent `adb shell` pipe.
+  Модель MT-B — задел под будущий virtio-input; фактический ввод идёт
+  через консоль эмулятора/sendevent.
 - **`raw.rs`** — `WM_INPUT` plumbing: `RegisterRawInputDevices`
   (`RIDEV_INPUTSINK`) + `GetRawInputData` delta extraction.
 - **`infinite_swipe.rs`** — FPS aiming state machine: relative mouse
@@ -87,12 +101,19 @@ Zero CPU pixel copies in steady state
   Парсер манифестов репозитория Google → прямые ссылки на zip.
 - **`android_runtime.rs`** — real Android bootstrapper/engine bridge:
   install-state probe under `%LOCALAPPDATA%\GorillaLuxe\runtime\`,
-  resumable `DownloadJob` (PowerShell bootstrapper), AVD writer,
-  headless `emulator.exe -no-window -accel whpx -gpu host|swiftshader_indirect`
-  spawn (gfxstream/ANGLE, no Qt window), adb bridge (`install -r`,
-  `input tap/swipe`, `setprop persist.sys.locale`), and `exec-out
-  screencap` → GDI+ PNG → RGBA frame capture feeding the DX12/CAS
-  pipeline. Загрузчик и мост к headless-движку Google.
+  native resumable `DownloadJob`, AVD writer, headless
+  `emulator.exe -no-window -accel on|auto -gpu auto|host|swiftshader`
+  spawn (gfxstream, no Qt window; emulator ≥35 removed the `*_indirect`
+  GPU names and accepts `-accel on|off|auto` only — "whpx" is mapped
+  to `on`), attach-or-spawn arbitration keyed by
+  `%TEMP%\avd\running\pid_*.ini` records (`avd.id=GorillaLuxe`,
+  pid-liveness + boot-grace — never an image-name `taskkill`), Job
+  Object `KILL_ON_JOB_CLOSE`, adb bridge (`install -r`,
+  `input tap/swipe`, `setprop persist.sys.locale`), persistent
+  `adb exec-out` screencap pipe (12B/16B raw header → RGBA8888 —
+  CPU-bound frame bridge, NOT zero-copy) with per-frame `grab_frame`
+  fallback, and TCP `EmuConsole`/`sendevent` fast input.
+  Загрузчик и мост к headless-движку Google; attach по pid-файлам AVD.
 - **`device_profile.rs`** — S23 Ultra / ROG Phone 7 / Pixel 8 Pro
   presets (`model/brand/board/dpi/mac`), `setprop` script +
   kernel-cmdline fragment, `binfmt_misc` AArch64/ARMv7 descriptors for
@@ -138,10 +159,22 @@ VerifyingArchive → Extracting → CreatingAvd → StartingEmulator →
 WaitingForBoot{elapsed_s} → Running → Stopped`, `Failed{ru,en}` + Retry.
 Downloads are native Rust (`system/downloader.rs`) — the PowerShell
 bootstrapper was removed; `emulator.exe` runs inside a Job Object with
-`KILL_ON_JOB_CLOSE` (no orphan qemu), input flows through a persistent
-`adb shell` stdin pipe (<5 ms), and frames arrive as raw `screencap`
-(12-byte header on Android ≤11, 16-byte with `dataspace` on
-Android 12/13 — auto-detected by length — + RGBA8888, no PNG/GDI+).
+`KILL_ON_JOB_CLOSE` (no orphan qemu). Input prefers the emulator
+console `event send` (~0.1-2 ms measured RTT, auth token verified)
+with `sendevent` batches on the persistent `adb shell` pipe as
+fallback and one-shot `input tap/swipe` as last resort.
+Frames arrive through a persistent `adb exec-out "while true;
+screencap"` pipe — raw `[w,h,fmt,(dataspace)]` + RGBA8888 (12-byte
+header on Android ≤11, 16-byte on Android 12/13 — auto-detected once
+by a lookahead sniff, per-frame `grab_frame` as fallback, PNG decode
+only for `-p` output). The Android frame bridge is a **CPU copy
+path** (guest → adb pipe → `Vec<u8>` → `FrameUploader` staging → GPU
+texture); "zero-copy" applies to the DX12 selftest pipeline and
+shared-texture/fence handles, NOT to screencap frames.
+Measured on i3-1115G4 (WHPX, `-gpu auto` → gfxstream): guest-side
+`screencap` costs ~0.5-1 s/frame → ~1-2 FPS sustained frame bridge;
+one-shot `adb exec-out screencap` ~1.2-4.7 s; console `event send`
+RTT ~0.1-2 ms vs `input tap` ~215-325 ms per spawn.
 
 ### `i18n` + `config`
 - **`i18n.rs`** — atomic `set_lang`/`current_lang`, `tr()` table for
@@ -161,6 +194,10 @@ wnd_proc ──► App (Mutex) ──► build_frame(state) ──► Frame{inst
 
 - `WM_LBUTTONDOWN/UP`, `WM_MOUSEMOVE` → dock clicks, hover, widget
   drags, slider scrub.
+- `WM_KEYDOWN`/`WM_KEYUP` → keymap widgets: Tap/Macro = one-shot guest
+  tap, Wasd = held touch (move on additional keys, release on last
+  key-up); F-keys + generic text input to the guest are NOT wired
+  (documented gap).
 - `WM_INPUT` → raw mouse deltas → `InfiniteSwipe` (F6 toggles FPS aim).
 - `WM_DROPFILES` → `.apk`/`.xapk` → animated install toast +
   `adb install -r` into the running guest.
@@ -168,10 +205,13 @@ wnd_proc ──► App (Mutex) ──► build_frame(state) ──► Frame{inst
 - Hotkeys: F1 keymapper, F2 settings, F3 HUD, F4 RU/EN (+ guest locale
   sync), F5 WHPX setup, F6 FPS aim (adb swipe forward), ESC quit.
 - Zone D onboarding: `install_state()` → Download (native ureq+zip
-  with SHA-256 + step labels) / Launch Android → Job-bound headless
-  emulator → raw `exec-out screencap` (12B header + RGBA8888) frames →
-  `android_tex` → CAS → swapchain. Clicks forward through the
-  persistent `adb shell` pipe (<5 ms).
+  with SHA-256 + step labels) / Launch Android → attach to a live
+  AVD-holder OR Job-bound headless emulator spawn → persistent raw
+  `screencap` stream (12B/16B header auto-detect) → `android_tex`
+  (`FrameUploader`, `NON_PIXEL_SHADER_RESOURCE`) → CAS → swapchain.
+  Input: `EmuConsole event send` TCP path, `sendevent`/`input`
+  fallbacks. `-grpc 8554` is opened for future gRPC control — no
+  client consumes it yet.
 
 ## CI pipeline / Конвейер CI
 

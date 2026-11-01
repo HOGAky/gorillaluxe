@@ -31,7 +31,9 @@ use gorillaluxe_core::ui::scene::{
 use gorillaluxe_core::ui::settings_panel::{FPS_PRESETS, RES_PRESETS};
 use gorillaluxe_core::APP_NAME;
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -44,7 +46,7 @@ use windows::Win32::Graphics::Gdi::{
     UpdateWindow, HDC, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -115,6 +117,11 @@ struct App {
     /// Last Infinite-Swipe position forwarded via adb.
     last_swipe_pos: Option<(i32, i32)>,
     last_swipe_tick: u64,
+    /// Virtual keys of held Wasd widgets — the active guest touch is
+    /// DOWN while the list is non-empty and MOVEs to the newest key's
+    /// widget position; WM_KEYUP removes a key and the last release
+    /// sends touch-up.
+    wasd_held: Vec<u16>,
     /// Persistent `adb shell` stdin pipe (<5 ms input forwarding).
     shell: Option<android_runtime::AdbShell>,
     /// WHPX readiness for the Zone B status pill.
@@ -175,15 +182,31 @@ fn start_android_download(a: &mut App) {
     });
 }
 
-/// Slot the boot-completed poller drops `true` into once the guest
-/// reports `sys.boot_completed=1` (clears the "Booting" HUD chip).
-fn booted_slot() -> &'static Mutex<bool> {
-    static SLOT: OnceLock<Mutex<bool>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(false))
-}
+// Boot-completion state lives in `android_runtime::guest_booted()`
+// — a background poller owns the adb probes, the UI only reads the
+// atomic.
+
+/// Exactly one launch pipeline at a time — a second click while boot
+/// is in flight must NOT spawn a parallel `launch_resilient` (the two
+/// threads then race the same AVD: one spawns, the other attaches and
+/// both run frame pumps hammering `screencap` — observed live in
+/// gorillaluxe.log).
+static LAUNCH_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Zone D → launch the headless emulator + start the frame pump.
 fn start_android(a: &mut App) {
+    if a.emu.is_some()
+        || a.dl.is_some()
+        || matches!(
+            a.ui.onboard,
+            Onboard::StartingEmulator | Onboard::WaitingForBoot { .. } | Onboard::Running
+        )
+    {
+        return;
+    }
+    if LAUNCH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     a.ui.onboard = Onboard::StartingEmulator;
     let profile = &gorillaluxe_core::system::device_profile::PRESETS[0];
     // GPU-aware fallback chain (host → angle_indirect → swiftshader):
@@ -203,98 +226,192 @@ fn start_android(a: &mut App) {
         spec.fps_cap,
         env_doctor::host_ram_mb()
     ));
-    let res = android_runtime::launch_resilient(profile, "whpx", a.cfg.ci_software_gpu, &spec)
-        .or_else(|e| {
-            android_runtime::log_line(&format!("whpx chain exhausted ({e}); retry accel=auto"));
-            android_runtime::launch_resilient(profile, "auto", a.cfg.ci_software_gpu, &spec)
-        });
-    match res {
-        Ok(emu) => {
-            a.emu = Some(emu);
-            a.ui.booted = false;
-            *booted_slot().lock().unwrap() = false;
-            a.ui.onboard = Onboard::WaitingForBoot {
-                elapsed_s: 0,
-                log: "engine spawned — waiting for guest framebuffer".to_string(),
-            };
-            let (tx, rx) = mpsc::channel();
-            a.frame_rx = Some(rx);
-            // Frame bridge: ONE persistent `adb exec-out` screencap
-            // pipe — zero process spawns per frame (60 FPS path).
-            // Guest-side `sleep` throttles capture to the UI FPS cap
-            // so a weak laptop CPU is never flooded. Starts
-            // IMMEDIATELY — the boot animation streams live.
-            // Per-frame `grab_frame` stays as the fallback.
-            let frame_ms = (1000 / a.cfg.fps_cap.clamp(15, 120).max(1)) as u64;
-            std::thread::spawn(move || {
-                let mut stream = match android_runtime::FrameStream::open(frame_ms) {
-                    Ok(s) => {
-                        android_runtime::log_line("frame stream: persistent screencap pipe");
-                        Some(s)
-                    }
-                    Err(e) => {
-                        android_runtime::log_line(&format!(
-                            "frame stream open failed ({e}) — per-frame fallback"
-                        ));
-                        None
-                    }
-                };
-                loop {
-                    let f = match &mut stream {
-                        Some(s) => s.next_frame(),
-                        None => android_runtime::grab_frame(),
+    let force_sw = a.cfg.ci_software_gpu;
+    // Guest-capture cadence is NOT the present rate: each `exec-out
+    // screencap` makes adbd the top CPU consumer in the guest (~19%,
+    // 267k faults — observed in `dumpsys cpuinfo`) and contributed to
+    // a SystemUI ANR on the 2 GiB guest during first-boot GMS churn.
+    // ≥400 ms idle gap after each capture keeps adbd duty ≈50% → ~10%
+    // guest CPU; the present loop still runs at fps_cap reusing the
+    // last frame.
+    let frame_ms = 400u64.max((1000 / a.cfg.fps_cap.clamp(15, 120).max(1)) as u64);
+    // Everything below spawns child processes and waits on boot —
+    // it must NOT run on the UI thread (a blocked wnd_proc dropped
+    // every click while launch was in flight).
+    std::thread::spawn(move || {
+        let res =
+            android_runtime::launch_resilient(profile, "whpx", force_sw, &spec).or_else(|e| {
+                android_runtime::log_line(&format!("whpx chain exhausted ({e}); retry accel=auto"));
+                android_runtime::launch_resilient(profile, "auto", force_sw, &spec)
+            });
+        LAUNCH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+        match res {
+            Ok(emu) => {
+                {
+                    let mut a = app().lock().unwrap();
+                    a.emu = Some(emu);
+                    a.ui.booted = false;
+                    a.ui.onboard = Onboard::WaitingForBoot {
+                        elapsed_s: 0,
+                        log: "engine spawned — waiting for guest framebuffer".to_string(),
                     };
-                    match f {
-                        Ok(frame) => {
-                            if tx.send(frame).is_err() {
-                                return;
+                }
+                let (tx, rx) = mpsc::channel();
+                app().lock().unwrap().frame_rx = Some(rx);
+                // Frame pump: one clean `adb -e exec-out screencap`
+                // per frame with a hard deadline — the child is killed
+                // on timeout, never blocking the pipeline. Raw RGBA is
+                // tried first; after 5 consecutive failures the worker
+                // escalates to `screencap -p` (GDI+ decode) so SOMETHING
+                // always reaches the screen.
+                std::thread::spawn(move || {
+                    let mut fails = 0u32;
+                    let mut png = false;
+                    let mut was_booted = false;
+                    let mut n = 0u64;
+                    // Consecutive capture failures — drives backoff so a
+                    // wedged guest `screencap` isn't re-hammered every
+                    // 300 ms (each attempt burns up to the 15 s deadline
+                    // and spams the log, observed live).
+                    let mut streak = 0u32;
+                    loop {
+                        // adbd only registers `emulator-5554` ~10-60 s
+                        // into boot — a screencap before that returns
+                        // "no devices" instantly. Hammering it spams
+                        // the log AND burns the 5-fail budget, so the
+                        // worker would lock into PNG mode forever
+                        // before raw ever got a chance. Wait online.
+                        if !android_runtime::emulator_online() {
+                            fails = 0;
+                            png = false;
+                            streak = 0;
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                        // Boot just completed — give the raw path a
+                        // fresh chance (pre-boot capture failures may
+                        // have locked PNG mode).
+                        let booted = android_runtime::guest_booted();
+                        if booted && !was_booted {
+                            fails = 0;
+                            png = false;
+                            streak = 0;
+                        }
+                        was_booted = booted;
+                        let r = if png {
+                            android_runtime::grab_frame_png()
+                        } else {
+                            android_runtime::grab_frame()
+                        };
+                        match r {
+                            Ok((px, w, h)) => {
+                                fails = 0;
+                                streak = 0;
+                                n += 1;
+                                android_runtime::FRAME_COUNT
+                                    .store(n, std::sync::atomic::Ordering::Release);
+                                if n == 1 || n.is_multiple_of(30) {
+                                    android_runtime::log_line(&format!(
+                                        "frame captured: #{n} {w}x{h} mode={}",
+                                        if png { "png" } else { "raw" }
+                                    ));
+                                }
+                                if n == 1 {
+                                    android_runtime::set_stage(android_runtime::stage::WAIT_FRAMES);
+                                }
+                                if tx.send((px, w, h)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                fails += 1;
+                                streak += 1;
+                                // Dedupe: a wedged capture repeats the
+                                // SAME timeout for minutes — log the
+                                // first occurrence and every 8th after
+                                // (log was flooded 1:1 per attempt).
+                                if streak == 1 || streak.is_multiple_of(8) {
+                                    android_runtime::log_line(&format!(
+                                        "WARN screencap failed x{streak}: {e}"
+                                    ));
+                                }
+                                if fails >= 5 && !png {
+                                    png = true;
+                                    android_runtime::log_line(
+                                        "raw capture failing — switching to PNG mode",
+                                    );
+                                }
+                                // Backoff under a sustained wedge:
+                                // 300 ms → 3 s cap, giving adbd/Surface-
+                                // Flinger time to un-wedge instead of a
+                                // tight 15 s timeout-retry storm.
+                                let back = 300u64.saturating_mul(streak.min(10) as u64).min(3000);
+                                std::thread::sleep(std::time::Duration::from_millis(back));
                             }
                         }
-                        Err(e) => {
-                            if stream.is_some() {
-                                android_runtime::log_line(&format!(
-                                    "frame stream died ({e}) — per-frame fallback"
-                                ));
-                                stream = None;
-                                continue;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                        }
-                    }
-                    if stream.is_none() {
                         std::thread::sleep(std::time::Duration::from_millis(frame_ms));
                     }
-                }
-            });
-            // Persistent low-latency input shell + injector once the
-            // guest is up.
-            std::thread::spawn(move || {
-                if android_runtime::wait_for_device() {
-                    match android_runtime::AdbShell::open() {
-                        Ok(sh) => {
-                            android_runtime::log_line("persistent adb shell attached");
-                            *shell_slot().lock().unwrap() = Some(sh);
+                });
+                // Persistent low-latency input shell + injector once the
+                // guest is up.
+                std::thread::spawn(move || {
+                    if android_runtime::wait_for_device() {
+                        // adbd registers before it can actually serve a
+                        // shell/exec-out — a single failed open used to
+                        // kill the persistent shell for the session.
+                        // Bounded retry while the emulator stays online.
+                        let mut opened = false;
+                        for _ in 0..12 {
+                            match android_runtime::AdbShell::open() {
+                                Ok(sh) => {
+                                    android_runtime::log_line("persistent adb shell attached");
+                                    *shell_slot().lock().unwrap() = Some(sh);
+                                    opened = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    if !android_runtime::emulator_online() {
+                                        return;
+                                    }
+                                    android_runtime::log_line(&format!("adb shell retry: {e}"));
+                                    std::thread::sleep(std::time::Duration::from_secs(5));
+                                }
+                            }
                         }
-                        Err(e) => android_runtime::log_line(&format!("adb shell: {e}")),
+                        if !opened {
+                            android_runtime::log_line("adb shell: giving up after 12 tries");
+                        }
+                        // The console listener (:5554) comes up well after
+                        // adbd — a single failed connect used to kill fast
+                        // input for the whole session (observed: 10054 →
+                        // permanent slow `adb input` fallback). Bounded
+                        // retry while the emulator stays online.
+                        let mut last_err = String::new();
+                        for _ in 0..12 {
+                            match android_runtime::FastInput::connect() {
+                                Ok(fi) => {
+                                    *input_slot().lock().unwrap() = Some(fi);
+                                    return;
+                                }
+                                Err(e) => {
+                                    last_err = e;
+                                    if !android_runtime::emulator_online() {
+                                        return;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_secs(5));
+                                }
+                            }
+                        }
+                        android_runtime::log_line(&format!("fast input: {last_err}"));
                     }
-                    match android_runtime::FastInput::connect() {
-                        Ok(fi) => *input_slot().lock().unwrap() = Some(fi),
-                        Err(e) => android_runtime::log_line(&format!("fast input: {e}")),
-                    }
-                    // Boot-completion poll — clears the HUD chip; runs
-                    // in parallel with the live frame stream.
-                    if android_runtime::boot_completed(240) {
-                        android_runtime::log_line("sys.boot_completed=1");
-                        *booted_slot().lock().unwrap() = true;
-                    }
-                }
-            });
+                });
+            }
+            Err(e) => {
+                android_runtime::log_line(&format!("emulator launch failed: {e}"));
+                app().lock().unwrap().ui.onboard = Onboard::failed(e);
+            }
         }
-        Err(e) => {
-            android_runtime::log_line(&format!("emulator launch failed: {e}"));
-            a.ui.onboard = Onboard::failed(e);
-        }
-    }
+    });
 }
 
 /// Write one line into the persistent guest shell (<5 ms). Returns
@@ -362,6 +479,10 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    // Fresh `gorillaluxe_boot.log` beside the exe — every launch owns
+    // its diagnostics (spec: overwrite, never append to a stale boot).
+    gorillaluxe_core::system::logger::boot_log_reset();
+    gorillaluxe_core::system::logger::info("gorillaluxe starting");
     let mut cfg = Config::load();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -405,6 +526,31 @@ fn utf16(s: &str) -> Vec<u16> {
 unsafe fn run_app(cfg: Config) {
     set_lang(cfg.lang);
 
+    // Single instance: a second gorillaluxe.exe racing the same AVD is
+    // what produced the FATAL "Running multiple emulators with the
+    // same AVD" chain (observed in emulator.log — every GPU mode in
+    // the fallback chain died on the lock). Bring the first window
+    // forward and exit instead of spawning a second emulator.
+    let mutex = CreateMutexW(None, true, w!("Local\\GorillaLuxe.SingleInstance"));
+    if let Ok(h) = mutex {
+        if windows::Win32::Foundation::GetLastError()
+            == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
+        {
+            let _ = CloseHandle(h);
+            if let Some(prev) = find_main_window() {
+                if !prev.is_invalid() {
+                    let _ = ShowWindow(prev, SW_RESTORE);
+                    let _ = SetForegroundWindow(prev);
+                }
+            }
+            return;
+        }
+        // HANDLE is Copy/no-Drop in windows-rs — never closed, so the
+        // mutex stays held for the process lifetime and the kernel
+        // releases it on exit.
+        let _ = h;
+    }
+
     // Shared app state must exist before WM_CREATE fires.
     let ui = UiState {
         lang: cfg.lang,
@@ -437,6 +583,7 @@ unsafe fn run_app(cfg: Config) {
         android_dims: None,
         last_swipe_pos: None,
         last_swipe_tick: 0,
+        wasd_held: Vec::new(),
         shell: None,
         whpx_ok: false,
     }));
@@ -557,19 +704,37 @@ unsafe fn run_app(cfg: Config) {
 }
 
 /// Real production status line for the Zone B pill — replaces the
-/// MVP "Phase 2" placeholder with live engine state.
+/// MVP "Phase 2" placeholder with live engine state. `Hidden` is the
+/// idle default — claiming "Running" there was a status stub: nothing
+/// had been launched.
 fn engine_status(whpx_ok: bool, onboard: &Onboard) -> String {
     let a13 = match onboard {
-        Onboard::Running | Onboard::Hidden => "Running",
-        Onboard::Stopped => "Ready",
+        Onboard::Running => "Running",
+        Onboard::Stopped | Onboard::Hidden => "Ready",
         Onboard::StartingEmulator | Onboard::WaitingForBoot { .. } => "Booting",
         Onboard::Failed { .. } => "Error",
-        _ => "Missing",
+        _ => "Ready",
     };
-    format!(
+    let mut s = format!(
         "GorillaLuxe Engine | WHPX: {} | Android 13: {a13}",
         if whpx_ok { "Ready" } else { "Off" }
-    )
+    );
+    if matches!(onboard, Onboard::Running) {
+        let n = android_runtime::FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            s.push_str(" | Waiting for display...");
+        } else {
+            s.push_str(&format!(" | Frames: {n}"));
+        }
+    }
+    s
+}
+
+/// HWND of an already-running GorillaLuxe instance (single-instance
+/// guard targets it for SetForegroundWindow). Window title is
+/// deliberately NOT matched — it never changes, class is authoritative.
+fn find_main_window() -> Option<HWND> {
+    unsafe { FindWindowW(w!("GorillaLuxeWindow"), None).ok() }
 }
 
 fn client_size(hwnd: HWND) -> (u32, u32) {
@@ -619,6 +784,13 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
     // the texture's steady state is NON_PIXEL_SHADER_RESOURCE, never
     // COMMON, so a one-shot `upload_texture` barrier set is invalid here.
     let mut android_tex_state = D3D12_RESOURCE_STATE_COMMON;
+    // LATCHED once the first guest frame lands in `android_tex`:
+    // frames arrive at capture rate (<=2 FPS on weak hosts) while the
+    // window presents at fps_cap — without the latch the guest image
+    // was visible only on the exact tick a frame arrived and the
+    // ambient backdrop showed the other ~59/60 frames (the
+    // "infinite loading / never shows Android" bug).
+    let mut has_guest_frame = false;
     let mut android_uploader = FrameUploader::new();
     let mut frames = 0u64;
     let mut last = std::time::Instant::now();
@@ -776,11 +948,17 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                         }
                     }
                 }
-                // Boot-elapsed tick + emulator liveness.
+                // Boot-elapsed tick + emulator liveness. The WaitingForBoot
+                // card's detail line carries the REAL launch stage (and
+                // the latched error) — not a static "Загрузка...".
                 let boot_elapsed = a
                     .emu
                     .as_ref()
                     .map(|e| e.launched_at().elapsed().as_secs() as u32);
+                let stage_txt = android_runtime::stage_line(a.ui.lang);
+                if let Onboard::WaitingForBoot { log, .. } = &mut a.ui.onboard {
+                    *log = stage_txt;
+                }
                 if let (Some(secs), Onboard::WaitingForBoot { elapsed_s, .. }) =
                     (boot_elapsed, &mut a.ui.onboard)
                 {
@@ -795,6 +973,8 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     a.frame_rx = None;
                     a.android_dims = None;
                     a.shell = None;
+                    a.wasd_held.clear();
+                    has_guest_frame = false;
                     if was_booting {
                         a.ui.onboard =
                             Onboard::failed("emulator exited during boot — see gorillaluxe.log");
@@ -815,7 +995,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     }
                 }
                 // Boot-completion poller cleared the "Booting" chip.
-                if *booted_slot().lock().unwrap() {
+                if android_runtime::guest_booted() {
                     a.ui.booted = true;
                 }
                 let status = engine_status(a.whpx_ok, &a.ui.onboard);
@@ -863,7 +1043,9 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
             let render_result: Result<(), String> = (|| {
                 // Guest-frame upload runs FIRST — its own cmd+submit
                 // must drain before the frame command list opens.
-                let mut android_src = false;
+                // `android_src` is latched via `has_guest_frame` — the
+                // texture holds the last good frame between captures.
+                let mut android_src = has_guest_frame && android_tex.is_some();
                 if let Some((rgba, w, h)) = latest {
                     if android_tex.is_none() || android_tex_dims != (w, h) {
                         dx.wait_idle()?;
@@ -892,6 +1074,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     )?;
                     android_tex_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                     android_src = true;
+                    has_guest_frame = true;
                 }
 
                 let (_alloc, list) = dx.cmd()?;
@@ -975,6 +1158,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     android_tex = None;
                     android_tex_dims = (0, 0);
                     android_uploader = FrameUploader::new();
+                    has_guest_frame = false;
                     drop(ui);
                     drop(comp);
                     drop(swap);
@@ -1062,6 +1246,7 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32) {
         }
         Some(RegionId::DockKeymapper) => a.ui.keymap.toggle(),
         Some(RegionId::DockSettings) => a.ui.settings.toggle(),
+        Some(RegionId::DockLog) => a.ui.log_open = !a.ui.log_open,
         Some(RegionId::DockApk) => toast(a, tr(a.ui.lang, "ui.apk.hint").to_string()),
         Some(RegionId::DockShot) => toast(a, tr(a.ui.lang, "ui.shot.saved").to_string()),
         Some(RegionId::CasSlider) => {
@@ -1154,12 +1339,24 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
         if let Some((dw, dh)) = a.android_dims {
             let gx = (x / a.win.0 * dw as f32) as u32;
             let gy = (y / a.win.1 * dh as f32) as u32;
-            if !fast_tap(a, gx, gy) && !shell_cmd(a, &format!("input tap {gx} {gy}")) {
+            if fast_tap(a, gx, gy) || shell_cmd(a, &format!("input tap {gx} {gy}")) {
+                android_runtime::log_line(&format!("guest tap ({gx},{gy})"));
+            } else {
                 std::thread::spawn(move || {
                     let _ = android_runtime::send_tap(gx, gy);
                 });
+                android_runtime::log_line(&format!("guest tap ({gx},{gy}) via spawn"));
             }
         }
+    } else {
+        android_runtime::log_line(&format!(
+            "guest tap skipped: running={} onboard={:?} region={:?} at({x},{y}) win={:?} regions={}",
+            android_running(a),
+            a.ui.onboard,
+            hit(&a.regions, x, y),
+            a.win,
+            a.regions.len(),
+        ));
     }
 }
 
@@ -1174,11 +1371,50 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
         let _ = a.ui.keymap.save();
         return;
     }
-    // Bound keys forward Zone C taps into the running guest.
+    // Bound keys forward Zone C actions into the running guest.
     if android_running(a) && !a.ui.keymap.open {
+        // An FpsAim widget's bound key toggles FPS aim the same way
+        // F6 does — without it a placed FpsAim widget was dead UI.
+        let aim_bound =
+            a.ui.keymap
+                .widgets
+                .iter()
+                .any(|w| w.key == Some(vk) && w.kind == WidgetKind::FpsAim);
+        if aim_bound {
+            a.ui.fps_mode = !a.ui.fps_mode;
+            if a.ui.fps_mode {
+                a.swipe.begin(a.tick);
+            } else {
+                a.swipe.end(a.tick);
+                fast_up(a);
+                a.last_swipe_pos = None;
+            }
+            return;
+        }
         if let Some((dw, dh)) = a.android_dims {
+            // Wasd widgets are a HELD touch — keydown presses at the
+            // widget position (or slides an already-held touch to the
+            // newest direction); WM_KEYUP releases. That is what makes
+            // a movement pad actually work.
+            let wasd_pos = a.ui.keymap.widgets.iter().find_map(|w| {
+                (w.key == Some(vk) && w.kind == WidgetKind::Wasd)
+                    .then_some(((w.x * dw as f32) as i32, (w.y * dh as f32) as i32))
+            });
+            if let Some((gx, gy)) = wasd_pos {
+                // Windows auto-repeat would re-fire keydown — a held
+                // key presses its widget exactly once.
+                if !a.wasd_held.contains(&vk) {
+                    let press = a.wasd_held.is_empty();
+                    a.wasd_held.push(vk);
+                    if !fast_aim(a, gx, gy, press) && press {
+                        // Slow-path hold ≈ long stationary swipe.
+                        shell_cmd(a, &format!("input swipe {gx} {gy} {gx} {gy} 600"));
+                    }
+                }
+                return;
+            }
             let tap_pos = a.ui.keymap.widgets.iter().find_map(|w| {
-                (w.key == Some(vk) && w.kind == WidgetKind::Tap)
+                (w.key == Some(vk) && matches!(w.kind, WidgetKind::Tap | WidgetKind::Macro))
                     .then_some(((w.x * dw as f32) as u32, (w.y * dh as f32) as u32))
             });
             if let Some((gx, gy)) = tap_pos {
@@ -1227,6 +1463,28 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
         },
         _ => {}
     }
+}
+
+/// WM_KEYUP — releases a held Wasd-widget touch, or slides it to the
+/// newest still-held direction when more than one key is down.
+fn on_key_up(a: &mut App, vk: u16) {
+    let Some(i) = a.wasd_held.iter().position(|k| *k == vk) else {
+        return;
+    };
+    a.wasd_held.remove(i);
+    if let Some(&last) = a.wasd_held.last() {
+        if let Some((dw, dh)) = a.android_dims {
+            let pos = a.ui.keymap.widgets.iter().find_map(|w| {
+                (w.key == Some(last) && w.kind == WidgetKind::Wasd)
+                    .then_some(((w.x * dw as f32) as i32, (w.y * dh as f32) as i32))
+            });
+            if let Some((gx, gy)) = pos {
+                fast_aim(a, gx, gy, false);
+                return;
+            }
+        }
+    }
+    fast_up(a);
 }
 
 fn on_drop_files(a: &mut App, lparam: LPARAM) {
@@ -1349,6 +1607,11 @@ unsafe extern "system" fn wnd_proc(
         WM_KEYDOWN => {
             let mut a = app().lock().unwrap();
             on_key(&mut a, wparam.0 as u16, hwnd);
+            LRESULT(0)
+        }
+        WM_KEYUP => {
+            let mut a = app().lock().unwrap();
+            on_key_up(&mut a, wparam.0 as u16);
             LRESULT(0)
         }
         WM_PAINT => {

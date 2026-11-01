@@ -52,6 +52,10 @@ pub fn is_low_spec(host_ram_mb: u64) -> bool {
 }
 
 /// Pick the profile from host RAM (0 = probe failed → capable path).
+/// Three tiers: ≤4 GiB hosts get the tiny guest; the ~8 GiB tier is
+/// 2560 MiB — at 2048 the Play-Store image swapped through first-boot
+/// GMS churn (kswapd ~33%, MemAvailable ~650 MB) and SystemUI ANRed
+/// live; ≥10 GiB hosts get 3 GiB. `host_ram_mb` is TOTAL RAM.
 pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
     if is_low_spec(host_ram_mb) {
         SpecProfile {
@@ -62,9 +66,18 @@ pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
             lcd_dpi: 160,
             fps_cap: 30,
         }
+    } else if host_ram_mb > 0 && host_ram_mb <= 8_704 {
+        SpecProfile {
+            guest_mem_mb: 2560,
+            guest_cores: 4,
+            lcd_w: 1280,
+            lcd_h: 720,
+            lcd_dpi: 240,
+            fps_cap: 60,
+        }
     } else {
         SpecProfile {
-            guest_mem_mb: 2048,
+            guest_mem_mb: 3072,
             guest_cores: 4,
             lcd_w: 1280,
             lcd_h: 720,

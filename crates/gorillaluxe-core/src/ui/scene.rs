@@ -62,7 +62,10 @@ pub enum RegionId {
     DockSettings,
     DockApk,
     DockShot,
+    DockLog,
     DockLang,
+    /// Inert click-catcher for the open LOG panel body.
+    LogPanel,
     CasSlider,
     ResPreset(usize),
     FpsPreset(usize),
@@ -188,6 +191,8 @@ pub struct UiState {
     /// emulator Running, a small "Booting Android..." chip renders so
     /// the boot animation never looks stuck.
     pub booted: bool,
+    /// LOG dock panel — live tail of the boot/runtime log ring.
+    pub log_open: bool,
 }
 
 impl Default for UiState {
@@ -209,6 +214,7 @@ impl Default for UiState {
             onboard: Onboard::Hidden,
             status: "GorillaLuxe Engine".to_string(),
             booted: true,
+            log_open: false,
         }
     }
 }
@@ -297,7 +303,7 @@ fn vk_label(vk: u16) -> String {
     }
 }
 
-const DOCK_BTNS: usize = 5;
+const DOCK_BTNS: usize = 6;
 
 /// Dock slot metrics shared by drawing + region emission.
 fn dock_layout(sw: f32, sh: f32) -> (f32, f32, f32) {
@@ -335,6 +341,7 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         RegionId::DockSettings,
         RegionId::DockApk,
         RegionId::DockShot,
+        RegionId::DockLog,
         RegionId::DockLang,
     ];
     let labels = [
@@ -342,6 +349,7 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         "F2",
         "APK",
         "SCR",
+        tr(lang, "ui.dock.log"),
         if lang == Lang::Ru { "RU" } else { "EN" },
     ];
     for (i, (id, label)) in ids.iter().zip(labels.iter()).enumerate() {
@@ -546,6 +554,59 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
                 wr - 3.0,
             ));
         }
+    }
+
+    // ---- LOG panel — live tail of the boot/runtime log -----------------
+    // Spec: instead of guessing why the guest is stuck, the dock's LOG
+    // button opens the real launch diagnostics on-screen.
+    if st.log_open {
+        let lines = crate::system::logger::recent(24);
+        let row_h = FONT_HUD as f32 + 4.0;
+        let pw = (sw * 0.62).min(760.0);
+        let ph = (lines.len() as f32 * row_h + 56.0).min(sh * 0.8);
+        let px = 16.0;
+        let py = sh - ph - 16.0;
+        v.push(Instance::rect(
+            [px, py],
+            [pw, ph],
+            [
+                BG_PRIMARY[0],
+                BG_PRIMARY[1],
+                BG_PRIMARY[2],
+                0.92 * BG_PRIMARY[3],
+            ],
+            R_FRAME,
+        ));
+        layout_text(
+            atlas,
+            &format!("LOG — {}", crate::system::logger::log_path().display()),
+            FONT_HUD,
+            px + 10.0,
+            py + 8.0,
+            ACCENT,
+            &mut v,
+        );
+        for (i, line) in lines.iter().enumerate() {
+            let y = py + 34.0 + i as f32 * row_h;
+            if y + row_h > py + ph - 6.0 {
+                break;
+            }
+            // WARN/ERROR lines render red; the rest stay muted.
+            let col = if line.contains("WARN") || line.contains("ERROR") {
+                STATUS_WARN
+            } else {
+                TEXT_MUTED
+            };
+            // Clip overly long lines to the panel width.
+            let max_chars = ((pw - 20.0) / (FONT_HUD as f32 * 0.62)) as usize;
+            let shown: String = line.chars().take(max_chars.max(16)).collect();
+            layout_text(atlas, &shown, FONT_HUD, px + 10.0, y, col, &mut v);
+        }
+        // Swallow clicks on the panel so they don't hit regions beneath.
+        rg.push(Region {
+            id: RegionId::LogPanel,
+            r: [px, py, pw, ph],
+        });
     }
 
     // ---- Quick Settings panel ----------------------------------------------

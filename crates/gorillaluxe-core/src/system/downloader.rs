@@ -214,10 +214,13 @@ fn run(tx: &mpsc::Sender<DlEvent>, targets: &[ArtifactTarget]) -> Result<(), Str
                     label: t.label.clone(),
                 },
             )?;
-            step(
-                verify_checksum(&t.zip, &t.sha256, &t.sha1)
-                    .map_err(|e| format!("checksum {}: {e}", t.label)),
-            )?;
+            if let Err(e) = verify_checksum(&t.zip, &t.sha256, &t.sha1) {
+                // A corrupt archive must never be "cached" and reused —
+                // delete it so the next run re-downloads instead of
+                // failing the same checksum forever.
+                let _ = fs::remove_file(&t.zip);
+                step(Err(format!("checksum {}: {e}", t.label)))?;
+            }
         }
         emit(
             tx,

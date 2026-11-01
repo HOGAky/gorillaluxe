@@ -137,14 +137,16 @@ impl SwapChain {
         dx.wait_idle()?;
         unsafe {
             self.buffers.clear();
+            // FRAME_LATENCY_WAITABLE_OBJECT is creation-only — passing it
+            // to ResizeBuffers returns DXGI_ERROR_INVALID_CALL (0x887A0001),
+            // which previously killed the whole DX12 path on first WM_SIZE.
             self.chain
                 .ResizeBuffers(
                     BUFFER_COUNT,
                     w,
                     h,
                     DXGI_FORMAT_R8G8B8A8_UNORM,
-                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
-                        | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
                 )
                 .map_err(|e| hr("ResizeBuffers", e))?;
             let incr = dx

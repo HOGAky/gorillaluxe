@@ -21,7 +21,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::time::Instant;
 
 use windows::core::PCWSTR;
@@ -328,11 +329,69 @@ pub struct EmulatorProc {
 }
 
 impl EmulatorProc {
-    /// Reap the engine: kill the direct child, then close the Job —
-    /// closing the last Job handle with `KILL_ON_JOB_CLOSE` terminates
-    /// every process assigned to it (qemu grandchildren included).
+    /// Wait for the child to exit on its own, up to `ms`.
+    fn wait_exit(&mut self, ms: u64) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Graceful-first teardown: a hard `kill()` here would drop qemu
+    /// mid-write and the QuickBoot snapshot is LOST — every launch
+    /// then cold-boots and replays the multi-minute GMS first-boot
+    /// churn (the SystemUI-ANR storm this build mitigates). Order:
+    ///  1) `avd snapshot save default_boot` (console :5554) — writes
+    ///     the qcow2 device overlays `reboot -p` alone doesn't
+    ///     (verified live: poweroff alone → next launch fails
+    ///     "Device 'cache' does not have the requested snapshot" →
+    ///     cold boot anyway);
+    ///  2) `reboot -p` — guest powers off → clean userdata unmount +
+    ///     qemu exit (RAM file-backs via -mem-path);
+    ///  3) monitor `quit` — clean qemu exit even if adbd is wedged;
+    ///  4) kill + Job close — last resort, never left orphaned.
+    ///
+    /// Total grace budget ~2 min: a ~2.5 GiB RAM snapshot + disk
+    /// overlays take a while on laptop storage.
     pub fn shutdown(&mut self) {
+        log_line("emulator shutdown: saving QuickBoot snapshot");
+        match emu_console_cmd("avd snapshot save default_boot", 60_000) {
+            Ok(r) => {
+                if r.starts_with("KO") {
+                    log_line(&format!("snapshot save failed: {}", r.trim()));
+                } else {
+                    log_line("QuickBoot snapshot saved");
+                }
+            }
+            Err(e) => log_line(&format!("snapshot save: {e}")),
+        }
+        log_line("emulator shutdown: guest poweroff requested");
+        let _ = super::silent_cmd(adb())
+            .args(["shell", "reboot", "-p"])
+            .output();
+        if self.wait_exit(45_000) {
+            log_line("emulator exited cleanly (guest poweroff)");
+        } else {
+            log_line("emulator still up after poweroff — monitor quit");
+            if let Ok(mut m) = QemuMonitor::connect() {
+                let _ = m.quit();
+            }
+            if self.wait_exit(30_000) {
+                log_line("emulator exited cleanly (monitor quit)");
+            } else {
+                log_line("emulator did not exit — hard kill");
+            }
+        }
         let _ = self.child.kill();
+        // Only clear when the stored pid is THIS child's — a GPU-chain
+        // retry may already have published its successor's pid.
+        if OWNED_EMU_PID.load(Ordering::Acquire) == self.child.id() {
+            OWNED_EMU_PID.store(0, Ordering::Release);
+        }
         if self.job != 0 {
             unsafe {
                 let _ = CloseHandle(HANDLE(self.job as _));
@@ -401,6 +460,41 @@ pub fn write_avd(
     let home = root.join("avd");
     let avd = home.join("GorillaLuxe.avd");
     std::fs::create_dir_all(&avd).map_err(|e| e.to_string())?;
+    // AVD migration: a `GorillaLuxe.avd` left by an older build can
+    // carry a portrait `1440x3088` config + stale `userdata-qemu.img` —
+    // qemu would boot that mismatch (wrong LCD, ghost apps, possible
+    // bootloop) instead of our landscape panel. The `.glx_avd_v4`
+    // marker marks a config written by THIS generation; when absent,
+    // kill the emulator still holding the AVD and purge every mutable
+    // image/lock/snapshot so the fresh config.ini below is the only
+    // source of truth.
+    let marker = avd.join(".glx_avd_v4");
+    if !marker.exists() && avd.join("config.ini").exists() {
+        for (pid, _) in our_avd_live_pids() {
+            let _ = super::silent_cmd("taskkill.exe")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+        if !our_avd_live_pids().is_empty() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        for e in std::fs::read_dir(&avd).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_mutable = name.ends_with(".img")
+                || name.ends_with(".qcow2")
+                || name.ends_with(".lock")
+                || name == "snapshots";
+            if !is_mutable {
+                continue;
+            }
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let _ = std::fs::remove_dir_all(e.path());
+            } else {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        log_line("AVD migrated to .glx_avd_v4 (stale images/locks purged)");
+    }
     // emulator.exe aborts with "PANIC: Cannot find AVD system path.
     // Please define ANDROID_SDK_ROOT" unless a `platforms\android-33\`
     // dir exists inside the SDK root — ship a minimal build.prop.
@@ -463,6 +557,7 @@ pub fn write_avd(
         sysdir = sysimg.to_string_lossy().replace('\\', "/"),
     );
     std::fs::write(avd.join("config.ini"), config).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(avd.join(".glx_avd_v4"), b"landscape spec-profile v4\n");
     Ok(avd)
 }
 
@@ -505,6 +600,12 @@ pub fn validate_avd(avd_dir: &Path) -> Result<(), String> {
 /// hardware/board/device props makes Android 13 `init` fail to locate
 /// `init.ranchu.rc` and the guest bootloops (sys.boot_completed never 1).
 fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> Vec<String> {
+    // emulator >=34 only accepts `-accel on|off|auto` — the legacy
+    // "whpx" name is rejected outright ("Invalid '-accel whpx'
+    // parameter, valid values are: on off auto") and the engine exits
+    // in <1 s. `on` = require the host hypervisor (WHPX) and fail fast
+    // when it is absent — exactly the semantics our "whpx" pass needs.
+    let accel_mode = if accel == "whpx" { "on" } else { accel };
     vec![
         "-avd".into(),
         "GorillaLuxe".into(),
@@ -522,7 +623,7 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
         "-grpc".into(),
         "8554".into(),
         "-accel".into(),
-        accel.to_string(),
+        accel_mode.to_string(),
         "-gpu".into(),
         gpu.to_string(),
         "-memory".into(),
@@ -533,12 +634,20 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
         "none".into(),
         "-netspeed".into(),
         "full".into(),
-        // ARM64 game support: enable Google's NDK translation bridge
-        // (present on Play-Store x86_64 images ≥API 30). Harmless when
-        // the lib is absent — the prop only matters for arm64 libs.
-        "-prop".into(),
-        "ro.dalvik.vm.native.bridge=libndk_translation.so".into(),
+        // gRPC without JWT = an unauthenticated local control port —
+        // the engine itself warns "No gRPC protection active" in
+        // emulator.log. JWT on; the token lands in the engine output
+        // when a client is ever wired.
+        "-grpc-use-jwt".into(),
         "-verbose".into(),
+        // Everything after `-qemu` passes through to qemu-system.
+        // The human monitor on 127.0.0.1:4444 is the injection path
+        // for `mouse_move`/`mouse_button`/`sendkey` (works in
+        // -no-window where console `event send` is dropped) and the
+        // graceful `quit` that saves the QuickBoot snapshot.
+        "-qemu".into(),
+        "-monitor".into(),
+        format!("tcp:127.0.0.1:{},server,nowait", QemuMonitor::PORT),
     ]
 }
 
@@ -560,13 +669,22 @@ pub fn launch(
     let root = runtime_dir();
     write_avd(&root, &sysimg, profile, gpu, spec)?;
     // Engine stdout+stderr → logs\emulator.log so an early exit (e.g.
-    // "PANIC: Cannot find AVD system path") is diagnosable.
+    // "PANIC: Cannot find AVD system path") is diagnosable. Rotated
+    // once per PROCESS run — the log reached 6.6 MB across sessions
+    // and every `emulator_log_tail` call had to slurp it. Per-attempt
+    // rotation would erase the previous attempt's FATAL line, so the
+    // once flag lives at process scope, not per launch().
     let logs = data_dir().join("logs");
     let _ = std::fs::create_dir_all(&logs);
+    static EMU_LOG_ROTATED: AtomicBool = AtomicBool::new(false);
+    let emu_log = logs.join("emulator.log");
+    if !EMU_LOG_ROTATED.swap(true, Ordering::AcqRel) && emu_log.exists() {
+        let _ = std::fs::rename(&emu_log, logs.join("emulator.prev.log"));
+    }
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(logs.join("emulator.log"))
+        .open(&emu_log)
         .map_err(|e| format!("emulator.log: {e}"))?;
     let log_err = log_file.try_clone().map_err(|e| e.to_string())?;
     let child = super::silent_cmd(&emulator)
@@ -582,6 +700,9 @@ pub fn launch(
         .stderr(Stdio::from(log_err))
         .spawn()
         .map_err(|e| format!("spawn emulator: {e}"))?;
+    // Published BEFORE the pid-file record exists — the poller's
+    // liveness check counts a live owned child as "still booting".
+    OWNED_EMU_PID.store(child.id(), Ordering::Release);
     let job = attach_kill_job(&child);
     log_line(&format!(
         "emulator launched (gpu={gpu} accel={accel} job={job})"
@@ -621,17 +742,37 @@ pub fn primary_gpu_vendor() -> Option<u32> {
     }
 }
 
-/// Ordered `-gpu` candidates for the fallback chain. Intel iGPUs crash
-/// `host` mode at Vulkan external-memory init → lead with ANGLE/D3D11;
-/// discrete NVIDIA/AMD get `host` first; CI forces pure software.
+/// Ordered `-gpu` candidates for the fallback chain — emulator >=35
+/// names only (`-help-gpu`: auto | host | swiftshader | swangle |
+/// software | lavapipe). The legacy `*_indirect` modes were removed:
+/// `angle_indirect`/`swiftshader_indirect` are rejected and remapped
+/// to `auto` with an ERROR line. `host` leads: on the i3/Intel-UHD
+/// test host `-gpu auto` resolved to swiftshader/lavapipe (SOFTWARE
+/// rendering) while `-gpu host` passed the engine's own compat check
+/// (`hasSufficientHwGpu: passed`) — software capture is what wedged
+/// `screencap` for 15-60 s. If `host` dies within the 12 s watch
+/// window the chain falls through to `auto`; `swiftshader` is the
+/// always-valid software last resort.
 pub fn gpu_chain(force_swiftshader: bool) -> Vec<&'static str> {
     if force_swiftshader {
-        return vec!["swiftshader_indirect"];
+        return vec!["swiftshader"];
     }
-    match primary_gpu_vendor() {
-        Some(0x8086) => vec!["angle_indirect", "host", "swiftshader_indirect"],
-        _ => vec!["host", "angle_indirect", "swiftshader_indirect"],
+    vec!["host", "auto", "swiftshader"]
+}
+
+/// Block until no live pid holds our AVD (≤20 s). A killed qemu can
+/// take several seconds to release `multiinstance.lock` and delete
+/// its `pid_*.ini` record — spawning while it still lives trips the
+/// engine's `FATAL: Running multiple emulators with the same AVD`.
+fn wait_avd_drained() {
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if our_avd_live_pids().is_empty() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    log_line("WARN AVD still held after 20 s drain wait");
 }
 
 /// Delete stale qemu lock files that block a cold relaunch after an
@@ -667,7 +808,7 @@ fn emulator_log_tail() -> String {
 /// it on shutdown, since we don't own it).
 pub enum EmulatorHandle {
     Owned(EmulatorProc),
-    Attached { next_probe: Instant, since: Instant },
+    Attached { since: Instant },
 }
 
 impl EmulatorHandle {
@@ -681,20 +822,20 @@ impl EmulatorHandle {
     }
 }
 
-/// `true` while the emulator is up. `Attached` probes `adb get-state`
-/// at most every 2 s (a one-shot process spawn per frame would be
-/// exactly the churn this runtime avoids).
+/// `true` while the emulator is up. Never spawns a process — the
+/// `Attached` branch reads [`EMU_ONLINE`] (refreshed ~2 s by the
+/// background liveness poller); `Owned` is a `try_wait` syscall.
+/// Calling this on the UI thread is safe.
 pub fn alive(h: &mut EmulatorHandle) -> bool {
     match h {
         EmulatorHandle::Owned(e) => matches!(e.child.try_wait(), Ok(None)),
-        EmulatorHandle::Attached { next_probe, .. } => {
-            if Instant::now() < *next_probe {
-                return true;
-            }
-            *next_probe = Instant::now() + std::time::Duration::from_secs(2);
-            adb_run(&["get-state"])
-                .map(|s| s.trim() == "device")
-                .unwrap_or(false)
+        EmulatorHandle::Attached { since } => {
+            EMU_ONLINE.load(Ordering::Acquire)
+                // Boot grace — adbd only registers `emulator-5554`
+                // ~10-60 s into boot and the poller needs a couple of
+                // ticks; a live pid owning our AVD counts as alive.
+                || (since.elapsed() < std::time::Duration::from_secs(BOOT_GRACE_S)
+                    && !our_avd_live_pids().is_empty())
         }
     }
 }
@@ -720,73 +861,434 @@ fn adb_device_present() -> bool {
         .unwrap_or(false)
 }
 
-/// Terminate stale `emulator.exe`/`qemu-system-*` instances holding
-/// our AVD, then clear `*.lock` files. Only runs when stale locks or
-/// an `avd/running/pid_*.ini` orphan actually exist — a live usable
-/// emulator takes the `Attached` path instead.
-fn kill_stale_emulators() {
-    let avd = avd_home().join("GorillaLuxe.avd");
-    let has_locks = std::fs::read_dir(&avd)
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.path().extension().is_some_and(|x| x == "lock"))
-        })
-        .unwrap_or(false);
-    let run_dir = std::env::temp_dir().join(r"avd\running");
-    let has_pid = std::fs::read_dir(&run_dir)
-        .map(|rd| {
-            rd.flatten().any(|e| {
-                e.file_name().to_string_lossy().starts_with("pid_")
-                    && e.path().extension().is_some_and(|x| x == "ini")
-            })
-        })
-        .unwrap_or(false);
-    if !has_locks && !has_pid {
-        return;
-    }
-    log_line("stale emulator locks/pids found — terminating orphans");
-    for img in [
-        "qemu-system-x86_64-headless.exe",
-        "qemu-system-x86_64.exe",
-        "emulator.exe",
-    ] {
-        let _ = super::silent_cmd("taskkill.exe")
-            .args(["/F", "/T", "/IM", img])
-            .output();
-    }
-    for e in std::fs::read_dir(&run_dir).into_iter().flatten().flatten() {
-        if e.path().extension().is_some_and(|x| x == "ini") {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-    purge_stale_locks(&avd);
+/// `adb reconnect` + settle + recheck — returns true when a device
+/// that was reported `offline` came back as `device`.
+fn adb_reconnect() -> bool {
+    let _ = adb_run(&["reconnect"]);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    adb_device_present()
 }
 
-/// Attach to a running emulator, else kill stale orphans, then spawn →
+/// `true` while `pid` refers to a live process.
+fn pid_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Live pids from `%TEMP%\avd\running\pid_*.ini` whose record names OUR
+/// `GorillaLuxe` AVD (`avd.id=`/`avd.dir=` lines) — `(pid, file age
+/// secs)`. Every emulator.exe of this user writes these records, so
+/// the avd match is what scopes them to us: foreign emulators
+/// (Android Studio, other AVDs) are never returned. Records whose pid
+/// is dead are deleted on sight — that IS the stale-file cleanup.
+fn our_avd_live_pids() -> Vec<(u32, u64)> {
+    let run_dir = std::env::temp_dir().join(r"avd\running");
+    let our_dir = avd_home().join("GorillaLuxe.avd");
+    let our_dir_s = our_dir.to_string_lossy().to_string();
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&run_dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(stem) = name
+            .strip_prefix("pid_")
+            .and_then(|s| s.strip_suffix(".ini"))
+        else {
+            continue;
+        };
+        let Ok(pid) = stem.parse::<u32>() else {
+            continue;
+        };
+        if !pid_alive(pid) {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        }
+        let body = std::fs::read_to_string(e.path()).unwrap_or_default();
+        let ours =
+            body.lines().any(|l| l.trim() == "avd.id=GorillaLuxe") || body.contains(&our_dir_s);
+        if !ours {
+            continue;
+        }
+        let age = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        out.push((pid, age));
+    }
+    out
+}
+
+/// Seconds a live pid may hold our AVD without adb seeing it before
+/// it's declared a zombie rather than a booting guest.
+const BOOT_GRACE_S: u64 = 120;
+
+/// A guest `screencap` on a loaded host can legitimately take a few
+/// seconds; a pipe silent for this long is a wedge, not a slow frame
+/// (observed: >10 min of silence while adbd stayed alive).
+const STREAM_STALL_MS: u64 = 30_000;
+
+/// One-shot `adb exec-out screencap` budget — a wedged guest capture
+/// is killed at this deadline instead of blocking the frame worker
+/// forever (same failure class as the pipe stall).
+/// Deadline per screencap attempt. During boot SurfaceFlinger is
+/// contending with zygote/package-scan/QuickBoot-restore — live
+/// captures there took 15-30 s on the i3 test host, so a short fuse
+/// murders every first frame and the guest-side orphan retries
+/// starve each other (retry storm). Post-boot a >15 s capture IS a
+/// wedge; pre-`boot_completed` we allow a full minute.
+const CAPTURE_TIMEOUT_MS: u64 = 15_000;
+const CAPTURE_TIMEOUT_BOOT_MS: u64 = 60_000;
+
+fn capture_deadline() -> std::time::Duration {
+    std::time::Duration::from_millis(if guest_booted() {
+        CAPTURE_TIMEOUT_MS
+    } else {
+        CAPTURE_TIMEOUT_BOOT_MS
+    })
+}
+
+// ---------------------------------------------------------------------------
+// UI-visible guest state — written ONLY by background threads, read by
+// the render/UI thread. The UI thread must never spawn `adb.exe`:
+// a single 50–300 ms process spawn on the message pump made the HUD
+// buttons feel dead (bug report: clicks on F1/F2/RU dropped while the
+// Attached-liveness probe shelled out every 2 s).
+// ---------------------------------------------------------------------------
+
+/// `adb get-state == device` for our emulator — refreshed ~every 2 s
+/// by [`start_liveness_poller`].
+static EMU_ONLINE: AtomicBool = AtomicBool::new(false);
+/// `sys.boot_completed == 1` — latched once by the same poller.
+static BOOT_COMPLETED: AtomicBool = AtomicBool::new(false);
+/// Non-black frames delivered to the UI — drives the "waiting for
+/// display" chip and the HUD frame counter.
+pub static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Guards against two poller threads.
+static POLLER_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Pid of the `emulator.exe` WE spawned (0 = none). The pid-file
+/// record under `%TEMP%\avd\running\` only appears after the launcher
+/// finishes its init — on a fresh AVD (marker migration, first
+/// install) that can take 30-60 s, longer than the poller's miss
+/// window. This pid is the liveness signal that covers the gap.
+static OWNED_EMU_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Launch/boot stage the HUD chip reports — replaces the static
+/// "Загрузка Android 13..." with the REAL current step so a stuck
+/// launch shows exactly where it is stuck.
+pub mod stage {
+    pub const IDLE: u8 = 0;
+    pub const CHECK_RUNTIME: u8 = 1;
+    pub const SPAWN_EMULATOR: u8 = 2;
+    pub const WAIT_ADBD: u8 = 3;
+    pub const WAIT_FRAMES: u8 = 4;
+    pub const BOOTED: u8 = 5;
+    pub const FAILED: u8 = 6;
+}
+static BOOT_STAGE: AtomicU64 = AtomicU64::new(0);
+
+/// Exact failure text for the HUD — set once and latched until the
+/// next launch attempt resets it.
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_stage(s: u8) {
+    BOOT_STAGE.store(s as u64, Ordering::Release);
+}
+pub fn boot_stage() -> u8 {
+    BOOT_STAGE.load(Ordering::Acquire) as u8
+}
+pub fn set_error(msg: &str) {
+    *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.to_string());
+    log_line(&format!("ERROR {msg}"));
+    set_stage(stage::FAILED);
+}
+pub fn last_error() -> Option<String> {
+    LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// One-line stage summary for the boot card/HUD — `[n/6] <stage>`
+/// plus the latched error when the launch failed. Bilingual via i18n.
+pub fn stage_line(lang: crate::i18n::Lang) -> String {
+    use crate::i18n::tr;
+    let s = boot_stage();
+    let key = match s {
+        stage::CHECK_RUNTIME => "ui.stage.check",
+        stage::SPAWN_EMULATOR => "ui.stage.spawn",
+        stage::WAIT_ADBD => "ui.stage.adb",
+        stage::WAIT_FRAMES => "ui.stage.frames",
+        stage::BOOTED => "ui.stage.booted",
+        stage::FAILED => "ui.stage.failed",
+        _ => "ui.stage.check",
+    };
+    let mut out = format!("[{s}/6] {}", tr(lang, key));
+    if let Some(e) = last_error() {
+        out.push_str(&format!(" — {e}"));
+    }
+    out
+}
+
+/// Guest reached `sys.boot_completed=1` (poller-latched).
+pub fn guest_booted() -> bool {
+    BOOT_COMPLETED.load(Ordering::Acquire)
+}
+
+/// adb sees our emulator in `device` state (poller-fresh, ≤2 s stale).
+pub fn emulator_online() -> bool {
+    EMU_ONLINE.load(Ordering::Acquire)
+}
+
+/// Reset the latches for a fresh launch — called by the launch path.
+pub fn reset_guest_state() {
+    EMU_ONLINE.store(false, Ordering::Release);
+    BOOT_COMPLETED.store(false, Ordering::Release);
+    FRAME_COUNT.store(0, Ordering::Release);
+}
+
+/// Background thread: every 2 s refresh [`EMU_ONLINE`], latch
+/// [`BOOT_COMPLETED`], and — on the first `device` sighting — wake
+/// the guest display (sleeping SurfaceFlinger = all-black captures).
+/// Exits when the emulator vanishes for good (10 misses with no live
+/// GorillaLuxe-AVD pid).
+pub fn start_liveness_poller() {
+    if POLLER_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let mut misses = 0u32;
+        let mut woke = false;
+        let mut anr_tick = 0u32;
+        let mut anr_ticks = 8u32;
+        loop {
+            let online = adb_run(&["get-state"])
+                .map(|s| s.trim() == "device")
+                .unwrap_or(false);
+            EMU_ONLINE.store(online, Ordering::Release);
+            if online {
+                misses = 0;
+                if !woke {
+                    // keyevent 82 = MENU (wakes + unlocks a slept
+                    // lockscreen); wm dismiss-keyguard clears the
+                    // keyguard window — without these an early-boot
+                    // display can sit black with boot_completed=1.
+                    wake_guest();
+                    // ARM64 support: the `-prop ro.dalvik.vm.native.bridge`
+                    // launch arg is REJECTED by emulator ≥35 ("only
+                    // 'qemu.*' properties are supported" in emulator.log)
+                    // — the supported switch is the persist flag, set
+                    // here before zygote spawns app processes. Best-effort:
+                    // harmless on images without libndk_translation.
+                    let _ = adb_run(&["-e", "shell", "setprop", "persist.sys.nativebridge", "1"]);
+                    // Background-app ANR dialogs are pure noise for a
+                    // consumer product — the app watchdog already kills
+                    // them silently when this is 0. Foreground ANRs
+                    // (SystemUI) still show and are handled by
+                    // dismiss_anr_dialogs.
+                    let _ = adb_run(&[
+                        "-e",
+                        "shell",
+                        "settings",
+                        "put",
+                        "global",
+                        "anr_show_background",
+                        "0",
+                    ]);
+                    log_line("guest wake + keyguard dismiss sent");
+                    woke = true;
+                }
+                // ~15 s cadence — `dumpsys window windows` itself costs
+                // guest CPU; running it every 2 s poll would feed the
+                // ANR pressure it is meant to clear.
+                anr_tick += 1;
+                if BOOT_COMPLETED.load(Ordering::Acquire) && anr_tick >= anr_ticks {
+                    // During a storm (several stacked dialogs) poll
+                    // every tick (~2 s) — a visible ANR window eats
+                    // every user touch until it's gone. Quiet periods
+                    // stay at ~15 s to keep dumpsys load negligible.
+                    let anr_active = dismiss_anr_dialogs() > 0;
+                    anr_tick = 0;
+                    anr_ticks = if anr_active { 1 } else { 8 };
+                }
+                if !BOOT_COMPLETED.load(Ordering::Acquire)
+                    && adb_run(&["-e", "shell", "getprop", "sys.boot_completed"])
+                        .map(|s| s.trim() == "1")
+                        .unwrap_or(false)
+                {
+                    BOOT_COMPLETED.store(true, Ordering::Release);
+                    set_stage(stage::BOOTED);
+                    log_line("sys.boot_completed=1");
+                }
+            } else {
+                // During early boot the guest legitimately misses a few
+                // probes. "Still alive" = our spawned child OR an AVD
+                // pid-file record — the latter only appears after the
+                // launcher's init (30-60 s on a fresh AVD), the former
+                // covers exactly that gap. Observed live: fresh-AVD
+                // boot raced the 10-miss window and the poller exited
+                // while qemu kept booting → permanent "Загрузка".
+                let owned = OWNED_EMU_PID.load(Ordering::Acquire);
+                let child_live = owned != 0 && pid_alive(owned);
+                if child_live || !our_avd_live_pids().is_empty() {
+                    misses = 0;
+                } else {
+                    misses += 1;
+                }
+                if misses >= 10 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        EMU_ONLINE.store(false, Ordering::Release);
+        POLLER_RUNNING.store(false, Ordering::Release);
+        log_line("liveness poller: emulator gone — exiting");
+    });
+}
+
+/// Wake the guest display + drop the keyguard — safe to call on any
+/// background thread once adb is attached.
+pub fn wake_guest() {
+    let _ = adb_run(&["-e", "shell", "input", "keyevent", "82"]);
+    let _ = adb_run(&["-e", "shell", "wm", "dismiss-keyguard"]);
+}
+
+/// Dismiss guest "Application Not Responding" dialogs by tapping
+/// "Wait" — the only non-destructive button (tapping the top row kills
+/// the app; a dead SystemUI respawns itself anyway). The ANR window's
+/// frame is parsed from `dumpsys window windows`: the bottom row is
+/// always "Wait" (locale-independent layout). Runs on the poller's
+/// cadence — guest ANRs are transient first-boot churn but a stuck
+/// dialog covers the whole display the user paid to see. Returns
+/// how many ANR windows were found (drives adaptive cadence).
+fn dismiss_anr_dialogs() -> usize {
+    let Ok(dump) = adb_run(&["-e", "shell", "dumpsys", "window", "windows"]) else {
+        return 0;
+    };
+    let mut found = 0usize;
+    // Find each `Application Not Responding:` window's mFrame.
+    let mut in_anr = false;
+    for line in dump.lines() {
+        if line.contains("Application Not Responding:") {
+            in_anr = true;
+            found += 1;
+            continue;
+        }
+        if !in_anr {
+            continue;
+        }
+        if line.contains("Window #") {
+            in_anr = false;
+            continue;
+        }
+        // `frame=[224,212][1055,507]` → bottom-row ("Wait") tap point.
+        if let Some(pos) = line.find("frame=[") {
+            let coords: Vec<i32> = line[pos + 6..]
+                .split(['[', ']', ','])
+                .filter_map(|t| t.parse::<i32>().ok())
+                .collect();
+            if coords.len() >= 4 {
+                let (x1, y1, x2, y2) = (coords[0], coords[1], coords[2], coords[3]);
+                if x2 > x1 && y2 > y1 {
+                    let tx = (x1 + x2) / 2;
+                    // 0.70 down the dialog = dead-center of the bottom
+                    // ("Wait") row; verified live at 0.71.
+                    let ty = y1 + ((y2 - y1) * 70) / 100;
+                    let _ = adb_run(&[
+                        "-e",
+                        "shell",
+                        "input",
+                        "tap",
+                        &tx.to_string(),
+                        &ty.to_string(),
+                    ]);
+                    log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
+                }
+            }
+            in_anr = false;
+        }
+    }
+    found
+}
+
+/// Attach to a running emulator, else clear stale state, then spawn →
 /// watch 12 s → if the engine died, retry with the next `-gpu` mode in
-/// the vendor-aware chain. Guarantees a boot on every GPU (NVIDIA/AMD
-/// `host`, Intel `angle_indirect`, software last resort) without user
-/// intervention. `accel` = `"whpx"` or `"auto"`.
+/// the vendor-aware chain. `accel` = `"whpx"` (mapped to `-accel on`,
+/// required-hypervisor) or `"auto"`.
+///
+/// Two `emulator.exe` instances can never share an AVD — a second
+/// spawn dies instantly with `FATAL: Running multiple emulators with
+/// the same AVD`. Detection has three cases, in order:
+/// 1. `adb devices` already lists `emulator-*` → adopt it.
+/// 2. A live `pid_*.ini` holds OUR AVD but adb doesn't see it — fresh
+///    (< BOOT_GRACE_S) means mid-boot → attach; stale means a zombie
+///    with dead adbd → kill THAT pid only (never an image-name
+///    `taskkill /IM`, which would nuke foreign emulators too).
+/// 3. Dead pids → their ini files are deleted inside the scan, then
+///    `*.lock` leftovers are purged before the spawn.
 pub fn launch_resilient(
     profile: &DeviceProfile,
     accel: &str,
     force_swiftshader: bool,
     spec: &crate::config::SpecProfile,
 ) -> Result<EmulatorHandle, String> {
-    // Two `emulator.exe` instances can never share an AVD — if one is
-    // already serving `emulator-5554`, adopt it; otherwise clear the
-    // orphans whose locks would make every spawn die inside 12 s.
+    reset_guest_state();
+    *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    set_stage(stage::CHECK_RUNTIME);
+    start_liveness_poller();
+    set_stage(stage::SPAWN_EMULATOR);
     if adb_device_present() {
         log_line("live emulator detected — attaching (no respawn)");
+        set_stage(stage::WAIT_ADBD);
         return Ok(EmulatorHandle::Attached {
-            next_probe: Instant::now() + std::time::Duration::from_secs(2),
             since: Instant::now(),
         });
     }
-    kill_stale_emulators();
+    let ours = our_avd_live_pids();
+    if ours.iter().any(|(_, age)| *age < BOOT_GRACE_S) {
+        log_line("our AVD held by a booting emulator (no adb yet) — attaching");
+        set_stage(stage::WAIT_ADBD);
+        return Ok(EmulatorHandle::Attached {
+            since: Instant::now(),
+        });
+    }
+    if !ours.is_empty() && adb_reconnect() {
+        // `adb devices` reports `offline` whenever the console link
+        // exists but the adbd handshake dropped — often transient
+        // (memory pressure, TCG stall). A reconnect that flips the
+        // device back to `device` saves us from killing a healthy
+        // guest; `our_avd_live_pids` confirmed it IS ours, so a
+        // reconnect is safe — no foreign AVD can be adopted.
+        log_line("adb reconnect revived the emulator — attaching");
+        set_stage(stage::WAIT_ADBD);
+        return Ok(EmulatorHandle::Attached {
+            since: Instant::now(),
+        });
+    }
+    for (pid, _) in &ours {
+        log_line(&format!(
+            "stale emulator pid {pid} holds GorillaLuxe.avd — killing"
+        ));
+        let _ = super::silent_cmd("taskkill.exe")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    }
+    wait_avd_drained();
+    purge_stale_locks(&avd_home().join("GorillaLuxe.avd"));
     let chain = gpu_chain(force_swiftshader);
     let mut last = String::new();
     for (i, gpu) in chain.iter().enumerate() {
+        // A still-dying previous attempt holds the AVD lock — the next
+        // spawn would die instantly with FATAL "multiple emulators",
+        // burning a GPU mode for a lock race (observed live: the whole
+        // chain failed while the first qemu was still flushing).
+        wait_avd_drained();
         // Remove stale locks BEFORE qemu grabs the AVD — leftover
         // `*.lock` files from an unclean exit block cold relaunch.
         purge_stale_locks(&avd_home().join("GorillaLuxe.avd"));
@@ -814,13 +1316,16 @@ pub fn launch_resilient(
                 "emulator stable on -gpu {gpu} (attempt {})",
                 i + 1
             ));
+            set_stage(stage::WAIT_ADBD);
             return Ok(EmulatorHandle::Owned(emu));
         }
         last = format!("gpu={gpu}: exited within 12s — {}", emulator_log_tail());
         log_line(&format!("launch attempt {} failed: {last}", i + 1));
         emu.shutdown();
     }
-    Err(format!("all GPU modes failed ({accel}): {last}"))
+    let msg = format!("all GPU modes failed ({accel}): {last}");
+    set_error(&msg);
+    Err(msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,28 +1552,135 @@ pub fn parse_screencap_header(b: &[u8]) -> Option<(u32, u32, usize)> {
     }
 }
 
-/// Grab one live frame: `exec-out screencap` WITHOUT `-p` returns a
-/// 12-byte header followed by uncompressed RGBA — zero PNG/GDI+
-/// cost, ~3-4x faster. Falls back to the GDI+ PNG path for
-/// `-p`-style output.
-pub fn grab_frame() -> Result<(Vec<u8>, u32, u32), String> {
-    let out = super::silent_cmd(adb())
-        .args(["exec-out", "screencap"])
-        .output()
+/// `adb -e exec-out screencap` with a hard deadline — the child is
+/// killed at [`CAPTURE_TIMEOUT_MS`] instead of blocking the frame
+/// worker forever (a wedged guest capture never returns).
+/// `stdout` is drained on a reader thread: the pipe buffer (~64 KiB)
+/// would deadlock a ~4 MB frame if we only polled `try_wait`.
+fn exec_out_capture(png: bool) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut cmd = super::silent_cmd(adb());
+    cmd.args(["-e", "exec-out", "screencap"]);
+    if png {
+        cmd.arg("-p");
+    }
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| format!("adb screencap: {e}"))?;
-    let b = &out.stdout;
-    if !out.status.success() || b.len() < 12 {
-        return Err("screencap failed".into());
+    let mut out = child.stdout.take().ok_or("screencap stdout")?;
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        v
+    });
+    let budget = capture_deadline();
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let b = reader.join().unwrap_or_default();
+                return Ok(b);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader.join();
+                    return Err(format!(
+                        "screencap timed out after {} ms",
+                        budget.as_millis()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = reader.join();
+                return Err(format!("screencap wait: {e}"));
+            }
+        }
     }
-    // Raw RGBA_8888 path.
-    if let Some((w, h, off)) = parse_screencap_header(b) {
-        return Ok((b[off..off + (w * h * 4) as usize].to_vec(), w, h));
+}
+
+/// `true` when the frame actually carries an image — early-boot and
+/// slept-display captures are all-black; counting pixels brighter
+/// than 16/255 and demanding ≥64 lit pixels keeps a black frame from
+/// ever being presented as "the guest is up".
+pub fn frame_is_visible(px: &[u8]) -> bool {
+    px.as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|c| c[0] as u16 + c[1] as u16 + c[2] as u16 > 16)
+        .take(64)
+        .count()
+        >= 64
+}
+
+/// Decode one raw `screencap` record → `(rgba, w, h)` or `None`.
+/// Handles BOTH header layouts (12 B legacy, 16 B with `dataspace`),
+/// both formats (`fmt=1` RGBA_8888, `fmt=5` BGRA_8888 → channel-swap),
+/// forces alpha=255 on every pixel, and rejects all-black frames.
+pub fn parse_frame(b: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    if b.len() < 12 {
+        return None;
     }
-    // PNG fallback (`screencap -p` style output).
+    let w = u32::from_le_bytes(b[0..4].try_into().unwrap());
+    let h = u32::from_le_bytes(b[4..8].try_into().unwrap());
+    let fmt = u32::from_le_bytes(b[8..12].try_into().unwrap());
+    if w == 0 || h == 0 || w > 8192 || h > 8192 || (fmt != 1 && fmt != 5) {
+        return None;
+    }
+    let px = (w as usize) * (h as usize) * 4;
+    let off = if b.len() == 16 + px {
+        16
+    } else if b.len() >= 12 + px {
+        12
+    } else {
+        return None;
+    };
+    let mut rgba = b[off..off + px].to_vec();
+    if fmt == 5 {
+        // BGRA_8888 → RGBA_8888.
+        for c in rgba.as_chunks_mut::<4>().0 {
+            c.swap(0, 2);
+        }
+    }
+    for c in rgba.as_chunks_mut::<4>().0 {
+        c[3] = 255;
+    }
+    if !frame_is_visible(&rgba) {
+        return None;
+    }
+    Some((rgba, w, h))
+}
+
+/// Grab one live frame via `adb -e exec-out screencap` (raw RGBA —
+/// zero PNG cost). Falls back to GDI+ decode when the output already
+/// IS a PNG. All-black frames surface as `Err` so the caller keeps
+/// showing "waiting for display" instead of a black screen.
+pub fn grab_frame() -> Result<(Vec<u8>, u32, u32), String> {
+    let b = exec_out_capture(false)?;
+    if let Some(f) = parse_frame(&b) {
+        return Ok(f);
+    }
     if b.starts_with(b"\x89PNG") {
-        return png_to_rgba(b);
+        return png_to_rgba(&b);
     }
-    Err(format!("screencap: unrecognized output len={}", b.len()))
+    Err(format!(
+        "screencap failed: len={} head={:02x?}",
+        b.len(),
+        &b[..b.len().min(16)]
+    ))
+}
+
+/// Explicit PNG path — `adb -e exec-out screencap -p` decoded via
+/// GDI+. Used after repeated raw-capture failures so SOMETHING always
+/// reaches the screen.
+pub fn grab_frame_png() -> Result<(Vec<u8>, u32, u32), String> {
+    let b = exec_out_capture(true)?;
+    png_to_rgba(&b)
 }
 
 /// PNG bytes → RGBA via GDI+ (fallback path only).
@@ -1154,12 +1766,15 @@ pub fn cmdline_quote(path: &Path) -> String {
 /// once by peeking at the NEXT record's header.
 pub struct FrameStream {
     child: Child,
-    stdout: std::process::ChildStdout,
+    /// Byte chunks produced by a reader thread that owns
+    /// `ChildStdout` — the blocking `read` lives over THERE so this
+    /// side can enforce a stall deadline.
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
     buf: Vec<u8>,
     /// Record header size: 0 = undetected, else 12 (Android ≤11) or
     /// 16 (Android 12+, with trailing `dataspace`).
     hdr_size: usize,
-    /// Bytes of the NEXT record already consumed by the sniff read.
+    /// Bytes of the NEXT record already consumed by an over-read.
     pending: Vec<u8>,
 }
 
@@ -1178,26 +1793,84 @@ impl FrameStream {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("frame stream: {e}"))?;
-        let stdout = child.stdout.take().ok_or("frame stream stdout")?;
+        let mut stdout = child.stdout.take().ok_or("frame stream stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The reader thread is the ONLY one allowed to block on the
+        // anonymous pipe; it forwards every chunk (or the terminal
+        // EOF/error) so the consumer side can use `recv_timeout`.
+        // When a stall is detected the stream is dropped → `child
+        // .kill()` breaks the pipe → this thread exits on its own.
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => {
+                        let _ = tx.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "stream EOF",
+                        )));
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(Ok(chunk[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
         Ok(FrameStream {
             child,
-            stdout,
+            rx,
             buf: Vec::new(),
             hdr_size: 0,
             pending: Vec::new(),
         })
     }
 
-    /// Fill `dst` from `pending` (sniff over-read) then the pipe.
-    fn fill_exact(&mut self, dst: &mut [u8]) -> Result<(), String> {
-        use std::io::Read;
+    fn drain_pending(&mut self, dst: &mut [u8]) -> usize {
         let take = self.pending.len().min(dst.len());
         dst[..take].copy_from_slice(&self.pending[..take]);
         self.pending.drain(..take);
-        if take < dst.len() {
-            self.stdout
-                .read_exact(&mut dst[take..])
-                .map_err(|e| format!("stream read: {e}"))?;
+        take
+    }
+
+    /// `read_exact` on an anonymous pipe blocks FOREVER when the
+    /// guest's `screencap` wedges without dying (observed live: the
+    /// stream went silent for >10 min while `adb shell` and one-shot
+    /// captures kept working). A reader thread owns the blocking
+    /// `read`; this side applies a [`STREAM_STALL_MS`] deadline and a
+    /// producer-liveness check — Err → the caller drops the stream
+    /// (Drop kills adb) and reopens a fresh pipe via the 2 s retry.
+    fn fill_exact(&mut self, dst: &mut [u8]) -> Result<(), String> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(STREAM_STALL_MS);
+        let mut filled = self.drain_pending(dst);
+        while filled < dst.len() {
+            // A dead producer never fills the pipe — bail early.
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return Err("stream producer (adb) exited".into());
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!("stream stalled >{STREAM_STALL_MS} ms — reopening"));
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(Ok(chunk)) => {
+                    self.pending.extend_from_slice(&chunk);
+                    filled += self.drain_pending(&mut dst[filled..]);
+                }
+                Ok(Err(e)) => return Err(format!("stream read: {e}")),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    return Err(format!("stream stalled >{STREAM_STALL_MS} ms — reopening"));
+                }
+            }
         }
         Ok(())
     }
@@ -1207,10 +1880,8 @@ impl FrameStream {
     /// whose trailing header re-validates fixes `hdr_size` for the
     /// stream's lifetime.
     fn sniff_first_frame(&mut self) -> Result<(Vec<u8>, u32, u32), String> {
-        use std::io::Read;
         let mut rec = vec![0u8; 12];
-        self.stdout
-            .read_exact(&mut rec)
+        self.fill_exact(&mut rec)
             .map_err(|e| format!("stream hdr: {e}"))?;
         let w = u32::from_le_bytes(rec[0..4].try_into().unwrap());
         let h = u32::from_le_bytes(rec[4..8].try_into().unwrap());
@@ -1220,8 +1891,7 @@ impl FrameStream {
         }
         let n = (w as usize) * (h as usize) * 4;
         let mut extra = vec![0u8; n + 16];
-        self.stdout
-            .read_exact(&mut extra)
+        self.fill_exact(&mut extra)
             .map_err(|e| format!("stream px: {e}"))?;
         let hdr_ok = |b: &[u8]| -> bool {
             if b.len() < 12 {
@@ -1279,92 +1949,129 @@ impl Drop for FrameStream {
 }
 
 // ---------------------------------------------------------------------------
-// Low-latency input — emulator console (TCP 5554) or persistent sendevent
+// Low-latency input — sendevent (eng builds) > persistent `input`
 // ---------------------------------------------------------------------------
 
-/// Android Emulator Console on 127.0.0.1:5554 — pure TCP, no guest
-/// process spawn per event (~1 ms vs ~100 ms for Java `input tap`).
-/// Authenticates with `%USERPROFILE%\.emulator_console_auth_token`.
-pub struct EmuConsole {
+/// QEMU human monitor on 127.0.0.1:4444 — wired by
+/// `-qemu -monitor tcp:…,server,nowait`. Used ONLY for `quit`
+/// (graceful shutdown → QuickBoot snapshot save); the HMP
+/// `mouse_*`/`sendkey` family was verified not to reach the ranchu
+/// guest (no PS/2-class device behind the handlers in this build).
+pub struct QemuMonitor {
     stream: std::net::TcpStream,
 }
 
-impl EmuConsole {
-    pub fn connect() -> Result<Self, String> {
-        use std::io::{BufRead, BufReader, Write};
-        let mut stream = std::net::TcpStream::connect("127.0.0.1:5554")
-            .map_err(|e| format!("console 5554: {e}"))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-            .ok();
-        // Read the greeting ("Android Console: ... OK").
-        let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        let mut line = String::new();
-        let _ = br.read_line(&mut line);
-        // Auth token — emulator writes it to $HOME or EMULATOR_HOME.
-        let token = [
-            std::env::var_os("USERPROFILE")
-                .map(PathBuf::from)
-                .map(|p| p.join(".emulator_console_auth_token")),
-            Some(runtime_dir().join(".emulator_console_auth_token")),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-        if !token.is_empty() {
-            writeln!(stream, "auth {token}").map_err(|e| e.to_string())?;
-            stream.flush().ok();
-            line.clear();
-            let _ = br.read_line(&mut line); // expect "OK"
+/// One-shot emulator-console command (TCP :5554, token auth).
+/// Used for `avd snapshot save` — the ONLY path that persists the
+/// full QuickBoot snapshot (RAM is file-backed via -mem-path but
+/// `cache`/`userdata` qcow2 overlays are written solely by this
+/// command; `reboot -p`/monitor `quit` alone produce a snapshot the
+/// next launch rejects as "no snapshot → cold boot").
+fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream =
+        std::net::TcpStream::connect("127.0.0.1:5554").map_err(|e| format!("console 5554: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(
+            reply_budget_ms.max(3000),
+        )))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    let mut br = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut l = String::new();
+    for _ in 0..8 {
+        l.clear();
+        match br.read_line(&mut l) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                if l.trim_end() == "OK" {
+                    break;
+                }
+            }
         }
-        Ok(EmuConsole { stream })
+    }
+    let token = [
+        std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|p| p.join(".emulator_console_auth_token")),
+        Some(runtime_dir().join(".emulator_console_auth_token")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|p| std::fs::read_to_string(p).ok())
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default();
+    if token.is_empty() {
+        return Err("no .emulator_console_auth_token".into());
+    }
+    writeln!(stream, "auth {token}").map_err(|e| e.to_string())?;
+    stream.flush().ok();
+    writeln!(stream, "{line}").map_err(|e| e.to_string())?;
+    stream.flush().ok();
+    // Read until OK/KO or the budget's read timeout elapses —
+    // `avd snapshot save` can take tens of seconds of disk I/O.
+    let deadline = Instant::now() + std::time::Duration::from_millis(reply_budget_ms);
+    let mut out = String::new();
+    loop {
+        l.clear();
+        match br.read_line(&mut l) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let t = l.trim_end();
+                out.push_str(t);
+                out.push('\n');
+                if t == "OK" || t.starts_with("KO") {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl QemuMonitor {
+    pub const PORT: u16 = 4444;
+
+    pub fn connect() -> Result<Self, String> {
+        let stream = std::net::TcpStream::connect(("127.0.0.1", Self::PORT))
+            .map_err(|e| format!("qemu monitor :{}: {e}", Self::PORT))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok();
+        let mut m = QemuMonitor { stream };
+        m.drain(); // "(qemu) " banner
+        Ok(m)
     }
 
-    /// Fire one console command; replies are drained lazily (we never
-    /// block waiting — command latency is the only thing that matters).
-    pub fn cmd(&mut self, line: &str) -> Result<(), String> {
+    /// Read-and-discard whatever the monitor emitted (banner, echoes)
+    /// without blocking.
+    fn drain(&mut self) {
+        use std::io::Read;
+        self.stream.set_nonblocking(true).ok();
+        let mut buf = [0u8; 4096];
+        for _ in 0..8 {
+            match self.stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        self.stream.set_nonblocking(false).ok();
+    }
+
+    /// Clean qemu exit — saves the QuickBoot snapshot, unlike kill().
+    pub fn quit(&mut self) -> Result<(), String> {
         use std::io::Write;
-        writeln!(self.stream, "{line}")
+        writeln!(self.stream, "quit")
             .and_then(|_| self.stream.flush())
             .map_err(|e| e.to_string())
-    }
-
-    /// Multi-touch-style DOWN at (x,y) on the ranchu touchscreen.
-    pub fn touch_down(&mut self, x: u32, y: u32) -> Result<(), String> {
-        for ev in [
-            "event send EV_ABS:ABS_MT_TRACKING_ID:1",
-            &format!("event send EV_ABS:ABS_MT_POSITION_X:{x}"),
-            &format!("event send EV_ABS:ABS_MT_POSITION_Y:{y}"),
-            "event send EV_KEY:BTN_TOUCH:1",
-            "event send EV_SYN:SYN_REPORT:0",
-        ] {
-            self.cmd(ev)?;
-        }
-        Ok(())
-    }
-
-    pub fn touch_move(&mut self, x: u32, y: u32) -> Result<(), String> {
-        for ev in [
-            &format!("event send EV_ABS:ABS_MT_POSITION_X:{x}"),
-            &format!("event send EV_ABS:ABS_MT_POSITION_Y:{y}"),
-            "event send EV_SYN:SYN_REPORT:0",
-        ] {
-            self.cmd(ev)?;
-        }
-        Ok(())
-    }
-
-    pub fn touch_up(&mut self) -> Result<(), String> {
-        for ev in [
-            "event send EV_KEY:BTN_TOUCH:0",
-            "event send EV_ABS:ABS_MT_TRACKING_ID:-1",
-            "event send EV_SYN:SYN_REPORT:0",
-        ] {
-            self.cmd(ev)?;
-        }
-        Ok(())
     }
 }
 
@@ -1393,35 +2100,77 @@ pub fn touch_input_node() -> Result<String, String> {
     Ok("/dev/input/event2".into()) // ranchu default
 }
 
-/// Unified low-latency injector: emulator console `event send`
-/// (pure TCP) preferred, `sendevent` batches over the persistent
-/// `adb shell` pipe as fallback — both ~1-3 ms, never `input tap`.
+/// Unified injector ordered by what ACTUALLY reaches the guest on a
+/// `ro.build.type=user` image in `-no-window` mode (all paths were
+/// verified live against `getevent`):
+///
+/// * `Events` — `sendevent` batches, eng/userdebug images only.
+///   Probed with a real write: on user builds `/dev/input/eventN`
+///   opens return EACCES even though the node "exists".
+/// * `Shell` — `input tap`/`input swipe` through the persistent
+///   `adb shell` pipe (~300-800 ms/event, always works as shell).
+///
+/// Dead paths removed after live verification:
+///   * emulator console `event send` — replies OK, dropped silently
+///     (user-event pipes are plumbed only when a Qt window exists);
+///   * QEMU HMP `mouse_move`/`mouse_button` — routes to the
+///     PS/2-class handler which doesn't exist on ranchu;
+///   * QMP `input-send-event` — reaches `qwerty2` for *keys* only;
+///     `abs x/y` has no pointer device to land on in this build.
+///
+///   The remaining sub-ms upgrade for touch is the gRPC
+///   `injectTouch` API on :8554 (needs a client-signed JWK —
+///   non-trivial, tracked in the audit).
 pub enum FastInput {
-    Console(EmuConsole),
-    Events { node: String, tracking_id: i32 },
+    /// `sendevent` path — eng/userdebug images only. `lcd` scales
+    /// guest px → the device's 0..32767 ABS range.
+    Events {
+        node: String,
+        tracking_id: i32,
+        lcd: (u32, u32),
+    },
+    Shell,
+}
+
+/// `wm size` → (w,h); falls back to the spec profile LCD when the
+/// guest is too early in boot to answer.
+fn guest_lcd() -> (u32, u32) {
+    if let Ok(out) = adb_run(&["shell", "wm", "size"]) {
+        if let Some((w, h)) = out
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.split_once('x'))
+        {
+            if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                if w > 0 && h > 0 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+    (1280, 720)
 }
 
 impl FastInput {
-    /// Console first; falls back to sendevent-on-shell (the caller
-    /// supplies the persistent `AdbShell` for that path).
     pub fn connect() -> Result<Self, String> {
-        match EmuConsole::connect() {
-            Ok(mut c) => {
-                // Probe: a harmless SYN must not error.
-                c.cmd("event send EV_SYN:SYN_REPORT:0")?;
-                log_line("input path: emulator console :5554");
-                Ok(FastInput::Console(c))
-            }
-            Err(e) => {
-                let node = touch_input_node()
-                    .map_err(|e2| format!("console: {e}; sendevent probe: {e2}"))?;
-                log_line(&format!("input path: sendevent on {node} (console: {e})"));
-                Ok(FastInput::Events {
-                    node,
-                    tracking_id: 1,
-                })
-            }
+        // sendevent survives only on images where shell can open
+        // /dev/input — probe a real write, not just the node name.
+        match touch_input_node() {
+            Ok(node) => match adb_run(&["shell", "sendevent", &node, "0", "0", "0"]) {
+                Ok(_) => {
+                    log_line(&format!("input path: sendevent on {node}"));
+                    return Ok(FastInput::Events {
+                        node,
+                        tracking_id: 1,
+                        lcd: guest_lcd(),
+                    });
+                }
+                Err(e) => log_line(&format!("sendevent probe failed: {e}")),
+            },
+            Err(e) => log_line(&format!("sendevent node probe failed: {e}")),
         }
+        log_line("input path: persistent `input` (sendevent unavailable)");
+        Ok(FastInput::Shell)
     }
 
     fn ev_line(node: &str, t: u32, c: u32, v: i32) -> String {
@@ -1432,13 +2181,23 @@ impl FastInput {
     /// shell executes all five events in a single write.
     pub fn down(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
         match self {
-            FastInput::Console(c) => c.touch_down(x, y),
-            FastInput::Events { node, tracking_id } => {
+            // `input` can't hold — a 600 ms still-swipe is the only
+            // way to leave the finger down for follow-up moves.
+            FastInput::Shell => shell.swipe(x as i32, y as i32, x as i32, y as i32, 600),
+            FastInput::Events {
+                node,
+                tracking_id,
+                lcd,
+            } => {
                 *tracking_id = tracking_id.wrapping_add(1).max(1);
+                let (sx, sy) = (
+                    x.saturating_mul(32767) / lcd.0.max(1),
+                    y.saturating_mul(32767) / lcd.1.max(1),
+                );
                 let batch = [
                     Self::ev_line(node, 3, 0x39, *tracking_id), // ABS_MT_TRACKING_ID
-                    Self::ev_line(node, 3, 0x35, x as i32),     // ABS_MT_POSITION_X
-                    Self::ev_line(node, 3, 0x36, y as i32),     // ABS_MT_POSITION_Y
+                    Self::ev_line(node, 3, 0x35, sx as i32),    // ABS_MT_POSITION_X
+                    Self::ev_line(node, 3, 0x36, sy as i32),    // ABS_MT_POSITION_Y
                     Self::ev_line(node, 1, 0x14a, 1),           // BTN_TOUCH down
                     Self::ev_line(node, 0, 0, 0),               // SYN_REPORT
                 ]
@@ -1450,22 +2209,28 @@ impl FastInput {
 
     pub fn mv(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
         match self {
-            FastInput::Console(c) => c.touch_move(x, y),
-            FastInput::Events { node, .. } => shell.cmd(
-                &[
-                    Self::ev_line(node, 3, 0x35, x as i32),
-                    Self::ev_line(node, 3, 0x36, y as i32),
-                    Self::ev_line(node, 0, 0, 0),
-                ]
-                .join(";"),
-            ),
+            FastInput::Shell => Err("input path: no incremental move".into()),
+            FastInput::Events { node, lcd, .. } => {
+                let (sx, sy) = (
+                    x.saturating_mul(32767) / lcd.0.max(1),
+                    y.saturating_mul(32767) / lcd.1.max(1),
+                );
+                shell.cmd(
+                    &[
+                        Self::ev_line(node, 3, 0x35, sx as i32),
+                        Self::ev_line(node, 3, 0x36, sy as i32),
+                        Self::ev_line(node, 0, 0, 0),
+                    ]
+                    .join(";"),
+                )
+            }
         }
     }
 
-    pub fn up(&mut self, shell: &mut AdbShell) -> Result<(), String> {
+    pub fn up(&mut self, _shell: &mut AdbShell) -> Result<(), String> {
         match self {
-            FastInput::Console(c) => c.touch_up(),
-            FastInput::Events { node, .. } => shell.cmd(
+            FastInput::Shell => Ok(()), // `input` down is self-completing
+            FastInput::Events { node, .. } => _shell.cmd(
                 &[
                     Self::ev_line(node, 1, 0x14a, 0),
                     Self::ev_line(node, 3, 0x39, -1),
@@ -1476,8 +2241,12 @@ impl FastInput {
         }
     }
 
-    /// Full tap = down+up (still <5 ms end-to-end on either path).
+    /// Full tap = down+up. `Events` is ~ms; `Shell` falls back to a
+    /// self-contained `input tap` (~300-800 ms).
     pub fn tap(&mut self, shell: &mut AdbShell, x: u32, y: u32) -> Result<(), String> {
+        if let FastInput::Shell = self {
+            return shell.tap(x, y);
+        }
         self.down(shell, x, y)?;
         self.up(shell)
     }
@@ -1485,7 +2254,7 @@ impl FastInput {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_screencap_header;
+    use super::{parse_frame, parse_screencap_header};
 
     fn cap(w: u32, h: u32, hdr: usize, dataspace: u32) -> Vec<u8> {
         let mut b = Vec::new();
@@ -1520,5 +2289,84 @@ mod tests {
         let mut bad = b12.clone();
         bad[8..12].copy_from_slice(&9u32.to_le_bytes());
         assert!(parse_screencap_header(&bad).is_none());
+    }
+
+    /// Spec-mandated coverage for `parse_frame`: both header layouts,
+    /// fmt=5 BGRA channel swap, forced alpha=255, and the all-black
+    /// early-boot reject.
+    #[test]
+    fn parse_frame_formats_alpha_black() {
+        let (w, h) = (64u32, 48u32);
+        let px = (w * h) as usize;
+        // Non-black RGBA record, 16-byte (Android 12/13) header.
+        let mut b16 = Vec::new();
+        b16.extend_from_slice(&w.to_le_bytes());
+        b16.extend_from_slice(&h.to_le_bytes());
+        b16.extend_from_slice(&1u32.to_le_bytes()); // fmt RGBA_8888
+        b16.extend_from_slice(&1u32.to_le_bytes()); // dataspace
+        for i in 0..px {
+            b16.extend_from_slice(&[200, 100 + (i % 8) as u8, 50, 7]);
+        }
+        let (rgba, pw, ph) = parse_frame(&b16).expect("16B frame must parse");
+        assert_eq!((pw, ph), (w, h));
+        assert_eq!(rgba[0], 200);
+        assert!(
+            rgba.as_chunks::<4>().0.iter().all(|c| c[3] == 255),
+            "alpha not forced"
+        );
+
+        // 12-byte header + BGRA_8888 (fmt=5) → channel swap.
+        let mut b12 = Vec::new();
+        b12.extend_from_slice(&w.to_le_bytes());
+        b12.extend_from_slice(&h.to_le_bytes());
+        b12.extend_from_slice(&5u32.to_le_bytes()); // fmt BGRA_8888
+        for _ in 0..px {
+            b12.extend_from_slice(&[10, 20, 200, 0]); // B=10 G=20 R=200 A=0
+        }
+        let (rgba2, ..) = parse_frame(&b12).expect("12B BGRA frame must parse");
+        assert_eq!(rgba2[0], 200, "BGRA→RGBA red swap failed");
+        assert_eq!(rgba2[2], 10, "BGRA→RGBA blue swap failed");
+        assert_eq!(rgba2[3], 255);
+
+        // All-black early-boot frame → rejected (stays on the
+        // "waiting for display" chip instead of a black screen).
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&w.to_le_bytes());
+        blk.extend_from_slice(&h.to_le_bytes());
+        blk.extend_from_slice(&1u32.to_le_bytes());
+        blk.extend_from_slice(&1u32.to_le_bytes());
+        blk.resize(16 + px * 4, 0);
+        assert!(parse_frame(&blk).is_none(), "black frame must be rejected");
+    }
+
+    /// Real-device pipeline check — needs a RUNNING GorillaLuxe
+    /// emulator on `emulator-5554` (manual validation only):
+    /// `cargo test -p gorillaluxe-core --release -- --ignored live_`
+    #[test]
+    #[ignore = "requires a live Android emulator — manual validation"]
+    fn live_android_frames_parse() {
+        if !super::adb_exe().is_file() {
+            eprintln!("runtime not installed — skipping live check");
+            return;
+        }
+        let mut s = match super::FrameStream::open(0) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("no live emulator ({e}) — skipping");
+                return;
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let mut dims = None;
+        for i in 0..5 {
+            let (px, w, h) = s.next_frame().expect("next_frame failed on live device");
+            assert_eq!(px.len(), (w as usize) * (h as usize) * 4);
+            if let Some(d) = dims {
+                assert_eq!(d, (w, h), "frame dims changed mid-stream");
+            }
+            dims = Some((w, h));
+            eprintln!("live frame {i}: {w}x{h} ({} bytes)", px.len());
+        }
+        eprintln!("5 live frames in {:?}", t0.elapsed());
     }
 }

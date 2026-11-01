@@ -281,4 +281,37 @@ mod tests {
         // Non-black output.
         assert!(a.chunks(4).filter(|p| p[..3] != [0, 0, 0]).count() > 100);
     }
+
+    /// Spec-mandated regression: the guest texture and the window are
+    /// almost NEVER the same size (portrait `720x1280` guest into a
+    /// `1280x720` landscape window, etc.) — the CAS dispatch maps
+    /// `dtid`→`src` proportionally, so every output quadrant must get
+    /// real pixels, not a cropped top-left corner.
+    #[test]
+    fn cas_scales_mismatched_dims() {
+        // Portrait guest buffer -> landscape window.
+        let src = pattern_image(72, 128);
+        let out = cas_reference(&src, 72, 128, 128, 72, 0.6);
+        let lit = |qx: std::ops::Range<u32>, qy: std::ops::Range<u32>| -> usize {
+            qy.clone()
+                .flat_map(|y| qx.clone().map(move |x| (y * 128 + x) as usize * 4))
+                .filter(|&o| out[o] as u16 + out[o + 1] as u16 + out[o + 2] as u16 > 16)
+                .count()
+        };
+        // All four quadrants of the scaled output carry image data.
+        assert!(lit(0..64, 0..36) > 64, "top-left quadrant black");
+        assert!(lit(64..128, 0..36) > 64, "top-right quadrant black");
+        assert!(lit(0..64, 36..72) > 64, "bottom-left quadrant black");
+        assert!(lit(64..128, 36..72) > 64, "bottom-right quadrant black");
+        // And the reverse orientation: landscape guest -> portrait window.
+        let src2 = pattern_image(128, 72);
+        let out2 = cas_reference(&src2, 128, 72, 72, 128, 0.6);
+        let lit2 = |y: u32| -> usize {
+            (0..72u32)
+                .map(|x| (y * 72 + x) as usize * 4)
+                .filter(|&o| out2[o] as u16 + out2[o + 1] as u16 + out2[o + 2] as u16 > 16)
+                .count()
+        };
+        assert!(lit2(10) > 32 && lit2(118) > 32, "vertical bands black");
+    }
 }

@@ -329,10 +329,13 @@ mod tests {
         // bandwidth (~8.3 GB/s). On single-channel hosts the same
         // publisher must still add ~zero overhead over the RAM floor:
         // pass when write time stays within 35% of the host's own
-        // memcpy baseline (and below a 250 ms sanity ceiling).
+        // memcpy baseline. The 250 ms sanity ceiling applies only
+        // while the host is healthy — when memcpy itself exceeds it
+        // (concurrent VM load) the ceiling measures the environment,
+        // not the publisher.
         let limit = (base_ms * 1.35).max(60.0);
         assert!(
-            write_ms <= limit && write_ms < 250.0,
+            write_ms <= limit && (write_ms < 250.0 || base_ms > 250.0),
             "60 frames took {write_ms:.1}ms; RAM baseline {base_ms:.1}ms (limit {limit:.1}ms)"
         );
     }

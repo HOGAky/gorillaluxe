@@ -3,6 +3,13 @@ TECHNICAL SPECIFICATION & EXECUTION PLAN (FOR DEVIN AI)
 Project: GorillaLuxe — High-Performance Android Virtualization Engine (Windows)
 Target Architecture: x86_64 Windows Host -> x86_64 Android 13 Guest + ARM64 Translation
 Environment Constraint: ZERO-BUDGET / LOW-DISK (<5GB) / CI-DRIVEN DEVELOPMENT
+
+STATUS NOTE (Phase 6): This document is the ORIGINAL TARGET SPEC. The shipped
+product currently runs Android via Google's official emulator (QEMU/WHPX) —
+NOT the custom VMM described below. The custom WHPX VMM, virtio-*, vsock/gRPC,
+and ARM64 translation are future/verification components only. For the
+FACTUAL current architecture see ARCHITECTURE.md; for implementation status
+see docs/audit/AUDIT_REPORT.md.
 ================================================================================
 
 0. AGENT ENVIRONMENT & RESOURCE CONSTRAINTS (CRITICAL - READ FIRST)
