@@ -45,14 +45,17 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, EndPaint, FillRect, SetBkMode, SetTextColor, TextOutW,
     UpdateWindow, HDC, PAINTSTRUCT, TRANSPARENT,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
+    ReleaseCapture, SetCapture, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2,
+    VK_F3, VK_F4, VK_F5, VK_F6, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN,
+    VK_RIGHT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -120,6 +123,10 @@ struct App {
     /// Running headless emulator — spawned by us or attached to an
     /// already-running instance.
     emu: Option<android_runtime::EmulatorHandle>,
+    /// Mid-session crash restarts this session (caps the
+    /// gpu-crash → relaunch loop at 2 so a dying fallback can't
+    /// spin forever).
+    auto_restarts: u32,
     /// Low-latency input injector (console :5554 or sendevent pipe).
     fast_input: Option<android_runtime::FastInput>,
     /// Frame channel fed by the screencap capture thread.
@@ -138,6 +145,10 @@ struct App {
     shell: Option<android_runtime::AdbShell>,
     /// WHPX readiness for the Zone B status pill.
     whpx_ok: bool,
+    /// Newest guest frame kept for the SCR dock button save.
+    last_frame: Option<(Vec<u8>, u32, u32)>,
+    /// Pending UTF-16 high surrogate from WM_CHAR (surrogate pairs).
+    high_surrogate: Option<u16>,
 }
 
 fn app_cell() -> &'static OnceLock<Mutex<App>> {
@@ -239,13 +250,12 @@ fn start_android(a: &mut App) {
         env_doctor::host_ram_mb()
     ));
     let force_sw = a.cfg.ci_software_gpu;
-    // Guest-capture cadence is NOT the present rate: each `exec-out
-    // screencap` makes adbd the top CPU consumer in the guest (~19%,
-    // 267k faults — observed in `dumpsys cpuinfo`) and contributed to
-    // a SystemUI ANR on the 2 GiB guest during first-boot GMS churn.
-    // ≥400 ms idle gap after each capture keeps adbd duty ≈50% → ~10%
-    // guest CPU; the present loop still runs at fps_cap reusing the
-    // last frame.
+    // Guest-capture cadence. The gRPC path (`:8554 streamScreenshot`)
+    // pushes host-ColorBuffer frames at the guest's own pace with ZERO
+    // guest CPU, so the pump just blocks on the socket. The adb
+    // `exec-out screencap` fallback makes adbd the top guest CPU
+    // consumer (~19%, 267k faults — observed in `dumpsys cpuinfo`),
+    // so it keeps a ≥400 ms idle gap between captures.
     let frame_ms = 400u64.max((1000 / a.cfg.fps_cap.clamp(15, 120).max(1)) as u64);
     // Everything below spawns child processes and waits on boot —
     // it must NOT run on the UI thread (a blocked wnd_proc dropped
@@ -286,31 +296,72 @@ fn start_android(a: &mut App) {
                     // 300 ms (each attempt burns up to the 15 s deadline
                     // and spams the log, observed live).
                     let mut streak = 0u32;
+                    // Host-side gRPC framebuffer capture — the primary
+                    // path once `:8554` accepts a client (up within ~1 s
+                    // of engine spawn, well before adbd).
+                    let mut grpc: Option<android_runtime::GrpcScreenshotClient> = None;
+                    let mut grpc_next_try = std::time::Instant::now();
                     loop {
-                        // adbd only registers `emulator-5554` ~10-60 s
-                        // into boot — a screencap before that returns
-                        // "no devices" instantly. Hammering it spams
-                        // the log AND burns the 5-fail budget, so the
-                        // worker would lock into PNG mode forever
-                        // before raw ever got a chance. Wait online.
-                        if !android_runtime::emulator_online() {
-                            fails = 0;
-                            png = false;
-                            streak = 0;
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            continue;
+                        if grpc.is_none() && std::time::Instant::now() >= grpc_next_try {
+                            match android_runtime::GrpcScreenshotClient::connect() {
+                                Ok(g) => {
+                                    android_runtime::log_line(
+                                        "frame capture: gRPC :8554 (host ColorBuffer, 0% guest CPU)",
+                                    );
+                                    grpc = Some(g);
+                                    fails = 0;
+                                    streak = 0;
+                                }
+                                Err(_) => {
+                                    grpc_next_try = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(3);
+                                }
+                            }
                         }
-                        // Boot just completed — give the raw path a
-                        // fresh chance (pre-boot capture failures may
-                        // have locked PNG mode).
-                        let booted = android_runtime::guest_booted();
-                        if booted && !was_booted {
-                            fails = 0;
-                            png = false;
-                            streak = 0;
+                        if grpc.is_none() {
+                            // adbd only registers `emulator-5554` ~10-60 s
+                            // into boot — a screencap before that returns
+                            // "no devices" instantly. Hammering it spams
+                            // the log AND burns the 5-fail budget, so the
+                            // worker would lock into PNG mode forever
+                            // before raw ever got a chance. Wait online.
+                            if !android_runtime::emulator_online() {
+                                fails = 0;
+                                png = false;
+                                streak = 0;
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                continue;
+                            }
+                            // Boot just completed — give the raw path a
+                            // fresh chance (pre-boot capture failures may
+                            // have locked PNG mode).
+                            let booted = android_runtime::guest_booted();
+                            if booted && !was_booted {
+                                fails = 0;
+                                png = false;
+                                streak = 0;
+                            }
+                            was_booted = booted;
                         }
-                        was_booted = booted;
-                        let r = if png {
+                        let r = if let Some(g) = grpc.as_mut() {
+                            match g.grab_frame() {
+                                Ok(Some(f)) => Ok(f),
+                                Ok(None) => {
+                                    // "Guest has not posted new frame"
+                                    // — keep the connection, retry on
+                                    // a short cadence. This IS the
+                                    // frame-sync the pump wants.
+                                    std::thread::sleep(std::time::Duration::from_millis(8));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    grpc = None;
+                                    grpc_next_try = std::time::Instant::now()
+                                        + std::time::Duration::from_secs(3);
+                                    Err(format!("grpc: {e}"))
+                                }
+                            }
+                        } else if png {
                             android_runtime::grab_frame_png()
                         } else {
                             android_runtime::grab_frame()
@@ -326,7 +377,13 @@ fn start_android(a: &mut App) {
                                 if n == 1 || n.is_multiple_of(30) {
                                     android_runtime::log_line(&format!(
                                         "frame captured: #{n} {w}x{h} mode={}",
-                                        if png { "png" } else { "raw" }
+                                        if grpc.is_some() {
+                                            "grpc"
+                                        } else if png {
+                                            "png"
+                                        } else {
+                                            "raw"
+                                        }
                                     ));
                                 }
                                 if n == 1 {
@@ -348,7 +405,7 @@ fn start_android(a: &mut App) {
                                         "WARN screencap failed x{streak}: {e}"
                                     ));
                                 }
-                                if fails >= 5 && !png {
+                                if fails >= 5 && !png && grpc.is_none() {
                                     png = true;
                                     android_runtime::log_line(
                                         "raw capture failing — trying PNG fallback",
@@ -364,7 +421,14 @@ fn start_android(a: &mut App) {
                                 std::thread::sleep(std::time::Duration::from_millis(back));
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(frame_ms));
+                        // With the gRPC stream active the blocking
+                        // read IS the pacing — an extra sleep would
+                        // let pushed frames queue in the socket and
+                        // turn into display lag. Without it, poll the
+                        // adb fallback at the capture floor.
+                        if grpc.is_none() {
+                            std::thread::sleep(std::time::Duration::from_millis(frame_ms));
+                        }
                     }
                 });
                 // Persistent low-latency input shell + injector once the
@@ -556,6 +620,42 @@ fn fast_up(a: &mut App) {
     }
 }
 
+/// Forward a hardware key to the guest — console `EV_KEY` when the
+/// injector supports it, persistent-shell `input keyevent` otherwise.
+fn guest_key(a: &mut App, code: u32) {
+    ensure_fast_input(a);
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.key_event(a.shell.as_mut(), code).is_ok() {
+            return;
+        }
+        a.fast_input = None;
+    }
+    if shell_cmd(a, &format!("input keyevent {code}")) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = android_runtime::send_keyevent(code);
+    });
+}
+
+/// Type a text string into the focused guest field — console
+/// `event text` (sub-ms) or persistent-shell `input text`.
+fn guest_text(a: &mut App, s: &str) {
+    ensure_fast_input(a);
+    if let Some(fi) = a.fast_input.as_mut() {
+        if fi.text(a.shell.as_mut(), s).is_ok() {
+            return;
+        }
+        a.fast_input = None;
+    }
+    if let Some(sh) = a.shell.as_mut() {
+        if sh.text(s).is_ok() {
+            return;
+        }
+        a.shell = None;
+    }
+}
+
 /// Whether a live Android guest is attached.
 fn android_running(a: &mut App) -> bool {
     a.emu.as_mut().is_some_and(android_runtime::alive)
@@ -667,6 +767,7 @@ unsafe fn run_app(cfg: Config) {
         cfg: cfg.clone(),
         dl: None,
         emu: None,
+        auto_restarts: 0,
         fast_input: None,
         frame_rx: None,
         android_dims: None,
@@ -675,6 +776,8 @@ unsafe fn run_app(cfg: Config) {
         wasd_held: Vec::new(),
         shell: None,
         whpx_ok: false,
+        last_frame: None,
+        high_surrogate: None,
     }));
 
     let hinst = HINSTANCE::from(GetModuleHandleW(None).unwrap_or_default());
@@ -1059,9 +1162,26 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                         a.ui.onboard,
                         Onboard::WaitingForBoot { .. } | Onboard::StartingEmulator
                     );
+                    let was_running = matches!(a.ui.onboard, Onboard::Running);
+                    // A live-session death with an owned proc is a
+                    // driver crash (Intel igxelpicd64 kills qemu in
+                    // -gpu host 20-30 min in — outside the launch
+                    // watch window). Record the mode so gpu_chain
+                    // demotes it, then auto-restart on the fallback
+                    // renderer — the QuickBoot snapshot restores the
+                    // guest where it left off.
+                    if was_running {
+                        if let Some(mode) = a.emu.as_ref().and_then(|e| e.gpu_mode()) {
+                            android_runtime::record_gpu_crash(&mode);
+                            android_runtime::log_line(&format!(
+                                "mid-session emulator death — gpu={mode} recorded for demotion"
+                            ));
+                        }
+                    }
                     a.emu = None;
                     a.frame_rx = None;
                     a.android_dims = None;
+                    a.last_frame = None;
                     a.shell = None;
                     a.fast_input = None;
                     a.wasd_held.clear();
@@ -1069,6 +1189,14 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     if was_booting {
                         a.ui.onboard =
                             Onboard::failed("emulator exited during boot — see gorillaluxe.log");
+                    } else if was_running && a.auto_restarts < 2 {
+                        a.auto_restarts += 1;
+                        a.ui.onboard = Onboard::Stopped;
+                        toast(
+                            &mut a,
+                            "GPU driver crashed — restarting with fallback renderer".into(),
+                        );
+                        start_android(&mut a);
                     } else {
                         a.ui.onboard = Onboard::Stopped;
                         toast(&mut a, "Android exited".into());
@@ -1104,11 +1232,16 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                         latest = Some(f);
                     }
                 }
-                if let Some((_, w, h)) = &latest {
-                    a.android_dims = Some((*w, *h));
+                if let Some(f) = &latest {
+                    a.android_dims = Some((f.1, f.2));
+                    a.last_frame = Some(f.clone());
                     if matches!(a.ui.onboard, Onboard::WaitingForBoot { .. }) {
                         android_runtime::log_line("first guest frame received — boot OK");
                         a.ui.onboard = Onboard::Running;
+                        // Guest alive → the crash-restart budget is
+                        // earned back (a 2-restart cap must not latch
+                        // forever across healthy sessions).
+                        a.auto_restarts = 0;
                     }
                 }
             }
@@ -1358,11 +1491,46 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32, hwnd: HWND) {
         }
         Some(RegionId::DockApk) => {
             a.drag = Drag::UiButton;
-            toast(a, tr(a.ui.lang, "ui.apk.hint").to_string());
+            if android_running(a) {
+                if let Some(path) = open_apk_dialog(hwnd) {
+                    toast(a, format!("{} {}", tr(a.ui.lang, "ui.apk.dropped"), path));
+                    let p = PathBuf::from(path);
+                    std::thread::spawn(move || {
+                        let _ = android_runtime::install_package(&p);
+                    });
+                }
+            } else {
+                toast(a, tr(a.ui.lang, "ui.apk.hint").to_string());
+            }
         }
         Some(RegionId::DockShot) => {
             a.drag = Drag::UiButton;
-            toast(a, tr(a.ui.lang, "ui.shot.saved").to_string());
+            if let Some((px, w, h)) = a.last_frame.clone() {
+                std::thread::spawn(
+                    move || match android_runtime::save_screenshot_bmp(&px, w, h) {
+                        Ok(path) => android_runtime::log_line(&format!(
+                            "screenshot saved: {}",
+                            path.display()
+                        )),
+                        Err(e) => android_runtime::log_line(&format!("screenshot failed: {e}")),
+                    },
+                );
+                toast(a, tr(a.ui.lang, "ui.shot.saved").to_string());
+            } else {
+                toast(a, "no guest frame yet".into());
+            }
+        }
+        Some(RegionId::DockBack) => {
+            a.drag = Drag::UiButton;
+            if android_running(a) {
+                guest_key(a, 4); // KEYCODE_BACK
+            }
+        }
+        Some(RegionId::DockHome) => {
+            a.drag = Drag::UiButton;
+            if android_running(a) {
+                guest_key(a, 3); // KEYCODE_HOME
+            }
         }
         Some(RegionId::CasSlider) => {
             a.drag = Drag::Slider;
@@ -1434,6 +1602,87 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32, hwnd: HWND) {
                     a.regions.len(),
                 ));
             }
+        }
+    }
+}
+
+/// `OPENFILENAMEW` (commdlg.h, Unicode) — defined locally and called
+/// through `GetProcAddress` so the build never needs the comdlg32
+/// import library (the GNU toolchain would have to fabricate it with
+/// a dlltool that is not installed here).
+#[repr(C)]
+struct OfnW {
+    l_struct_size: u32,
+    hwnd_owner: isize,
+    h_instance: isize,
+    lpstr_filter: *const u16,
+    lpstr_custom_filter: *mut u16,
+    n_max_cust_filter: u32,
+    n_filter_index: u32,
+    lpstr_file: *mut u16,
+    n_max_file: u32,
+    lpstr_file_title: *mut u16,
+    n_max_file_title: u32,
+    lpstr_initial_dir: *const u16,
+    lpstr_title: *const u16,
+    flags: u32,
+    n_file_offset: u16,
+    n_file_extension: u16,
+    lpstr_def_ext: *const u16,
+    l_cust_data: isize,
+    lpfn_hook: isize,
+    lp_template_name: *const u16,
+    pv_reserved: *const core::ffi::c_void,
+    dw_reserved: u32,
+    flags_ex: u32,
+}
+
+/// Modal "Open" dialog filtered to `*.apk;*.xapk` — the APK dock
+/// button's real file picker (was a toast stub).
+fn open_apk_dialog(hwnd: HWND) -> Option<String> {
+    const OFN_FILEMUSTEXIST: u32 = 0x0000_1000;
+    const OFN_PATHMUSTEXIST: u32 = 0x0000_0800;
+    const OFN_EXPLORER: u32 = 0x0008_0000;
+    let mut filter: Vec<u16> =
+        "Android Packages (*.apk;*.xapk)\0*.apk;*.xapk\0All Files (*.*)\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+    let mut title: Vec<u16> = "Select APK / XAPK\0".encode_utf16().collect();
+    let mut buf = [0u16; 1024];
+    unsafe {
+        let comdlg = LoadLibraryW(w!("comdlg32.dll")).ok()?;
+        let proc_ = GetProcAddress(comdlg, windows::core::s!("GetOpenFileNameW"))?;
+        let get_open: unsafe extern "system" fn(*mut OfnW) -> i32 = std::mem::transmute(proc_);
+        let mut ofn = OfnW {
+            l_struct_size: std::mem::size_of::<OfnW>() as u32,
+            hwnd_owner: hwnd.0 as isize,
+            h_instance: 0,
+            lpstr_filter: filter.as_mut_ptr(),
+            lpstr_custom_filter: std::ptr::null_mut(),
+            n_max_cust_filter: 0,
+            n_filter_index: 1,
+            lpstr_file: buf.as_mut_ptr(),
+            n_max_file: buf.len() as u32,
+            lpstr_file_title: std::ptr::null_mut(),
+            n_max_file_title: 0,
+            lpstr_initial_dir: std::ptr::null(),
+            lpstr_title: title.as_mut_ptr(),
+            flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER,
+            n_file_offset: 0,
+            n_file_extension: 0,
+            lpstr_def_ext: std::ptr::null(),
+            l_cust_data: 0,
+            lpfn_hook: 0,
+            lp_template_name: std::ptr::null(),
+            pv_reserved: std::ptr::null(),
+            dw_reserved: 0,
+            flags_ex: 0,
+        };
+        if get_open(&mut ofn) != 0 {
+            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..len]))
+        } else {
+            None
         }
     }
 }
@@ -1527,8 +1776,6 @@ fn on_lbutton_up(a: &mut App, x: f32, y: f32) {
             if fast_active {
                 if moved {
                     let _ = fast_move(a, gx, gy);
-                } else if a.tick.saturating_sub(start_tick) < 25 {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 if fast_up_at(a, gx, gy) {
                     if moved {
@@ -1578,7 +1825,7 @@ fn on_rbutton_down(a: &mut App, x: f32, y: f32) {
     {
         if !shell_cmd(a, "input keyevent 4") {
             std::thread::spawn(|| {
-                let _ = android_runtime::send_tap(0, 0);
+                let _ = android_runtime::send_keyevent(4);
             });
         }
         android_runtime::log_line("guest back (right-click)");
@@ -1586,16 +1833,24 @@ fn on_rbutton_down(a: &mut App, x: f32, y: f32) {
 }
 
 /// Mouse wheel / touchpad two-finger scroll over the guest canvas.
+/// The gRPC injector takes the raw wheel delta directly (native
+/// WheelEvent, no swipe approximation); older tiers keep the swipe.
 fn on_mouse_wheel(a: &mut App, delta: i16) {
     let (mx, my) = a.ui.mouse;
     if !a.ui.keymap.open
         && android_running(a)
         && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
         && hit(&a.regions, mx, my).is_none()
-        && a.tick.saturating_sub(a.last_swipe_tick) >= 90
+        && a.tick.saturating_sub(a.last_swipe_tick) >= 30
     {
         a.last_swipe_tick = a.tick;
         let (gx, gy) = guest_xy(a, mx, my);
+        ensure_fast_input(a);
+        if let Some(fi) = a.fast_input.as_mut() {
+            if fi.wheel(a.shell.as_mut(), gx, gy, delta as i32).is_ok() {
+                return;
+            }
+        }
         let (_, dh) = a.android_dims.unwrap_or((1280, 720));
         let dy = if delta > 0 { 160i32 } else { -160i32 };
         let y2 = (gy as i32 + dy).clamp(40, dh.saturating_sub(40) as i32);
@@ -1603,7 +1858,7 @@ fn on_mouse_wheel(a: &mut App, delta: i16) {
     }
 }
 
-fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
+fn on_key(a: &mut App, vk: u16) {
     if let Some(i) = a.ui.keymap.selected {
         // Any key binds the selected widget; ESC removes it.
         if vk == VK_ESCAPE.0 {
@@ -1701,10 +1956,87 @@ fn on_key(a: &mut App, vk: u16, hwnd: HWND) {
                 a.last_swipe_pos = None;
             }
         }
-        k if k == VK_ESCAPE.0 => unsafe {
-            let _ = DestroyWindow(hwnd);
-        },
-        _ => {}
+        k if k == VK_ESCAPE.0 => {
+            // Escape never closes the app: it dismisses open panels
+            // first, then acts as Android Back in the guest.
+            if a.ui.keymap.open {
+                a.ui.keymap.open = false;
+                a.ui.keymap.selected = None;
+            } else if a.ui.settings.open {
+                a.ui.settings.open = false;
+            } else if a.ui.log_open {
+                a.ui.log_open = false;
+            } else if android_running(a) {
+                guest_key(a, 4); // KEYCODE_BACK
+            }
+        }
+        k => {
+            // Forward PC keyboard editing/navigation keys into the
+            // guest (URL bar, text fields, game UI). Printable text
+            // arrives through WM_CHAR; Space is deliberately absent
+            // here because it does.
+            if android_running(a) && !a.ui.keymap.open {
+                if let Some(code) = vk_android_key(k) {
+                    guest_key(a, code);
+                }
+            }
+        }
+    }
+}
+
+/// Windows VK → Android KEYCODE for editing/navigation keys (the
+/// codes `android_to_linux_key` maps onto the qwerty2 keyboard).
+fn vk_android_key(vk: u16) -> Option<u32> {
+    Some(match vk {
+        k if k == VK_RETURN.0 => 66,  // ENTER
+        k if k == VK_BACK.0 => 67,    // DEL (backspace)
+        k if k == VK_TAB.0 => 61,     // TAB
+        k if k == VK_LEFT.0 => 21,    // DPAD_LEFT
+        k if k == VK_UP.0 => 19,      // DPAD_UP
+        k if k == VK_RIGHT.0 => 22,   // DPAD_RIGHT
+        k if k == VK_DOWN.0 => 20,    // DPAD_DOWN
+        k if k == VK_DELETE.0 => 112, // FORWARD_DEL
+        k if k == VK_HOME.0 => 122,   // MOVE_HOME
+        k if k == VK_END.0 => 123,    // MOVE_END
+        k if k == VK_PRIOR.0 => 92,   // PAGE_UP
+        k if k == VK_NEXT.0 => 93,    // PAGE_DOWN
+        k if k == VK_INSERT.0 => 124, // INSERT
+        _ => return None,
+    })
+}
+
+/// WM_CHAR — UTF-16 text input for the focused guest field (URL bar,
+/// search boxes, chat). Surrogate pairs are stitched across messages.
+fn on_char(a: &mut App, unit: u16) {
+    let ch = if (0xD800..0xDC00).contains(&unit) {
+        a.high_surrogate = Some(unit);
+        return;
+    } else if (0xDC00..0xE000).contains(&unit) {
+        match a.high_surrogate.take() {
+            Some(hi) => {
+                char::from_u32(0x1_0000 + (((hi as u32 - 0xD800) << 10) | (unit as u32 - 0xDC00)))
+                    .unwrap_or('\u{FFFD}')
+            }
+            None => return,
+        }
+    } else {
+        a.high_surrogate = None;
+        match char::from_u32(unit as u32) {
+            Some(c) => c,
+            None => return,
+        }
+    };
+    // Control chars arrive as real keys via WM_KEYDOWN — never as text.
+    if ch.is_control() {
+        return;
+    }
+    if android_running(a)
+        && !a.ui.keymap.open
+        && matches!(a.ui.onboard, Onboard::Running | Onboard::Hidden)
+    {
+        let mut s = String::new();
+        s.push(ch);
+        guest_text(a, &s);
     }
 }
 
@@ -1859,9 +2191,14 @@ unsafe extern "system" fn wnd_proc(
             on_drop_files(&mut a, lparam);
             LRESULT(0)
         }
+        WM_CHAR => {
+            let mut a = app().lock().unwrap();
+            on_char(&mut a, wparam.0 as u16);
+            LRESULT(0)
+        }
         WM_KEYDOWN => {
             let mut a = app().lock().unwrap();
-            on_key(&mut a, wparam.0 as u16, hwnd);
+            on_key(&mut a, wparam.0 as u16);
             LRESULT(0)
         }
         WM_KEYUP => {

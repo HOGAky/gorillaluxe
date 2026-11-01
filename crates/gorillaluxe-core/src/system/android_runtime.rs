@@ -553,6 +553,18 @@ pub fn write_avd(
     std::fs::write(avd.join("config.ini"), config).map_err(|e| e.to_string())?;
     let _ = std::fs::write(avd.join("quickBootChoice.ini"), b"saveOnExit = true\n");
     let _ = std::fs::write(avd.join(".glx_avd_v4"), b"landscape spec-profile v4\n");
+    // One-time snapshot reset when switching to `-feature -Vulkan`:
+    // a snapshot saved while `goldfish_vulkan` was enabled carries a
+    // Vulkan device state that crashes Chrome/WebView on Intel iGPUs.
+    // Preserves `userdata-qemu.img.qcow2` (installed apps/accounts).
+    let vk_marker = avd.join(".glx_no_vulkan_v1");
+    if !vk_marker.exists() {
+        let _ = std::fs::remove_dir_all(avd.join("snapshots"));
+        let _ = std::fs::write(
+            &vk_marker,
+            b"vulkan disabled for chrome/webview stability\n",
+        );
+    }
     Ok(avd)
 }
 
@@ -601,15 +613,24 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
     // in <1 s. `on` = require the host hypervisor (WHPX) and fail fast
     // when it is absent — exactly the semantics our "whpx" pass needs.
     let accel_mode = if accel == "whpx" { "on" } else { accel };
+    // NOTE: emulator 37.3.6 has NO hardware-ANGLE GLES mode — the
+    // ForceANGLE feature flag hijacks mode selection entirely and
+    // resolves to `swangle` (ANGLE→SwiftShader, still software).
+    // Verified live: `-gpu host -feature ForceANGLE` logged
+    // `gpu_mode_requested: swangle`. Hardware accel = `-gpu host`
+    // (vendor WGL) only; everything else is CPU rendering.
     vec![
         "-avd".into(),
         "GorillaLuxe".into(),
-        // `-no-window` is deliberate: we evaluated embedding Google's
-        // Qt window (`-feature -Force32bit` / HWND reparenting) and it
-        // is strictly worse — it bypasses the DX12+CAS compositor and
-        // cannot be hit-tested/rotated with our input layer. The
-        // persistent screencap pipe is the CAS-compatible path.
-        "-no-window".into(),
+        // `-qt-hide-window` (Qt starts but the window is hidden) —
+        // NOT `-no-window`: with -no-window gfxstream never posts
+        // frames to the QEMU scanout (verified: `screendump` dumps an
+        // all-black PPM and gRPC `getScreenshot` long-polls forever
+        // with FAILED_PRECONDITION "guest has not posted new frame").
+        // The hidden window keeps the display pipeline alive so the
+        // host-side gRPC capture works; our DX12 window is still the
+        // only thing the user sees.
+        "-qt-hide-window".into(),
         // QuickBoot snapshots stay ON — never `-no-snapshot`: the
         // engine restores guest RAM in ~2-3 s on every launch after
         // the first cold boot.
@@ -629,13 +650,14 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
         "none".into(),
         "-netspeed".into(),
         "full".into(),
-        // gRPC without JWT = an unauthenticated local control port —
-        // the engine itself warns "No gRPC protection active" in
-        // emulator.log. JWT on; the token lands in the engine output
-        // when a client is ever wired.
-        "-grpc-use-jwt".into(),
+        // Disable guest Vulkan passthrough (`-feature -Vulkan`): on
+        // Intel iGPUs (`host has ext semaphore? win32 0`),
+        // `goldfish_vulkan` crashes Chrome/WebView `CompositorGpuTh`
+        // with a null function-pointer dereference (`rip = 0x0`) and
+        // aborts QuickBoot saves with `UNSUPPORTED_VK_APP`. Hardware
+        // OpenGL ES 3.0 (`-gpu host`) remains fully active.
         "-feature".into(),
-        "VulkanSnapshots".into(),
+        "-Vulkan".into(),
         "-verbose".into(),
         // Everything after `-qemu` passes through to qemu-system.
         // The human monitor on 127.0.0.1:4444 is the injection path
@@ -664,6 +686,24 @@ pub fn launch(
         return Err("Android runtime not installed".into());
     };
     let root = runtime_dir();
+    // Software renderers (swangle/swiftshader/software/lavapipe) run
+    // ALL guest composition on CPU — at 1280x720 the composer HAL eats
+    // ~60% of a core even on an idle screen (measured live), starving
+    // system_server into ANRs. Halving the pixels to 960x540 cuts that
+    // almost in half; the host compositor upscales via CAS anyway.
+    let soft_spec;
+    let spec =
+        if matches!(gpu, "swangle" | "swiftshader" | "software" | "lavapipe") && spec.lcd_w > 960 {
+            soft_spec = crate::config::SpecProfile {
+                lcd_w: 960,
+                lcd_h: 540,
+                lcd_dpi: 160,
+                ..*spec
+            };
+            &soft_spec
+        } else {
+            spec
+        };
     write_avd(&root, &sysimg, profile, gpu, spec)?;
     // Engine stdout+stderr → logs\emulator.log so an early exit (e.g.
     // "PANIC: Cannot find AVD system path") is diagnosable. Rotated
@@ -750,11 +790,72 @@ pub fn primary_gpu_vendor() -> Option<u32> {
 /// `screencap` for 15-60 s. If `host` dies within the 12 s watch
 /// window the chain falls through to `auto`; `swiftshader` is the
 /// always-valid software last resort.
+///
+/// Modes that crashed MID-SESSION are demoted behind everything
+/// crash-free: `-gpu host` runs gfxstream over the native vendor GL
+/// driver and Intel iGPU hosts (igxelpicd64.dll, observed APPCRASH
+/// c0000005 killing qemu 20-30 min into a session — this is the
+/// "browser opened then the app died" report) die outside the 12 s
+/// launch watch. `record_gpu_crash` persists one line per crash;
+/// a mode with any crash record goes last, so the NEXT launch skips
+/// the flaky driver. `swangle`/`swiftshader` (SwiftShader CPU) can
+/// never die in a vendor driver — they anchor the tail.
 pub fn gpu_chain(force_swiftshader: bool) -> Vec<&'static str> {
     if force_swiftshader {
         return vec!["swiftshader"];
     }
-    vec!["host", "auto", "swiftshader"]
+    let base = ["host", "auto", "swangle", "swiftshader"];
+    // `auto` resolves to the SAME native-GL path whenever the host
+    // driver is healthy enough to pass the compat check — so a `host`
+    // crash record implicates `auto` too (verified live: gpu=auto on
+    // Intel UHD selected `gles_mode_selected:host` → same igxelpicd64
+    // crash class). Software modes have no such alias.
+    let eff_crashes = |m: &str| {
+        gpu_crash_count(m)
+            + if m == "auto" {
+                gpu_crash_count("host")
+            } else {
+                0
+            }
+    };
+    let mut chain: Vec<&'static str> = base
+        .iter()
+        .copied()
+        .filter(|m| eff_crashes(m) == 0)
+        .collect();
+    // Crashed modes stay reachable as a deeper fallback (sorted by
+    // fewest crashes) — better a flaky host GPU than a dead emulator.
+    let mut crashed: Vec<&'static str> = base
+        .iter()
+        .copied()
+        .filter(|m| eff_crashes(m) > 0)
+        .collect();
+    crashed.sort_by_key(|m| eff_crashes(m));
+    chain.extend(crashed);
+    chain
+}
+
+/// One line per mid-session GPU-mode crash in
+/// `GorillaLuxe/gpu_crashes.txt` — the persistence that lets
+/// [`gpu_chain`] demote a flaky mode forever after it dies once
+/// (launch-time deaths inside the 12 s watch never reach this file:
+/// the chain already advances on its own).
+pub fn record_gpu_crash(mode: &str) {
+    let path = data_dir().join("gpu_crashes.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{mode}");
+    }
+}
+
+fn gpu_crash_count(mode: &str) -> u32 {
+    let path = data_dir().join("gpu_crashes.txt");
+    std::fs::read_to_string(&path)
+        .map(|s| s.lines().filter(|l| l.trim() == mode).count() as u32)
+        .unwrap_or(0)
 }
 
 /// Block until no live pid holds our AVD (≤20 s). A killed qemu can
@@ -815,6 +916,15 @@ impl EmulatorHandle {
         match self {
             EmulatorHandle::Owned(e) => e.launched_at,
             EmulatorHandle::Attached { since, .. } => *since,
+        }
+    }
+
+    /// `-gpu` mode of an owned proc (`None` for attached engines —
+    /// we never spawned them so their mode is unknown).
+    pub fn gpu_mode(&self) -> Option<String> {
+        match self {
+            EmulatorHandle::Owned(e) => Some(e.gpu.clone()),
+            EmulatorHandle::Attached { .. } => None,
         }
     }
 }
@@ -1047,6 +1157,7 @@ pub fn reset_guest_state() {
     EMU_ONLINE.store(false, Ordering::Release);
     BOOT_COMPLETED.store(false, Ordering::Release);
     FRAME_COUNT.store(0, Ordering::Release);
+    GUEST_LCD.store(0, Ordering::Release);
 }
 
 /// Background thread: every 2 s refresh [`EMU_ONLINE`], latch
@@ -1092,13 +1203,24 @@ pub fn start_liveness_poller() {
                     //     enabled for user-initiated installs.
                     let init_script = concat!(
                         "setprop persist.sys.nativebridge 1;",
+                        "setprop debug.hwui.renderer opengl;",
                         "setprop dalvik.vm.dex2oat-threads 1;",
                         "setprop dalvik.vm.boot-dex2oat-threads 1;",
                         "cmd package bg-dexopt-job --disable >/dev/null 2>&1;",
                         "settings put global anr_show_background 0;",
+                        // Skip SetupWizard provisioning entirely — SUW
+                        // + GMS first-signin is the biggest single
+                        // cold-boot CPU consumer (~60% for 5+ min,
+                        // measured live) and a headless box has no
+                        // wizard to show anyway. Marking provisioned
+                        // before disabling keeps GMS services happy.
+                        "settings put global device_provisioned 1;",
+                        "settings put secure user_setup_complete 1;",
+                        "pm disable-user --user 0 com.google.android.setupwizard >/dev/null 2>&1;",
                         "settings put global window_animation_scale 0.0;",
                         "settings put global transition_animation_scale 0.0;",
                         "settings put global animator_duration_scale 0.0;",
+                        "pm enable com.google.android.googlequicksearchbox >/dev/null 2>&1;",
                         "for p in ",
                         "com.google.android.apps.youtube.music ",
                         "com.google.android.youtube ",
@@ -1107,8 +1229,7 @@ pub fn start_liveness_poller() {
                         "com.google.android.videos ",
                         "com.google.android.apps.tachyon ",
                         "com.google.android.apps.docs ",
-                        "com.google.android.apps.wellbeing ",
-                        "com.google.android.googlequicksearchbox; ",
+                        "com.google.android.apps.wellbeing; ",
                         "do pm disable-user --user 0 $p >/dev/null 2>&1; done"
                     );
                     let _ = adb_run(&["-e", "shell", init_script]);
@@ -1124,13 +1245,10 @@ pub fn start_liveness_poller() {
                     set_stage(stage::BOOTED);
                     log_line("sys.boot_completed=1");
                     if !calmed_store {
-                        // Stop Finsky's automatic BOOT_COMPLETED
-                        // `rapid_auto_update` storm once (Play Store
-                        // launches normally when the user taps its icon).
                         let _ = adb_run(&[
                             "-e",
                             "shell",
-                            "am force-stop com.android.vending; cmd package bg-dexopt-job --cancel >/dev/null 2>&1",
+                            "cmd package bg-dexopt-job --cancel >/dev/null 2>&1",
                         ]);
                         calmed_store = true;
                     }
@@ -1193,51 +1311,59 @@ fn dismiss_anr_dialogs(_streak: u32) -> usize {
     let Ok(dump) = adb_run(&["-e", "shell", "dumpsys", "window", "windows"]) else {
         return 0;
     };
-    let mut found = 0usize;
-    let mut in_anr = false;
-    for line in dump.lines() {
-        if line.contains("Window #") {
-            if line.contains("Application Not Responding:") {
-                in_anr = true;
-                found += 1;
-            } else {
-                in_anr = false;
+    let found = dump
+        .lines()
+        .filter(|l| l.contains("Window #") && l.contains("Application Not Responding:"))
+        .count();
+    if found == 0 {
+        return 0;
+    }
+    // Precise "Wait" hit: the ANR mFrame only loosely tracks the
+    // visible AlertDialog (verified live — 78%-of-frame taps landed
+    // between the title and the buttons). `uiautomator dump` hands us
+    // the real button bounds; tap each `Wait`/`Подождать` node center.
+    // "Close app"/"Закрыть" is NEVER tapped (killing SystemUI blanks
+    // the wallpaper surface to all-black).
+    let _ = adb_run(&["-e", "shell", "uiautomator", "dump", "/sdcard/glx_ui.xml"]);
+    if let Ok(ui) = adb_run(&["-e", "shell", "cat", "/sdcard/glx_ui.xml"]) {
+        let mut rest = ui.as_str();
+        while let Some(p) = rest.find("bounds=\"[") {
+            let seg = &rest[..p];
+            let node_start = seg.rfind("<node").unwrap_or(0);
+            let node = &seg[node_start..];
+            let is_wait = ["\"Wait\"", "\"Подождать\""]
+                .iter()
+                .any(|t| node.contains(&format!("text={t}")));
+            rest = &rest[p + 8..];
+            if !is_wait {
+                continue;
             }
-            continue;
-        }
-        if !in_anr {
-            continue;
-        }
-        if let Some(pos) = line.find("frame=[") {
-            let coords: Vec<i32> = line[pos + 6..]
-                .split(['[', ']', ','])
-                .filter_map(|t| t.parse::<i32>().ok())
-                .collect();
+            let coords: Vec<i32> = p_split_bounds(&rest[..rest.find('"').unwrap_or(40)]);
             if coords.len() >= 4 {
-                let (x1, y1, x2, y2) = (coords[0], coords[1], coords[2], coords[3]);
-                if x2 > x1 && y2 > y1 {
-                    let tx = ((x1 + x2) / 2).max(0) as u32;
-                    // Always tap "Wait" (78% down mFrame = y≈442) —
-                    // never "Close app" (killing SystemUI blanks the
-                    // wallpaper/lockscreen surface to all-black).
-                    let ty = (y1 + ((y2 - y1) * 78) / 100).max(0) as u32;
-                    if console_tap(tx, ty).is_err() {
-                        let _ = adb_run(&[
-                            "-e",
-                            "shell",
-                            "input",
-                            "tap",
-                            &tx.to_string(),
-                            &ty.to_string(),
-                        ]);
-                    }
-                    log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
+                let tx = ((coords[0] + coords[2]) / 2).max(0) as u32;
+                let ty = ((coords[1] + coords[3]) / 2).max(0) as u32;
+                if console_tap(tx, ty).is_err() {
+                    let _ = adb_run(&[
+                        "-e",
+                        "shell",
+                        "input",
+                        "tap",
+                        &tx.to_string(),
+                        &ty.to_string(),
+                    ]);
                 }
+                log_line(&format!("ANR dialog dismissed via Wait tap ({tx},{ty})"));
             }
-            in_anr = false;
         }
     }
     found
+}
+
+/// Parse `[x1,y1][x2,y2]` from a uiautomator `bounds` attribute body.
+fn p_split_bounds(s: &str) -> Vec<i32> {
+    s.split(['[', ']', ','])
+        .filter_map(|t| t.trim().parse::<i32>().ok())
+        .collect()
 }
 
 /// Attach to a running emulator, else clear stale state, then spawn →
@@ -1344,6 +1470,7 @@ pub fn launch_resilient(
         }
         last = format!("gpu={gpu}: exited within 12s — {}", emulator_log_tail());
         log_line(&format!("launch attempt {} failed: {last}", i + 1));
+        record_gpu_crash(gpu);
         emu.shutdown();
     }
     let msg = format!("all GPU modes failed ({accel}): {last}");
@@ -1417,6 +1544,23 @@ impl AdbShell {
     pub fn keyevent(&mut self, code: u32) -> Result<(), String> {
         self.cmd(&format!("input keyevent {code}"))
     }
+    /// `input text` — POSIX-shell-quoted (`%s` for space, `%25` for
+    /// percent). Non-control chars pass through as UTF-8.
+    pub fn text(&mut self, s: &str) -> Result<(), String> {
+        let mut esc = String::with_capacity(s.len() + 2);
+        esc.push('\'');
+        for c in s.chars() {
+            match c {
+                '\'' => esc.push_str("'\"'\"'"),
+                ' ' => esc.push_str("%s"),
+                '%' => esc.push_str("%25"),
+                c if c.is_control() => {}
+                c => esc.push(c),
+            }
+        }
+        esc.push('\'');
+        self.cmd(&format!("input text {esc}"))
+    }
     /// Guest locale sync (spec §3.5): `ru-RU` / `en-US`.
     pub fn set_locale(&mut self, locale: &str) -> Result<(), String> {
         let lang = locale.split('-').next().unwrap_or("en");
@@ -1434,6 +1578,11 @@ impl Drop for AdbShell {
 /// One-shot `input tap` (fallback when no persistent shell attached).
 pub fn send_tap(x: u32, y: u32) -> Result<(), String> {
     adb_run(&["shell", "input", "tap", &x.to_string(), &y.to_string()]).map(|_| ())
+}
+
+/// One-shot `input keyevent` fallback.
+pub fn send_keyevent(code: u32) -> Result<(), String> {
+    adb_run(&["shell", "input", "keyevent", &code.to_string()]).map(|_| ())
 }
 
 /// One-shot `input swipe` fallback.
@@ -1713,6 +1862,672 @@ pub fn grab_frame() -> Result<(Vec<u8>, u32, u32), String> {
 pub fn grab_frame_png() -> Result<(Vec<u8>, u32, u32), String> {
     let b = exec_out_capture(true)?;
     png_to_rgba(&b)
+}
+
+/// Save an RGBA8888 frame to `%USERPROFILE%\Pictures\GorillaLuxe` (or
+/// `%LOCALAPPDATA%\GorillaLuxe\screenshots`) as a 32-bpp BMP file.
+/// Returns the saved path.
+pub fn save_screenshot_bmp(rgba: &[u8], w: u32, h: u32) -> Result<PathBuf, String> {
+    if w == 0 || h == 0 || rgba.len() < (w as usize) * (h as usize) * 4 {
+        return Err("no guest frame available".into());
+    }
+    let dir = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|p| p.join("Pictures").join("GorillaLuxe"))
+        .unwrap_or_else(|| data_dir().join("screenshots"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("GorillaLuxe_{ts}.bmp"));
+    let px_bytes = w * h * 4;
+    let file_size = 54 + px_bytes;
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+    bmp.extend_from_slice(&(w as i32).to_le_bytes());
+    bmp.extend_from_slice(&(-(h as i32)).to_le_bytes()); // top-down
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&px_bytes.to_le_bytes());
+    bmp.extend_from_slice(&2835i32.to_le_bytes());
+    bmp.extend_from_slice(&2835i32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    bmp.extend_from_slice(&0u32.to_le_bytes());
+    for c in rgba[..(w as usize) * (h as usize) * 4].as_chunks::<4>().0 {
+        bmp.extend_from_slice(&[c[2], c[1], c[0], 255]); // BGRA
+    }
+    std::fs::write(&path, &bmp).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// HTTP/2 `h2c` client-streaming connection to
+/// `/android.emulation.control.EmulatorController/streamInputEvent`
+/// on `127.0.0.1:8554` — the SAME input path the emulator's own Qt
+/// window uses. Each `InputEvent` is a small DATA frame written
+/// directly onto the open stream: sub-millisecond dispatch into the
+/// guest's virtio-input devices, no console `event send` quirks, no
+/// `sendevent` permission issues on `ro.build.type=user` images, and
+/// pixel coordinates (no 0..32767 scaling).
+pub struct GrpcInputClient {
+    stream: std::net::TcpStream,
+    /// Last pointer position — a lift reuses it (MouseEvent lifts
+    /// "pointer 0", the coords are informational on release).
+    last: (u32, u32),
+}
+
+fn pb_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(b);
+            return;
+        }
+        buf.push(b | 0x80);
+    }
+}
+
+fn pb_int(buf: &mut Vec<u8>, field: u32, v: i64) {
+    pb_varint(buf, (field as u64) << 3);
+    pb_varint(buf, v as u64); // int32/int64 varint (sign-extended)
+}
+
+fn pb_msg(buf: &mut Vec<u8>, field: u32, inner: &[u8]) {
+    pb_varint(buf, ((field as u64) << 3) | 2);
+    pb_varint(buf, inner.len() as u64);
+    buf.extend_from_slice(inner);
+}
+
+fn pb_str(buf: &mut Vec<u8>, field: u32, s: &str) {
+    pb_msg(buf, field, s.as_bytes());
+}
+
+impl GrpcInputClient {
+    const STREAM_SID: u32 = 1;
+
+    pub fn connect() -> Result<Self, String> {
+        use std::io::Write;
+        let mut stream = std::net::TcpStream::connect("127.0.0.1:8554")
+            .map_err(|e| format!("grpc input 8554: {e}"))?;
+        stream.set_nodelay(true).ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_millis(1500)))
+            .ok();
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .and_then(|_| stream.write_all(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]))
+            .map_err(|e| format!("grpc input preface: {e}"))?;
+
+        const PATH: &[u8] = b"/android.emulation.control.EmulatorController/streamInputEvent";
+        const AUTH: &[u8] = b"127.0.0.1:8554";
+        const CTYPE: &[u8] = b"application/grpc";
+        let mut hpack = Vec::with_capacity(140);
+        hpack.push(0x83);
+        hpack.push(0x86);
+        hpack.push(0x04);
+        hpack.push(PATH.len() as u8);
+        hpack.extend_from_slice(PATH);
+        hpack.push(0x01);
+        hpack.push(AUTH.len() as u8);
+        hpack.extend_from_slice(AUTH);
+        hpack.extend_from_slice(&[0x0f, 0x10]);
+        hpack.push(CTYPE.len() as u8);
+        hpack.extend_from_slice(CTYPE);
+        hpack.extend_from_slice(b"\x00\x02te\x08trailers");
+        let hlen = hpack.len() as u32;
+        let sid = Self::STREAM_SID;
+        let mut req = Vec::with_capacity(9 + hpack.len());
+        req.extend_from_slice(&[(hlen >> 16) as u8, (hlen >> 8) as u8, hlen as u8]);
+        req.push(0x01); // HEADERS
+        req.push(0x04); // END_HEADERS — NO END_STREAM: client-streaming
+        req.extend_from_slice(&sid.to_be_bytes());
+        req.extend_from_slice(&hpack);
+        stream
+            .write_all(&req)
+            .and_then(|_| stream.flush())
+            .map_err(|e| format!("grpc input headers: {e}"))?;
+
+        // The server replies only when the stream closes, but it does
+        // emit SETTINGS / PING / WINDOW_UPDATE that must be drained —
+        // a dedicated thread ACKs control frames and discards the rest
+        // so the recv buffer never fills during long sessions.
+        if let Ok(mut drain) = stream.try_clone() {
+            drain.set_read_timeout(None).ok();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut fh = [0u8; 9];
+                loop {
+                    if drain.read_exact(&mut fh).is_err() {
+                        return;
+                    }
+                    let flen =
+                        ((fh[0] as usize) << 16) | ((fh[1] as usize) << 8) | (fh[2] as usize);
+                    let ftype = fh[3];
+                    let flags = fh[4];
+                    // HEADERS/RST on the input stream carry grpc-status
+                    // trailers — dump them so rejected events are
+                    // diagnosable (INVALID_ARGUMENT reasons etc.).
+                    if ftype == 0x01 || ftype == 0x09 || ftype == 0x03 {
+                        let mut payload = vec![0u8; flen];
+                        if drain.read_exact(&mut payload).is_err() {
+                            return;
+                        }
+                        let mut dump = String::new();
+                        for b in &payload {
+                            if b.is_ascii_graphic() || *b == b' ' {
+                                dump.push(*b as char);
+                            } else {
+                                dump.push_str(&format!("<{b:02x}>"));
+                            }
+                        }
+                        log_line(&format!("grpc input stream ctrl t={ftype} [{dump}]"));
+                        continue;
+                    }
+                    let mut payload = vec![0u8; flen.min(16384)];
+                    let mut left = flen;
+                    while left > 0 {
+                        let chunk = left.min(payload.len());
+                        let n = match drain.read(&mut payload[..chunk]) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        left -= n;
+                    }
+                    match (ftype, flags & 0x01 == 0) {
+                        (0x04, true) => {
+                            let _ = drain
+                                .write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0])
+                                .and_then(|_| drain.flush());
+                        }
+                        (0x06, true) => {
+                            // PING -> ACK echoes the 8-byte opaque
+                            // payload verbatim (RFC 7540 §6.7).
+                            let mut pong = [0u8; 17];
+                            pong[0..5].copy_from_slice(&[0, 0, 8, 6, 1]);
+                            if flen == 8 {
+                                pong[9..17].copy_from_slice(&payload[..8]);
+                            }
+                            let _ = drain.write_all(&pong).and_then(|_| drain.flush());
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+        Ok(GrpcInputClient {
+            stream,
+            last: (0, 0),
+        })
+    }
+
+    /// Serialize `msg` into a gRPC DATA frame on the open input stream.
+    fn send_event(&mut self, msg: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let sid = Self::STREAM_SID;
+        let glen = (5 + msg.len()) as u32;
+        let mut f = Vec::with_capacity(9 + 5 + msg.len());
+        f.extend_from_slice(&[(glen >> 16) as u8, (glen >> 8) as u8, glen as u8]);
+        f.push(0x00); // DATA
+        f.push(0x00); // no END_STREAM — the stream stays open
+        f.extend_from_slice(&sid.to_be_bytes());
+        f.push(0x00); // gRPC: uncompressed
+        f.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        f.extend_from_slice(msg);
+        self.stream
+            .write_all(&f)
+            .and_then(|_| self.stream.flush())
+            .map_err(|e| format!("grpc input write: {e}"))
+    }
+
+    /// MouseEvent → InputEvent.mouse_event (field 3): emulates a
+    /// single-finger capacitive touch. `buttons` bit0 = primary button.
+    /// Scale guest display pixels to the sender's domain. The
+    /// emulator maps incoming Touch.x/y onto the MT ABS axes using
+    /// the DISPLAY size — i.e. it expects plain pixel coordinates
+    /// (verified: 0..32767 input arrives unmapped; pixel input does).
+    fn scale(&self, x: u32, y: u32) -> (u32, u32) {
+        let lcd = guest_lcd();
+        (x.min(lcd.0), y.min(lcd.1))
+    }
+
+    /// TouchEvent → InputEvent.touch_event (field 2): a Protocol-B
+    /// MT contact. `pressure > 0` = down/move, `pressure = 0` = lift.
+    /// (MouseEvent was verified live to emit PRESSURE/TRACKING_ID
+    /// without ABS_MT_POSITION on headless builds — TouchEvent is
+    /// the documented touch path and carries explicit coordinates.)
+    fn touch(&mut self, x: u32, y: u32, pressure: i32) -> Result<(), String> {
+        let (sx, sy) = self.scale(x, y);
+        let mut t = Vec::with_capacity(24);
+        pb_int(&mut t, 1, sx as i64); // x
+        pb_int(&mut t, 2, sy as i64); // y
+        pb_int(&mut t, 3, 1); // identifier
+        pb_int(&mut t, 4, pressure as i64); // pressure
+        pb_int(&mut t, 5, 60); // touch_major
+        let mut te = Vec::with_capacity(t.len() + 4);
+        pb_msg(&mut te, 1, &t); // touches
+        let mut ie = Vec::with_capacity(te.len() + 4);
+        pb_msg(&mut ie, 2, &te); // touch_event
+        self.send_event(&ie)?;
+        self.last = (x, y);
+        Ok(())
+    }
+
+    pub fn mouse(&mut self, x: u32, y: u32, buttons: u32) -> Result<(), String> {
+        self.touch(x, y, if buttons & 1 != 0 { 1024 } else { 0 })
+    }
+
+    pub fn down(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.touch(x, y, 1024)
+    }
+    pub fn mv(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.touch(x, y, 1024)
+    }
+    pub fn up(&mut self) -> Result<(), String> {
+        let (x, y) = self.last;
+        self.touch(x, y, 0)
+    }
+    pub fn tap(&mut self, x: u32, y: u32) -> Result<(), String> {
+        self.touch(x, y, 1024)?;
+        self.touch(x, y, 0)
+    }
+
+    /// WheelEvent → InputEvent.wheel_event (field 6). `dy` uses the
+    /// 120-per-click convention (same units as WM_MOUSEWHEEL delta).
+    pub fn wheel(&mut self, dx: i32, dy: i32) -> Result<(), String> {
+        let mut we = Vec::with_capacity(12);
+        pb_int(&mut we, 1, dx as i64);
+        pb_int(&mut we, 2, dy as i64);
+        let mut ie = Vec::with_capacity(we.len() + 4);
+        pb_msg(&mut ie, 6, &we);
+        self.send_event(&ie)
+    }
+
+    /// KeyboardEvent → InputEvent.key_event (field 1). `key` is a DOM
+    /// key name ("Enter", "GoBack", "ArrowLeft", …); the emulator
+    /// translates it to evdev via the chromium tables.
+    pub fn key(&mut self, dom_key: &str) -> Result<(), String> {
+        let mut ke = Vec::with_capacity(dom_key.len() + 8);
+        pb_int(&mut ke, 2, 2); // eventType = keypress (down+up)
+        pb_str(&mut ke, 4, dom_key);
+        let mut ie = Vec::with_capacity(ke.len() + 4);
+        pb_msg(&mut ie, 1, &ke);
+        self.send_event(&ie)
+    }
+
+    /// KeyboardEvent.text — each printable ASCII char is translated to
+    /// an evdev keypress. Non-ASCII characters are ignored server-side,
+    /// so callers must keep an adb `input text`/clipboard fallback.
+    pub fn text(&mut self, s: &str) -> Result<(), String> {
+        if !s.is_ascii() {
+            return Err("grpc text: non-ascii".into());
+        }
+        let mut ke = Vec::with_capacity(s.len() + 8);
+        pb_str(&mut ke, 5, s);
+        let mut ie = Vec::with_capacity(ke.len() + 4);
+        pb_msg(&mut ie, 1, &ke);
+        self.send_event(&ie)
+    }
+}
+
+/// Direct HTTP/2 `h2c` gRPC client for `127.0.0.1:8554`
+/// `/android.emulation.control.EmulatorController/streamScreenshot`.
+///
+/// Server-push `Image` stream straight from `gfxstream`'s host GPU
+/// `ColorBuffer`: zero `adb.exe` spawns, 0% Android guest CPU. This is
+/// the same RPC Android Studio uses for the embedded device view —
+/// unlike `getScreenshot` (a "wait for next posted frame" long-poll
+/// that pends forever once the Qt window is hidden), opening the
+/// stream registers the client as a display consumer so the engine
+/// keeps posting frames under `-qt-hide-window`.
+pub struct GrpcScreenshotClient {
+    stream: std::net::TcpStream,
+    /// Leftover bytes of the in-flight gRPC message sequence on
+    /// stream 1 — messages may split across DATA frames or share one.
+    msg_buf: Vec<u8>,
+    /// DATA bytes consumed since the last WINDOW_UPDATE on stream 1.
+    credit: u32,
+}
+
+impl GrpcScreenshotClient {
+    const STREAM_SID: u32 = 1;
+
+    pub fn connect() -> Result<Self, String> {
+        use std::io::Write;
+        let mut stream = std::net::TcpStream::connect("127.0.0.1:8554")
+            .map_err(|e| format!("grpc 8554: {e}"))?;
+        stream.set_nodelay(true).ok();
+        // The stream pushes frames only when the guest produces them;
+        // an idle guest means silence — NOT a dead connection. A 5 s
+        // read timeout turns that silence into `Ok(None)` so the pump
+        // can check its own shutdown channel and loop back.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(5000)))
+            .ok();
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_millis(2500)))
+            .ok();
+        // HTTP/2 client preface + SETTINGS(HEADER_TABLE_SIZE=0). A zero
+        // header table forces the server to emit `grpc-status` as a
+        // literal name instead of a dynamic-table index.
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .and_then(|_| stream.write_all(&[0, 0, 6, 4, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]))
+            .and_then(|_| {
+                // Connection-level +1 GiB flow-control credit.
+                stream.write_all(&[0, 0, 4, 8, 0, 0, 0, 0, 0, 0x40, 0, 0, 0])
+            })
+            .map_err(|e| format!("grpc preface: {e}"))?;
+
+        // HPACK headers for POST …/streamScreenshot on stream 1.
+        const PATH: &[u8] = b"/android.emulation.control.EmulatorController/streamScreenshot";
+        const AUTH: &[u8] = b"127.0.0.1:8554";
+        const CTYPE: &[u8] = b"application/grpc";
+        let mut hpack = Vec::with_capacity(140);
+        hpack.push(0x83); // :method: POST
+        hpack.push(0x86); // :scheme: http
+        hpack.push(0x04); // :path
+        hpack.push(PATH.len() as u8);
+        hpack.extend_from_slice(PATH);
+        hpack.push(0x01); // :authority
+        hpack.push(AUTH.len() as u8);
+        hpack.extend_from_slice(AUTH);
+        hpack.extend_from_slice(&[0x0f, 0x10]); // content-type (idx 31)
+        hpack.push(CTYPE.len() as u8);
+        hpack.extend_from_slice(CTYPE);
+        hpack.extend_from_slice(b"\x00\x02te\x08trailers");
+
+        let hlen = hpack.len() as u32;
+        let sid = Self::STREAM_SID;
+        let mut req = Vec::with_capacity(9 + hpack.len() + 9 + 7 + 13);
+        req.extend_from_slice(&[(hlen >> 16) as u8, (hlen >> 8) as u8, hlen as u8]);
+        req.push(0x01); // HEADERS
+        req.push(0x04); // END_HEADERS
+        req.extend_from_slice(&sid.to_be_bytes());
+        req.extend_from_slice(&hpack);
+        // DATA: 5-byte gRPC header + protobuf `ImageFormat { format:
+        // RGBA8888 (1) }`, END_STREAM — request is complete, the
+        // server then streams Images until we disconnect.
+        req.extend_from_slice(&[0, 0, 7, 0x00, 0x01]);
+        req.extend_from_slice(&sid.to_be_bytes());
+        req.extend_from_slice(&[0x00, 0, 0, 0, 2, 0x08, 0x01]);
+        // Stream-level +1 GiB credit — RGBA 1280x720 is ~3.6 MiB per
+        // frame, far above the 64 KiB default stream window.
+        req.extend_from_slice(&[0, 0, 4, 8, 0]);
+        req.extend_from_slice(&sid.to_be_bytes());
+        req.extend_from_slice(&[0x40, 0, 0, 0]);
+        stream
+            .write_all(&req)
+            .and_then(|_| stream.flush())
+            .map_err(|e| format!("grpc streamScreenshot: {e}"))?;
+
+        Ok(GrpcScreenshotClient {
+            stream,
+            msg_buf: Vec::with_capacity(4 * 1024 * 1024),
+            credit: 0,
+        })
+    }
+
+    /// Pop one complete gRPC message (5-byte header + protobuf body)
+    /// from the accumulated stream buffer.
+    fn take_msg(&mut self) -> Option<Vec<u8>> {
+        if self.msg_buf.len() < 5 {
+            return None;
+        }
+        let mlen = u32::from_be_bytes(self.msg_buf[1..5].try_into().unwrap()) as usize;
+        if self.msg_buf.len() < 5 + mlen {
+            return None;
+        }
+        Some(self.msg_buf.drain(..5 + mlen).skip(5).collect())
+    }
+
+    /// Blocks until the server pushes the next `Image` frame.
+    /// `Ok(None)` = read timeout while the guest screen is static —
+    /// the stream stays open and the caller should just call again.
+    pub fn grab_frame(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
+        use std::io::{Read, Write};
+        if let Some(msg) = self.take_msg() {
+            if let Some(f) = parse_grpc_image(&msg) {
+                return Ok(Some(f));
+            }
+        }
+        let sid = Self::STREAM_SID;
+        loop {
+            let mut fh = [0u8; 9];
+            match self.stream.read_exact(&mut fh) {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut
+                        || e.raw_os_error() == Some(10060) =>
+                {
+                    return Ok(None)
+                }
+                r => r.map_err(|e| format!("grpc read hdr: {e}"))?,
+            }
+            let flen = ((fh[0] as usize) << 16) | ((fh[1] as usize) << 8) | (fh[2] as usize);
+            let ftype = fh[3];
+            let flags = fh[4];
+            let rsid = u32::from_be_bytes([fh[5] & 0x7f, fh[6], fh[7], fh[8]]);
+            let mut payload = vec![0u8; flen];
+            if flen > 0 {
+                match self.stream.read_exact(&mut payload) {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                            || e.raw_os_error() == Some(10060) =>
+                    {
+                        return Ok(None)
+                    }
+                    r => r.map_err(|e| format!("grpc read body: {e}"))?,
+                }
+            }
+            match ftype {
+                0x00 => {
+                    // DATA
+                    self.credit = self.credit.saturating_add(flen as u32);
+                    if self.credit >= 8 * 1024 * 1024 {
+                        let mut wu = Vec::with_capacity(26);
+                        wu.extend_from_slice(&[0, 0, 4, 8, 0, 0, 0, 0, 0]);
+                        wu.extend_from_slice(&self.credit.to_be_bytes());
+                        wu.extend_from_slice(&[0, 0, 4, 8, 0]);
+                        wu.extend_from_slice(&sid.to_be_bytes());
+                        wu.extend_from_slice(&self.credit.to_be_bytes());
+                        let _ = self.stream.write_all(&wu);
+                        self.credit = 0;
+                    }
+                    if rsid == sid {
+                        if flags & 0x08 != 0 {
+                            let pad = payload[0] as usize;
+                            if pad < payload.len() {
+                                self.msg_buf
+                                    .extend_from_slice(&payload[1..payload.len() - pad]);
+                            }
+                        } else {
+                            self.msg_buf.extend_from_slice(&payload);
+                        }
+                        if flags & 0x01 != 0 {
+                            return Err("grpc stream END_STREAM".into());
+                        }
+                        while let Some(msg) = self.take_msg() {
+                            if let Some(f) = parse_grpc_image(&msg) {
+                                return Ok(Some(f));
+                            }
+                        }
+                    }
+                }
+                0x01 | 0x09 if rsid == sid => {
+                    // HEADERS / CONTINUATION on our stream. END_STREAM
+                    // here means the server closed the stream — report
+                    // the trailers so the caller can reconnect.
+                    if flags & 0x01 != 0 {
+                        let mut dump = String::new();
+                        for b in &payload {
+                            if b.is_ascii_graphic() || *b == b' ' {
+                                dump.push(*b as char);
+                            } else {
+                                dump.push_str(&format!("<{b:02x}>"));
+                            }
+                        }
+                        return Err(format!("grpc stream closed [{dump}]"));
+                    }
+                }
+                0x04 if flags & 0x01 == 0 => {
+                    // Server SETTINGS -> ACK
+                    let _ = self.stream.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]);
+                }
+                0x06 if flags & 0x01 == 0 && payload.len() == 8 => {
+                    // PING -> ACK
+                    let mut pong = [0u8; 17];
+                    pong[0..5].copy_from_slice(&[0, 0, 8, 6, 1]);
+                    pong[9..17].copy_from_slice(&payload);
+                    let _ = self.stream.write_all(&pong);
+                }
+                0x03 if rsid == sid => return Err("grpc RST_STREAM".into()),
+                0x07 => return Err("grpc GOAWAY".into()),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn read_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    while *pos < b.len() && shift < 64 {
+        let byte = b[*pos];
+        *pos += 1;
+        val |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(val);
+        }
+        shift += 7;
+    }
+    None
+}
+
+/// Parse one protobuf `Image` message (gRPC prefix already stripped).
+/// Returns `None` for the empty "display inactive" marker frames the
+/// stream emits when the guest screen is off (w=0/h=0, no pixels).
+/// Pixel order is RGBA8888 **bottom-up** — rows are flipped to the
+/// top-down layout the DX12 uploader expects.
+fn parse_grpc_image(msg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut pos = 0usize;
+    let mut w = 0u32;
+    let mut h = 0u32;
+    let mut img_slice: Option<&[u8]> = None;
+    while pos < msg.len() {
+        let Some(tag) = read_varint(msg, &mut pos) else {
+            break;
+        };
+        let field = tag >> 3;
+        let wire = tag & 7;
+        match (field, wire) {
+            (1, 2) => {
+                // format: ImageFormat submessage
+                let Some(len) = read_varint(msg, &mut pos) else {
+                    break;
+                };
+                let end = (pos + len as usize).min(msg.len());
+                let mut sp = pos;
+                while sp < end {
+                    let Some(stag) = read_varint(msg, &mut sp) else {
+                        break;
+                    };
+                    match (stag >> 3, stag & 7) {
+                        (3, 0) => {
+                            if let Some(v) = read_varint(msg, &mut sp) {
+                                if w == 0 {
+                                    w = v as u32;
+                                }
+                            }
+                        }
+                        (4, 0) => {
+                            if let Some(v) = read_varint(msg, &mut sp) {
+                                if h == 0 {
+                                    h = v as u32;
+                                }
+                            }
+                        }
+                        (_, 0) => {
+                            let _ = read_varint(msg, &mut sp);
+                        }
+                        (_, 2) => {
+                            if let Some(l) = read_varint(msg, &mut sp) {
+                                sp = (sp + l as usize).min(end);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                pos = end;
+            }
+            (2, 0) => {
+                if let Some(v) = read_varint(msg, &mut pos) {
+                    if v > 0 {
+                        w = v as u32;
+                    }
+                }
+            }
+            (3, 0) => {
+                if let Some(v) = read_varint(msg, &mut pos) {
+                    if v > 0 {
+                        h = v as u32;
+                    }
+                }
+            }
+            (4, 2) => {
+                let Some(len) = read_varint(msg, &mut pos) else {
+                    break;
+                };
+                let end = (pos + len as usize).min(msg.len());
+                img_slice = Some(&msg[pos..end]);
+                pos = end;
+            }
+            (_, 0) => {
+                let _ = read_varint(msg, &mut pos);
+            }
+            (_, 1) => pos = (pos + 8).min(msg.len()),
+            (_, 2) => {
+                if let Some(l) = read_varint(msg, &mut pos) {
+                    pos = (pos + l as usize).min(msg.len());
+                }
+            }
+            (_, 5) => pos = (pos + 4).min(msg.len()),
+            _ => break,
+        }
+    }
+    // Empty Image = "display inactive" marker — not a real frame.
+    let raw = img_slice?;
+    if w == 0 || h == 0 || raw.is_empty() {
+        return None;
+    }
+    let row = w as usize * 4;
+    let expected = row * h as usize;
+    if raw.len() != expected {
+        log_line(&format!(
+            "grpc Image size {} != {expected} ({w}x{h}) — skipping",
+            raw.len()
+        ));
+        return None;
+    }
+    // Bottom-up RGBA → top-down with alpha forced opaque.
+    let mut rgba = vec![0u8; expected];
+    for y in 0..h as usize {
+        let src = &raw[(h as usize - 1 - y) * row..(h as usize - y) * row];
+        rgba[y * row..(y + 1) * row].copy_from_slice(src);
+    }
+    for c in rgba.as_chunks_mut::<4>().0 {
+        c[3] = 255;
+    }
+    if !frame_is_visible(&rgba) {
+        return None;
+    }
+    Some((rgba, w, h))
 }
 
 /// PNG bytes → RGBA via GDI+ (fallback path only).
@@ -2106,7 +2921,6 @@ fn emu_console_cmd(line: &str, reply_budget_ms: u64) -> Result<String, String> {
 pub struct EmuConsole {
     stream: std::net::TcpStream,
     tracking_id: i32,
-    lcd: (u32, u32),
 }
 
 impl EmuConsole {
@@ -2165,14 +2979,20 @@ impl EmuConsole {
         Ok(EmuConsole {
             stream,
             tracking_id: 1,
-            lcd: (1280, 720),
         })
     }
 
     fn scale(&self, x: u32, y: u32) -> (u32, u32) {
+        // Re-read the atomic-cached LCD on every event: the console
+        // often connects while adbd is still OFFLINE — the constructor
+        // then latched the (1280,720) fallback and EVERY later tap
+        // landed ~33% off on a 960x540 guest (verified via getevent:
+        // tap (900,349) arrived as scaled 0x59FF = px 675). Once the
+        // first `wm size` probe succeeds, all events re-scale right.
+        let lcd = guest_lcd();
         (
-            (x.saturating_mul(32767) / self.lcd.0.max(1)).min(32767),
-            (y.saturating_mul(32767) / self.lcd.1.max(1)).min(32767),
+            (x.saturating_mul(32767) / lcd.0.max(1)).min(32767),
+            (y.saturating_mul(32767) / lcd.1.max(1)).min(32767),
         )
     }
 
@@ -2197,6 +3017,25 @@ impl EmuConsole {
             .and_then(|_| self.stream.flush())
             .map_err(|e| e.to_string())?;
         self.drain_replies();
+        Ok(())
+    }
+
+    /// Like `send_cmd` but reads one reply line and reports `KO`
+    /// replies as errors — used by `event text`, which is optional in
+    /// older engines and must fall back to `input text`.
+    fn send_cmd_check(&mut self, cmd: &str) -> Result<(), String> {
+        use std::io::{BufRead, BufReader, Write};
+        self.drain_replies();
+        write!(self.stream, "{cmd}\r\n")
+            .and_then(|_| self.stream.flush())
+            .map_err(|e| e.to_string())?;
+        let mut br = BufReader::new(self.stream.try_clone().map_err(|e| e.to_string())?);
+        let mut l = String::new();
+        let _ = br.read_line(&mut l);
+        let t = l.trim_end();
+        if t.starts_with("KO") {
+            return Err(format!("console: {t}"));
+        }
         Ok(())
     }
 
@@ -2228,8 +3067,23 @@ impl EmuConsole {
 
     pub fn tap(&mut self, x: u32, y: u32) -> Result<(), String> {
         self.down(x, y)?;
-        std::thread::sleep(std::time::Duration::from_millis(30));
         self.up()
+    }
+
+    pub fn key_tap(&mut self, key_name: &str) -> Result<(), String> {
+        self.send_cmd(&format!(
+            "event send EV_KEY:{key_name}:1 EV_SYN:0:0 EV_KEY:{key_name}:0 EV_SYN:0:0"
+        ))
+    }
+
+    pub fn text(&mut self, s: &str) -> Result<(), String> {
+        // `event text` takes the rest of the line verbatim — newlines
+        // or CR would inject extra console commands, so strip them.
+        let clean: String = s.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+        if clean.is_empty() {
+            return Ok(());
+        }
+        self.send_cmd_check(&format!("event text {clean}"))
     }
 
     pub fn swipe(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, ms: u32) -> Result<(), String> {
@@ -2246,11 +3100,38 @@ impl EmuConsole {
     }
 }
 
+/// Android keycode → Linux `input-event-codes` name for the qwerty2
+/// keyboard reachable through console `event send EV_KEY:<name>`.
+/// Only keys that exist on a real keyboard are mapped — Android
+/// system keys (BACK/HOME/APP_SWITCH) go through `input keyevent`.
+pub fn android_to_linux_key(code: u32) -> Option<&'static str> {
+    Some(match code {
+        19 => "KEY_UP",
+        20 => "KEY_DOWN",
+        21 => "KEY_LEFT",
+        22 => "KEY_RIGHT",
+        61 => "KEY_TAB",
+        62 => "KEY_SPACE",
+        66 => "KEY_ENTER",
+        67 => "KEY_BACKSPACE",
+        92 => "KEY_PAGEUP",
+        93 => "KEY_PAGEDOWN",
+        111 => "KEY_ESC",
+        112 => "KEY_DELETE",
+        122 => "KEY_HOME",
+        123 => "KEY_END",
+        124 => "KEY_INSERT",
+        _ => return None,
+    })
+}
+
 /// One-shot sub-ms tap over emulator console `:5554` (safe from
 /// background threads such as `dismiss_anr_dialogs`).
 pub fn console_tap(x: u32, y: u32) -> Result<(), String> {
     let mut c = EmuConsole::connect()?;
-    c.tap(x, y)
+    c.down(x, y)?;
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    c.up()
 }
 
 impl QemuMonitor {
@@ -2321,13 +3202,15 @@ pub fn touch_input_node() -> Result<String, String> {
 
 /// Unified injector ordered by latency and capability:
 ///
-/// * `Console` — `event mouse <x> <y> 0 <buttonstate>` over persistent
-///   emulator console `127.0.0.1:5554` (<0.5 ms, real multi-touch
-///   press/drag/release via `virtio_input_multi_touch_pci_1`, zero
-///   guest process spawn, works on `ro.build.type=user` in `-no-window`).
+/// * `Grpc` — `streamInputEvent` mouse/wheel/key events over gRPC
+///   `:8554` (<0.5 ms, the same path the Qt window uses — works on
+///   `user` builds under `-qt-hide-window`).
+/// * `Console` — `event send` batches over persistent emulator
+///   console `127.0.0.1:5554`.
 /// * `Events` — `sendevent` batches (eng/userdebug images only).
 /// * `Shell` — `input tap`/`input swipe` via persistent `adb shell`.
 pub enum FastInput {
+    Grpc(GrpcInputClient),
     Console(EmuConsole),
     Events {
         node: String,
@@ -2338,8 +3221,20 @@ pub enum FastInput {
 }
 
 /// `wm size` → (w,h); falls back to the spec profile LCD when the
-/// guest is too early in boot to answer.
+/// guest is too early in boot to answer. A successful probe is
+/// cached process-wide — the panel geometry never changes mid-boot,
+/// and `EmuConsole::connect` calls this on EVERY `console_tap` (the
+/// ANR dismisser would otherwise spawn `wm size` every ~4 s).
+/// Packed w<<16|h in an atomic so there is no lock on the hot path.
+/// CLEARED by [`reset_guest_state`] — a relaunch may land on a
+/// different spec profile (e.g. software GPU → 960x540).
+static GUEST_LCD: AtomicU64 = AtomicU64::new(0);
+
 fn guest_lcd() -> (u32, u32) {
+    let packed = GUEST_LCD.load(Ordering::Acquire);
+    if packed != 0 {
+        return ((packed >> 32) as u32, packed as u32);
+    }
     if let Ok(out) = adb_run(&["shell", "wm", "size"]) {
         if let Some((w, h)) = out
             .split_whitespace()
@@ -2348,6 +3243,7 @@ fn guest_lcd() -> (u32, u32) {
         {
             if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
                 if w > 0 && h > 0 {
+                    GUEST_LCD.store(((w as u64) << 32) | h as u64, Ordering::Release);
                     return (w, h);
                 }
             }
@@ -2358,10 +3254,15 @@ fn guest_lcd() -> (u32, u32) {
 
 impl FastInput {
     pub fn connect() -> Result<Self, String> {
+        // Console `event send` is the primary touch path — verified
+        // end-to-end via getevent (full ABS_MT_POSITION/PRESSURE,
+        // sub-ms). gRPC `streamInputEvent` is kept for keys/text/wheel
+        // but its touch path is skin-bound and drops coordinates
+        // under `-qt-hide-window`, so it never wins over the console.
         for attempt in 0..8 {
             match EmuConsole::connect() {
                 Ok(c) => {
-                    log_line("input path: emulator console :5554 (`event mouse` -> virtio-mt)");
+                    log_line("input path: emulator console :5554 (`event send` -> virtio-mt)");
                     return Ok(FastInput::Console(c));
                 }
                 Err(e) => {
@@ -2372,6 +3273,13 @@ impl FastInput {
                     }
                 }
             }
+        }
+        match GrpcInputClient::connect() {
+            Ok(g) => {
+                log_line("input path: gRPC streamInputEvent :8554 (keys/wheel only — touch via skin is dead headless)");
+                return Ok(FastInput::Grpc(g));
+            }
+            Err(e) => log_line(&format!("gRPC input :8554 unavailable: {e}")),
         }
         match touch_input_node() {
             Ok(node) => match adb_run(&["shell", "sendevent", &node, "0", "0", "0"]) {
@@ -2392,27 +3300,49 @@ impl FastInput {
     }
 
     /// Lazily upgrade `Shell` to `Console` if `:5554` came up late.
+    /// (Grpc is NOT an upgrade target: its touch path is dead under
+    /// a hidden window, so `Console`/`Events` always outrank it.)
     fn try_upgrade(&mut self) {
         if matches!(self, FastInput::Shell) {
             if let Ok(c) = EmuConsole::connect() {
-                log_line("input path upgraded to emulator console :5554 (`event mouse`)");
+                log_line("input path upgraded to emulator console :5554");
                 *self = FastInput::Console(c);
             }
         }
     }
 
+    /// gRPC write failure → drop to the next live tier and let the
+    /// call retry through it.
+    fn downgrade(&mut self) {
+        log_line("gRPC input lost — downgrading to console/shell");
+        if let Ok(c) = EmuConsole::connect() {
+            *self = FastInput::Console(c);
+        } else {
+            *self = FastInput::Shell;
+        }
+    }
+
     pub fn is_realtime(&self) -> bool {
-        matches!(self, FastInput::Console(_) | FastInput::Events { .. })
+        matches!(
+            self,
+            FastInput::Grpc(_) | FastInput::Console(_) | FastInput::Events { .. }
+        )
     }
 
     fn ev_line(node: &str, t: u32, c: u32, v: i32) -> String {
         format!("sendevent {node} {t} {c} {v}")
     }
 
-    /// Touch/mouse DOWN at (x,y). `Console` does not need `shell`.
+    /// Touch/mouse DOWN at (x,y). `Grpc` touch is dead under
+    /// `-qt-hide-window` — it immediately downgrades to the console
+    /// tier before dispatching.
     pub fn down(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
         self.try_upgrade();
+        if matches!(self, FastInput::Grpc(_)) {
+            self.downgrade();
+        }
         match self {
+            FastInput::Grpc(_) => unreachable!(),
             FastInput::Console(c) => c.down(x, y),
             FastInput::Shell => shell
                 .ok_or_else(|| "no adb shell".to_string())?
@@ -2441,7 +3371,11 @@ impl FastInput {
     }
 
     pub fn mv(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
+        if matches!(self, FastInput::Grpc(_)) {
+            self.downgrade();
+        }
         match self {
+            FastInput::Grpc(_) => unreachable!(),
             FastInput::Console(c) => c.mv(x, y),
             FastInput::Shell => Err("input path: no incremental move".into()),
             FastInput::Events { node, lcd, .. } => {
@@ -2462,7 +3396,11 @@ impl FastInput {
     }
 
     pub fn up(&mut self, shell: Option<&mut AdbShell>) -> Result<(), String> {
+        if matches!(self, FastInput::Grpc(_)) {
+            self.downgrade();
+        }
         match self {
+            FastInput::Grpc(_) => unreachable!(),
             FastInput::Console(c) => c.up(),
             FastInput::Shell => Ok(()),
             FastInput::Events { node, .. } => shell.ok_or_else(|| "no adb shell".to_string())?.cmd(
@@ -2476,16 +3414,107 @@ impl FastInput {
         }
     }
 
-    pub fn up_at(&mut self, shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
-        if let FastInput::Console(c) = self {
-            return c.up_at(x, y);
-        }
+    pub fn up_at(&mut self, shell: Option<&mut AdbShell>, _x: u32, _y: u32) -> Result<(), String> {
         self.up(shell)
+    }
+
+    /// Hardware-key press identified by an ANDROID keycode. gRPC maps
+    /// common keys to DOM key names (`GoBack`, `Enter`, arrows…);
+    /// console `EV_KEY` handles the same set on the qwerty2 device;
+    /// everything else goes through `input keyevent` (~10 ms).
+    pub fn key_event(&mut self, shell: Option<&mut AdbShell>, code: u32) -> Result<(), String> {
+        if let FastInput::Grpc(g) = self {
+            let dom = match code {
+                3 => "GoHome",
+                4 => "GoBack",
+                19 => "ArrowUp",
+                20 => "ArrowDown",
+                21 => "ArrowLeft",
+                22 => "ArrowRight",
+                26 => "Power",
+                61 => "Tab",
+                62 => " ",
+                66 => "Enter",
+                67 => "Backspace",
+                92 => "PageUp",
+                93 => "PageDown",
+                111 => "Escape",
+                112 => "Delete",
+                122 => "Home",
+                123 => "End",
+                187 => "AppSwitch",
+                _ => "",
+            };
+            if !dom.is_empty() {
+                match g.key(dom) {
+                    Ok(()) => return Ok(()),
+                    Err(_) => self.downgrade(),
+                }
+            }
+        }
+        if let FastInput::Console(c) = self {
+            if let Some(name) = android_to_linux_key(code) {
+                return c.key_tap(name);
+            }
+        }
+        shell
+            .ok_or_else(|| "no adb shell".to_string())?
+            .keyevent(code)
+    }
+
+    /// Type a text string into the guest. gRPC uses KeyboardEvent.text
+    /// (ASCII — sub-ms); console uses `event text`; fallback is the
+    /// persistent shell's `input text`.
+    pub fn text(&mut self, shell: Option<&mut AdbShell>, s: &str) -> Result<(), String> {
+        if s.is_empty() {
+            return Ok(());
+        }
+        if let FastInput::Grpc(g) = self {
+            if s.is_ascii() {
+                match g.text(s) {
+                    Ok(()) => return Ok(()),
+                    Err(_) => self.downgrade(),
+                }
+            }
+        }
+        if let FastInput::Console(c) = self {
+            return c.text(s);
+        }
+        shell.ok_or_else(|| "no adb shell".to_string())?.text(s)
+    }
+
+    /// Mouse wheel — gRPC WheelEvent takes the raw 120-units-per-click
+    /// delta straight from WM_MOUSEWHEEL. Other tiers approximate with
+    /// a swipe at the cursor.
+    pub fn wheel(
+        &mut self,
+        shell: Option<&mut AdbShell>,
+        x: u32,
+        y: u32,
+        delta: i32,
+    ) -> Result<(), String> {
+        if let FastInput::Grpc(g) = self {
+            match g.wheel(0, delta) {
+                Ok(()) => return Ok(()),
+                Err(_) => self.downgrade(),
+            }
+        }
+        // Fallback: three-line scroll ≈ 180 px drag upward/downward.
+        let dir = if delta > 0 { -1 } else { 1 };
+        let dist = (delta.abs() / 40).clamp(60, 420);
+        self.swipe(
+            shell,
+            x as i32,
+            y as i32,
+            x as i32,
+            (y as i32 + dir * dist).max(0),
+            300,
+        )
     }
 
     pub fn swipe(
         &mut self,
-        shell: Option<&mut AdbShell>,
+        mut shell: Option<&mut AdbShell>,
         x1: i32,
         y1: i32,
         x2: i32,
@@ -2493,6 +3522,21 @@ impl FastInput {
         ms: u32,
     ) -> Result<(), String> {
         self.try_upgrade();
+        if matches!(self, FastInput::Grpc(_)) {
+            // Grpc touch is dead headless — downgrade to console, then
+            // drive the swipe through down/mv/up on whatever tier won.
+            self.downgrade();
+            let steps = (ms / 16).clamp(4, 24) as i32;
+            let step_sleep = std::time::Duration::from_millis((ms / steps as u32).max(8) as u64);
+            self.down(shell.as_deref_mut(), x1.max(0) as u32, y1.max(0) as u32)?;
+            for i in 1..=steps {
+                std::thread::sleep(step_sleep);
+                let x = (x1 + (x2 - x1) * i / steps).max(0) as u32;
+                let y = (y1 + (y2 - y1) * i / steps).max(0) as u32;
+                self.mv(shell.as_deref_mut(), x, y)?;
+            }
+            return self.up(shell);
+        }
         if let FastInput::Console(c) = self {
             return c.swipe(x1, y1, x2, y2, ms);
         }
@@ -2501,11 +3545,15 @@ impl FastInput {
             .swipe(x1, y1, x2, y2, ms)
     }
 
-    /// Full tap = down+up. `Console` is ~25 ms end-to-end over TCP;
-    /// `Shell` falls back to `input tap`.
+    /// Full tap = down+up. Console is sub-ms; `Shell` falls back to
+    /// `input tap`.
     pub fn tap(&mut self, mut shell: Option<&mut AdbShell>, x: u32, y: u32) -> Result<(), String> {
         self.try_upgrade();
+        if matches!(self, FastInput::Grpc(_)) {
+            self.downgrade();
+        }
         match self {
+            FastInput::Grpc(_) => unreachable!(),
             FastInput::Console(c) => c.tap(x, y),
             FastInput::Shell => shell.ok_or_else(|| "no adb shell".to_string())?.tap(x, y),
             FastInput::Events { .. } => {

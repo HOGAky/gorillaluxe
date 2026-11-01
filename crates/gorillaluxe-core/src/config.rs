@@ -23,10 +23,10 @@ impl Default for Config {
         Config {
             lang: Lang::En,
             ci_software_gpu: false,
-            cas_sharpness: 0.5,
-            res_w: 1920,
-            res_h: 1080,
-            fps_cap: 120,
+            cas_sharpness: 0.25,
+            res_w: 1280,
+            res_h: 720,
+            fps_cap: 60,
         }
     }
 }
@@ -59,7 +59,7 @@ pub fn is_low_spec(host_ram_mb: u64) -> bool {
 pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
     if is_low_spec(host_ram_mb) {
         SpecProfile {
-            guest_mem_mb: 1024,
+            guest_mem_mb: 1536,
             guest_cores: 2,
             lcd_w: 960,
             lcd_h: 540,
@@ -68,7 +68,7 @@ pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
         }
     } else if host_ram_mb > 0 && host_ram_mb <= 8_704 {
         SpecProfile {
-            guest_mem_mb: 2560,
+            guest_mem_mb: 2816,
             guest_cores: 4,
             lcd_w: 1280,
             lcd_h: 720,
@@ -77,12 +77,12 @@ pub fn spec_profile(host_ram_mb: u64) -> SpecProfile {
         }
     } else {
         SpecProfile {
-            guest_mem_mb: 3072,
+            guest_mem_mb: 4096,
             guest_cores: 4,
             lcd_w: 1280,
             lcd_h: 720,
             lcd_dpi: 240,
-            fps_cap: 60,
+            fps_cap: 120,
         }
     }
 }
@@ -231,7 +231,8 @@ mod tests {
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.lang, Lang::En);
-        assert!((c.cas_sharpness - 0.5).abs() < f32::EPSILON);
+        assert!((c.cas_sharpness - 0.25).abs() < f32::EPSILON);
+        assert_eq!((c.res_w, c.res_h), (1280, 720));
     }
 
     #[test]
@@ -240,7 +241,7 @@ mod tests {
         std::fs::write(&p, b"\x00\x01\x02garbage\xFF\xFE===\nlang=zz\nres=-1x0\n").unwrap();
         let c = Config::load_from(&p);
         // Bad values rejected → defaults (lang falls back to OS detect).
-        assert!((320..=8192).contains(&c.res_w) && c.res_w == 1920);
+        assert!((320..=8192).contains(&c.res_w) && c.res_w == 1280);
         assert!(c.fps_cap >= 30);
         let _ = std::fs::remove_file(&p);
     }

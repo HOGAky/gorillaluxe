@@ -64,6 +64,10 @@ pub enum RegionId {
     DockShot,
     DockLog,
     DockLang,
+    /// Android Back (keycode 4) — left-pointing triangle glyph.
+    DockBack,
+    /// Android Home (keycode 3) — house glyph.
+    DockHome,
     /// Inert click-catcher for the open LOG panel body.
     LogPanel,
     CasSlider,
@@ -303,7 +307,7 @@ fn vk_label(vk: u16) -> String {
     }
 }
 
-const DOCK_BTNS: usize = 6;
+const DOCK_BTNS: usize = 8;
 
 /// Dock slot metrics shared by drawing + region emission.
 fn dock_layout(sw: f32, sh: f32) -> (f32, f32, f32) {
@@ -343,6 +347,8 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         RegionId::DockShot,
         RegionId::DockLog,
         RegionId::DockLang,
+        RegionId::DockBack,
+        RegionId::DockHome,
     ];
     let labels = [
         "F1",
@@ -351,6 +357,8 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         "SCR",
         tr(lang, "ui.dock.log"),
         if lang == Lang::Ru { "RU" } else { "EN" },
+        "",
+        "",
     ];
     for (i, (id, label)) in ids.iter().zip(labels.iter()).enumerate() {
         let r = slot_rect(dock_x, dock_y, i);
@@ -373,22 +381,59 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
             R_FRAME,
         ));
         rg.push(Region { id: *id, r });
-        centered_text(
-            atlas,
-            label,
-            FONT_HUD,
-            r[0] + r[2] / 2.0,
-            r[1] + (r[3] - FONT_HUD as f32) / 2.0,
-            if accent_slot {
-                BG_PRIMARY
-            } else {
-                TEXT_PRIMARY
-            },
-            &mut v,
-        );
+        let fg = if accent_slot {
+            BG_PRIMARY
+        } else {
+            TEXT_PRIMARY
+        };
+        match id {
+            // Android-style glyph icons — the atlas only packs text,
+            // so the back triangle and home house are drawn as rects.
+            RegionId::DockBack => {
+                // ◄ vertical base at right, apex pointing left.
+                let cx = r[0] + r[2] / 2.0;
+                let cy = r[1] + r[3] / 2.0;
+                for (row, w) in [4.0f32, 8.0, 13.0, 8.0, 4.0].into_iter().enumerate() {
+                    let x = cx + 6.0 - w;
+                    v.push(Instance::rect(
+                        [x, cy - 5.0 + row as f32 * 2.5],
+                        [w, 2.0],
+                        fg,
+                        0.0,
+                    ));
+                }
+            }
+            RegionId::DockHome => {
+                // ⌂ roof pyramid + square body.
+                let cx = r[0] + r[2] / 2.0;
+                let cy = r[1] + r[3] / 2.0;
+                for (row, w) in [4.0f32, 9.0, 14.0].into_iter().enumerate() {
+                    v.push(Instance::rect(
+                        [cx - w / 2.0, cy - 7.0 + row as f32 * 3.0],
+                        [w, 2.5],
+                        fg,
+                        0.0,
+                    ));
+                }
+                v.push(Instance::rect([cx - 5.5, cy + 2.0], [11.0, 6.0], fg, 0.0));
+            }
+            _ => {
+                centered_text(
+                    atlas,
+                    label,
+                    FONT_HUD,
+                    r[0] + r[2] / 2.0,
+                    r[1] + (r[3] - FONT_HUD as f32) / 2.0,
+                    fg,
+                    &mut v,
+                );
+            }
+        }
     }
 
     // ---- Zone B: HUD performance pill --------------------------------------
+    // Anchored bottom-left: a top-left pill covered the browser
+    // address bar / app toolbars in the guest (production feedback).
     if st.hud_visible {
         let mut hud_text = format!(
             "{} FPS | {:.1} ms | {}",
@@ -399,8 +444,9 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         }
         let tw = text_width(atlas, &hud_text, FONT_HUD);
         let pill_w = tw + PAD_FRAME_X * 2.0;
+        let pill_y = sh - 16.0 - HUD_HEIGHT;
         v.push(Instance::rect(
-            [16.0, 16.0],
+            [16.0, pill_y],
             [pill_w, HUD_HEIGHT],
             BG_PRIMARY,
             R_PILL,
@@ -410,7 +456,7 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
             &hud_text,
             FONT_HUD,
             16.0 + PAD_FRAME_X,
-            16.0 + (HUD_HEIGHT - FONT_HUD as f32) / 2.0,
+            pill_y + (HUD_HEIGHT - FONT_HUD as f32) / 2.0,
             if stats.fps >= 100 {
                 STATUS_OK
             } else {
@@ -421,9 +467,9 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         // Real engine status pill (replaces the MVP phase-2 placeholder).
         let status = st.status.as_str();
         let stw = text_width(atlas, status, FONT_HUD);
-        let sty = 16.0 + HUD_HEIGHT + ITEM_SPACING;
+        let sty = pill_y - ITEM_SPACING - (FONT_HUD as f32 + 8.0);
         v.push(Instance::rect(
-            [16.0, sty - 2.0],
+            [16.0, sty],
             [stw + PAD_FRAME_X * 2.0, FONT_HUD as f32 + 8.0],
             BG_SURFACE,
             R_FRAME,
@@ -433,7 +479,7 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
             status,
             FONT_HUD,
             16.0 + PAD_FRAME_X,
-            sty,
+            sty + 2.0,
             TEXT_MUTED,
             &mut v,
         );
@@ -442,14 +488,22 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         if matches!(st.onboard, Onboard::Running) && !st.booted {
             let bt = tr(lang, "ui.onboard.booting");
             let bw = text_width(atlas, bt, FONT_HUD);
-            let by = sty + FONT_HUD as f32 + 8.0 + ITEM_SPACING;
+            let by = sty - ITEM_SPACING - (FONT_HUD as f32 + 8.0);
             v.push(Instance::rect(
-                [16.0, by - 2.0],
+                [16.0, by],
                 [bw + PAD_FRAME_X * 2.0, FONT_HUD as f32 + 8.0],
                 BG_SURFACE,
                 R_FRAME,
             ));
-            layout_text(atlas, bt, FONT_HUD, 16.0 + PAD_FRAME_X, by, ACCENT, &mut v);
+            layout_text(
+                atlas,
+                bt,
+                FONT_HUD,
+                16.0 + PAD_FRAME_X,
+                by + 2.0,
+                ACCENT,
+                &mut v,
+            );
         }
     }
 
@@ -565,7 +619,13 @@ pub fn build_frame(sw: f32, sh: f32, st: &UiState, atlas: &FontAtlas, stats: &Hu
         let pw = (sw * 0.62).min(760.0);
         let ph = (lines.len() as f32 * row_h + 56.0).min(sh * 0.8);
         let px = 16.0;
-        let py = sh - ph - 16.0;
+        // Clear of the bottom-left HUD pills when they are visible.
+        let hud_clear = if st.hud_visible {
+            HUD_HEIGHT + FONT_HUD as f32 + 8.0 + ITEM_SPACING * 2.0 + 16.0
+        } else {
+            16.0
+        };
+        let py = sh - ph - hud_clear;
         v.push(Instance::rect(
             [px, py],
             [pw, ph],
