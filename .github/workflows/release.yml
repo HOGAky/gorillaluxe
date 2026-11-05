@@ -63,7 +63,7 @@ jobs:
           Write-Host ("Zip size: {0:N1} MB" -f ((Get-Item GorillaLuxe-Win64.zip).Length / 1MB))
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: GorillaLuxe-Win64.zip
           generate_release_notes: true
