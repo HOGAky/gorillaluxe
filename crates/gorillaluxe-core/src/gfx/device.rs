@@ -21,6 +21,39 @@ struct CmdPair {
     in_use: bool,
 }
 
+/// Enumerate every DXGI adapter the compositor could bind —
+/// `(name, dedicated_vram_mb, is_software)`. Perf forensics needs the
+/// full list (hybrid laptops: prove the dGPU exists before blaming a
+/// wrong-adapter pick), and the chosen adapter is reported separately
+/// via `Dx12::adapter_name`.
+pub fn enumerate_adapters() -> Vec<(String, u64, bool)> {
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..32u32 {
+            let Ok(adapter) = factory.EnumAdapters1(i) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            out.push((
+                String::from_utf16_lossy(&desc.Description[..end]),
+                desc.DedicatedVideoMemory as u64 / (1024 * 1024),
+                (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0,
+            ));
+        }
+        out
+    }
+}
+
 pub struct Dx12 {
     pub factory: IDXGIFactory6,
     pub device: ID3D12Device,
@@ -127,6 +160,7 @@ impl Dx12 {
                     .unwrap_or(desc.Description.len());
                 String::from_utf16_lossy(&desc.Description[..end])
             };
+            crate::system::perf_debug::set_host_adapter(&adapter_name);
 
             let queue = device
                 .CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {

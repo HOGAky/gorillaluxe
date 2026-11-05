@@ -804,6 +804,22 @@ pub fn gpu_chain(force_swiftshader: bool) -> Vec<&'static str> {
     if force_swiftshader {
         return vec!["swiftshader"];
     }
+    // Crash records written BEFORE guest Vulkan was disabled
+    // (`-feature -Vulkan`) no longer prove instability — the Intel
+    // APPCRASH module `igxelpicd64.dll` is the vendor *Vulkan* ICD,
+    // and the guest Vulkan path is exactly what we turned off. Give
+    // hardware GLES (`host`/`auto`) one fresh probation: if the
+    // driver still kills qemu the mode re-records and demotes on
+    // the very next launch. Versioned marker so this runs once.
+    let probation = data_dir().join(".glx_gpu_probation_v2");
+    if !probation.exists() {
+        let crash_file = data_dir().join("gpu_crashes.txt");
+        if crash_file.exists() {
+            let _ = std::fs::remove_file(&crash_file);
+            log_line("gpu crash history reset — retesting hardware GLES under -feature -Vulkan");
+        }
+        let _ = std::fs::write(&probation, b"post -Vulkan hw-gpu probation\n");
+    }
     let base = ["host", "auto", "swangle", "swiftshader"];
     // `auto` resolves to the SAME native-GL path whenever the host
     // driver is healthy enough to pass the compat check — so a `host`
@@ -1173,6 +1189,7 @@ pub fn start_liveness_poller() {
         let mut misses = 0u32;
         let mut woke = false;
         let mut calmed_store = false;
+        let mut gles_probed = false;
         let mut anr_tick = 0u32;
         let mut anr_ticks = 6u32;
         let mut anr_streak = 0u32;
@@ -1274,6 +1291,14 @@ pub fn start_liveness_poller() {
                         "shell",
                         "am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1",
                     ]);
+                    // Perf forensics: which GL renderer did the guest
+                    // actually bind? SwiftShader here = every frame is
+                    // CPU-rasterised — the "unplayably slow" smoking
+                    // gun, logged to perf_debug.log.
+                    if !gles_probed {
+                        super::perf_debug::probe_guest_renderer();
+                        gles_probed = true;
+                    }
                 }
                 // Focus watchdog — ANR storms can re-wedge focus later
                 // (SystemUI restarts re-create empty-focus states).
@@ -1553,6 +1578,8 @@ pub fn launch_resilient(
     wait_avd_drained();
     purge_stale_locks(&avd_home().join("GorillaLuxe.avd"));
     let chain = gpu_chain(force_swiftshader);
+    super::perf_debug::log_host_environment(spec);
+    super::perf_debug::log_launch(&chain, accel);
     let mut last = String::new();
     for (i, gpu) in chain.iter().enumerate() {
         // A still-dying previous attempt holds the AVD lock — the next
@@ -1587,6 +1614,10 @@ pub fn launch_resilient(
                 "emulator stable on -gpu {gpu} (attempt {})",
                 i + 1
             ));
+            // The engine survived the watch window — prove which
+            // accelerator ACTUALLY engaged (WHPX vs silent TCG under
+            // `accel=auto`) by scanning emulator.log.
+            super::perf_debug::verify_accel_engaged(accel);
             set_stage(stage::WAIT_ADBD);
             return Ok(EmulatorHandle::Owned(emu));
         }
@@ -1608,7 +1639,7 @@ fn adb() -> std::ffi::OsString {
     adb_exe().into_os_string()
 }
 
-fn adb_run(args: &[&str]) -> Result<String, String> {
+pub(crate) fn adb_run(args: &[&str]) -> Result<String, String> {
     let out = super::silent_cmd(adb())
         .args(args)
         .output()

@@ -278,7 +278,7 @@ pub fn run(allow_software: bool) -> Result<Report, String> {
     let stats_h = HudStats {
         fps: 240,
         frame_ms: 4.2,
-        backend: "DX12 Zero-Copy | WARP",
+        backend: "DX12 Zero-Copy | WARP".to_string(),
     };
     let mut ui_state = UiState::default();
     let instances = build_frame(DW as f32, DH as f32, &ui_state, &atlas, &stats_h).instances;

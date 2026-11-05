@@ -10,6 +10,7 @@ pub mod downloader;
 pub mod env_doctor;
 pub mod logger;
 pub mod manifest;
+pub mod perf_debug;
 pub mod selftest;
 pub mod sensors;
 pub mod shm_publisher;

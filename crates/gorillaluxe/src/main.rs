@@ -301,6 +301,11 @@ fn start_android(a: &mut App) {
                     // of engine spawn, well before adbd).
                     let mut grpc: Option<android_runtime::GrpcScreenshotClient> = None;
                     let mut grpc_next_try = std::time::Instant::now();
+                    // Perf forensics: delivered-fps + capture-latency
+                    // rollups land in perf_debug.log every ~10 s.
+                    let mut delivered = 0u32;
+                    let mut stats_tick = std::time::Instant::now();
+                    let mut perf_tick = std::time::Instant::now();
                     loop {
                         if grpc.is_none() && std::time::Instant::now() >= grpc_next_try {
                             match android_runtime::GrpcScreenshotClient::connect() {
@@ -343,6 +348,9 @@ fn start_android(a: &mut App) {
                             }
                             was_booted = booted;
                         }
+                        // Perf forensics: capture-mode + wall latency
+                        // of every grab feeds perf_debug.log + the HUD.
+                        let cap_start = std::time::Instant::now();
                         let r = if let Some(g) = grpc.as_mut() {
                             match g.grab_frame() {
                                 Ok(Some(f)) => Ok(f),
@@ -368,6 +376,27 @@ fn start_android(a: &mut App) {
                         };
                         match r {
                             Ok((px, w, h)) => {
+                                let cap_us = cap_start.elapsed().as_micros() as u64;
+                                let mode = if grpc.is_some() {
+                                    1
+                                } else if png {
+                                    3
+                                } else {
+                                    2
+                                };
+                                gorillaluxe_core::system::perf_debug::note_capture(cap_us, mode);
+                                delivered += 1;
+                                if stats_tick.elapsed().as_secs() >= 1 {
+                                    gorillaluxe_core::system::perf_debug::note_delivered_fps(
+                                        delivered,
+                                    );
+                                    delivered = 0;
+                                    stats_tick = std::time::Instant::now();
+                                    if perf_tick.elapsed().as_secs() >= 10 {
+                                        gorillaluxe_core::system::perf_debug::log_frame_stats();
+                                        perf_tick = std::time::Instant::now();
+                                    }
+                                }
                                 fails = 0;
                                 streak = 0;
                                 png = false;
@@ -911,6 +940,11 @@ fn engine_status(whpx_ok: bool, onboard: &Onboard) -> String {
         "GorillaLuxe Engine | WHPX: {} | Android 13: {a13}",
         if whpx_ok { "Ready" } else { "Off" }
     );
+    // TCG = software CPU interpretation — never silent. The user must
+    // SEE "no hardware accel" instead of wondering why it's 2 FPS.
+    if gorillaluxe_core::system::perf_debug::accel_is_tcg() {
+        s.push_str(" | NO HW ACCEL (TCG)");
+    }
     if matches!(onboard, Onboard::Running) {
         let n = android_runtime::FRAME_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         if n == 0 {
@@ -1338,11 +1372,9 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 let stats = HudStats {
                     fps,
                     frame_ms: if fps > 0 { 1000.0 / fps as f32 } else { 0.0 },
-                    backend: if dx.is_warp {
-                        "DX12 Zero-Copy | WARP"
-                    } else {
-                        "DX12 Zero-Copy"
-                    },
+                    // Live pipeline view: adapter | capture mode+ms |
+                    // accel engine | guest GL renderer (perf_debug).
+                    backend: gorillaluxe_core::system::perf_debug::hud_backend(dx.is_warp),
                 };
                 let frame: Frame = {
                     let a = app().lock().unwrap();

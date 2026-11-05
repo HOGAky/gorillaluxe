@@ -82,12 +82,13 @@ pub enum RegionId {
     OnboardClose,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HudStats {
     pub fps: u32,
     pub frame_ms: f32,
-    /// e.g. "DX12 Zero-Copy | WARP"
-    pub backend: &'static str,
+    /// e.g. "DX12|Intel UHD|grpc 1.4ms|WHPX|GLES:host" — assembled by
+    /// `perf_debug::hud_backend` from live capture/accel/renderer state.
+    pub backend: String,
 }
 
 impl Default for HudStats {
@@ -95,7 +96,7 @@ impl Default for HudStats {
         HudStats {
             fps: 0,
             frame_ms: 0.0,
-            backend: "DX12",
+            backend: "DX12".to_string(),
         }
     }
 }
