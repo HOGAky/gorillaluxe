@@ -119,7 +119,7 @@ jobs:
           if ($size -gt 35) { Write-Error "artifact exceeds 35 MB budget"; exit 1 }
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GorillaLuxe-Win64
           path: GorillaLuxe-Win64.zip
