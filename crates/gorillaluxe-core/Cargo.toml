@@ -6,7 +6,7 @@ description = "GorillaLuxe core: WHPX VMM, DX12 compositor, i18n (RU/EN)"
 
 [dependencies]
 windows = { workspace = true }
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 # native-tls → Windows Schannel: OS root CAs + proxy support, no
 # vendored crypto (ring needs a C toolchain we deliberately avoid).
 # The direct native-tls dep lets us attach the connector to the ureq
