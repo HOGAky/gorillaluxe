@@ -23,6 +23,7 @@ fn main() {
 }
 
 fn real_main() -> i32 {
+    gorillaluxe_core::system::crash_guard::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let mut cfg = Config::load();

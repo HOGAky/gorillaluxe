@@ -5,6 +5,7 @@
 
 pub mod android_runtime;
 pub mod cpu_pinning;
+pub mod crash_guard;
 pub mod device_profile;
 pub mod downloader;
 pub mod env_doctor;

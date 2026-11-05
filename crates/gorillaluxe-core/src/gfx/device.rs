@@ -202,7 +202,7 @@ impl Dx12 {
     /// so the frame hot path does not mint fresh WDDM objects per call.
     pub fn cmd(&self) -> GResult<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
         unsafe {
-            let mut slot = self.cmd_pair.lock().unwrap();
+            let mut slot = self.cmd_pair.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = slot.as_mut() {
                 if !p.in_use {
                     // Defensive Close: a list abandoned mid-record by an
@@ -261,7 +261,7 @@ impl Dx12 {
             }
             // GPU drained — the cached pair becomes reusable by `cmd()`
             // when this list is the one it handed out.
-            let mut slot = self.cmd_pair.lock().unwrap();
+            let mut slot = self.cmd_pair.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = slot.as_mut() {
                 if p.list.as_raw() == list.as_raw() {
                     p.in_use = false;

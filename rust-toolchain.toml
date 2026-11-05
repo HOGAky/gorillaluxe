@@ -1,0 +1,6 @@
+# Pinned toolchain (TZ 0: reproducible builds). `cargo`/`rustup` pick
+# this automatically; CI installs the same channel via rust-toolchain.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

@@ -1,0 +1,33 @@
+# GorillaLuxe runtime lock — the ONLY artifact set the app downloads.
+#
+# Embedded at compile time (`include_str!`) and consulted BEFORE any
+# live manifest resolution: Google's `repository2-1.xml` ships new
+# "latest" emulator builds on its own schedule, and the code in
+# `system/android_runtime.rs` is verified against the pinned set
+# (emulator 37.x / Android 13 x86_64 `google_apis_playstore` r09).
+# Bumping = edit this file, update `KNOWN_GOOD_PACKAGES` in
+# `system/manifest.rs`, re-verify sha1/sha256 + smoke-test a boot.
+#
+# sha1 values are the archive digests published in Google's manifests
+# (verified by `downloader::verify_checksum` after every download).
+
+schema = 1
+
+[platform-tools]
+package_path = "platform-tools"
+url = "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip"
+size = 8044989
+sha1 = "e03e78b1d80b396f1c3358e31251cb31740e1110"
+
+[emulator]
+package_path = "emulator"
+url = "https://dl.google.com/android/repository/emulator-windows_x64-16696583.zip"
+size = 460366285
+sha1 = "a77fc745377fc3224255706fd8b77a5066756047"
+
+[system-image]
+package_path = "system-images;android-33;google_apis_playstore;x86_64"
+url = "https://dl.google.com/android/repository/sys-img/google_apis_playstore/x86_64-33_r09.zip"
+size = 1670173438
+sha1 = "2ce85ed6dcabd321442059c1267cc5376e22e046"
+api_level = 33

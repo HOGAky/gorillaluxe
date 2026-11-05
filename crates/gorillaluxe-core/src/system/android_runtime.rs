@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::PCWSTR;
@@ -216,12 +216,73 @@ fn resolve_live() -> Result<[manifest::Artifact; 3], String> {
     Ok([tools, emu, img])
 }
 
+/// Pinned runtime triple from the repo-root `runtime.lock.toml`
+/// (embedded at compile time — it cannot drift at the user's end).
+/// TZ 5.1: never download an uncontrolled "latest" — the pinned set
+/// is resolved FIRST; live manifest data only fills in when the lock
+/// cannot be parsed (a development/mismatch case worth logging).
+fn locked_packages() -> Option<[manifest::Artifact; 3]> {
+    const LOCK: &str = include_str!("../../../../runtime.lock.toml");
+    let pick = |section: &str| -> Option<manifest::Artifact> {
+        let mut in_section = false;
+        let mut package_path = None;
+        let mut url = None;
+        let mut size = 0u64;
+        let mut sha1 = String::new();
+        let mut api_level = 0u32;
+        for line in LOCK.lines() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                in_section = l == format!("[{section}]");
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let Some((k, v)) = l.split_once('=') else {
+                continue;
+            };
+            let v = v.trim().trim_matches('"');
+            match k.trim() {
+                "package_path" => package_path = Some(v.to_string()),
+                "url" => url = Some(v.to_string()),
+                "size" => size = v.parse().unwrap_or(0),
+                "sha1" => sha1 = v.to_string(),
+                "api_level" => api_level = v.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        let url = url?;
+        let file = url.rsplit('/').next()?.to_string();
+        Some(manifest::Artifact {
+            package_path: package_path?,
+            host_os: "windows".into(),
+            url: file,
+            absolute_url: url,
+            size,
+            api_level,
+            sha256: String::new(),
+            sha1,
+        })
+    };
+    Some([
+        pick("platform-tools")?,
+        pick("emulator")?,
+        pick("system-image")?,
+    ])
+}
+
 /// Resolve the three download URLs needed for the runtime.
 /// `Ok` = `(platform-tools, emulator, system-image)` in download order.
-/// Live resolution is preferred; on ANY failure the compile-time
-/// `KNOWN_GOOD_PACKAGES` (CI-verified URLs) take over so the download
-/// always has concrete targets.
+/// Order (TZ 5.1): the compile-time `runtime.lock.toml` pin wins; the
+/// live manifest is a fallback for development drift; the baked-in
+/// `KNOWN_GOOD_PACKAGES` are the last-resort offline set.
 pub fn resolve_runtime_urls() -> Result<[manifest::Artifact; 3], String> {
+    if let Some(t) = locked_packages() {
+        log_line("runtime artifacts pinned by runtime.lock.toml");
+        return Ok(t);
+    }
+    log_line("runtime.lock.toml unparsable — resolving live manifest");
     match resolve_live() {
         Ok(t) => Ok(t),
         Err(e) => {
@@ -351,8 +412,10 @@ impl EmulatorProc {
     ///  2) `kill` via console :5554 (NOT `adb shell reboot -p` — guest
     ///     poweroff triggers `Snapshotter` to log `Deleting snapshot
     ///     default_boot` and forces a cold boot on the next launch!);
-    ///  3) monitor `quit` — clean qemu exit fallback;
+    ///  3) a second console `kill` after a grace period;
     ///  4) kill + Job close — last resort, never left orphaned.
+    ///     (The `:4444` QEMU HMP monitor was removed entirely — an
+    ///     unauthenticated TCP control port, TZ P2 security gate.)
     pub fn shutdown(&mut self) {
         log_line("emulator shutdown: saving QuickBoot snapshot");
         match emu_console_cmd("avd snapshot save default_boot", 60_000) {
@@ -370,12 +433,10 @@ impl EmulatorProc {
         if self.wait_exit(35_000) {
             log_line("emulator exited cleanly (console kill)");
         } else {
-            log_line("emulator still up after console kill — monitor quit");
-            if let Ok(mut m) = QemuMonitor::connect() {
-                let _ = m.quit();
-            }
-            if self.wait_exit(25_000) {
-                log_line("emulator exited cleanly (monitor quit)");
+            log_line("emulator still up after console kill — retry once, then hard kill");
+            let _ = emu_console_cmd("kill", 5_000);
+            if self.wait_exit(15_000) {
+                log_line("emulator exited on second console kill");
             } else {
                 log_line("emulator did not exit — hard kill");
             }
@@ -659,14 +720,15 @@ fn emulator_args(gpu: &str, accel: &str, spec: &crate::config::SpecProfile) -> V
         "-feature".into(),
         "-Vulkan".into(),
         "-verbose".into(),
-        // Everything after `-qemu` passes through to qemu-system.
-        // The human monitor on 127.0.0.1:4444 is the injection path
-        // for `mouse_move`/`mouse_button`/`sendkey` (works in
-        // -no-window where console `event send` is dropped) and the
-        // graceful `quit` that saves the QuickBoot snapshot.
-        "-qemu".into(),
-        "-monitor".into(),
-        format!("tcp:127.0.0.1:{},server,nowait", QemuMonitor::PORT),
+        // gRPC token auth — the server then requires
+        // `authorization: Bearer <console_auth_token>` on every call
+        // (verified in `-help`: `-grpc-use-token` uses the emulator
+        // console token). Without it ANY local process could inject
+        // events and pull screenshots (spec P2: zero unauthenticated
+        // local ports). QEMU's `-monitor` HMP was removed for the
+        // same reason — shutdown goes through console `kill`, which
+        // already requires the auth token.
+        "-grpc-use-token".into(),
     ]
 }
 
@@ -975,6 +1037,35 @@ impl EmulatorHandle {
 
 /// `true` when adb already sees a live emulator (e.g. a previous
 /// `emulator.exe` still booted under `Temp\avd\running\pid_*.ini`).
+/// PID listening on `127.0.0.1:<port>` per `netstat -ano -p tcp`
+/// (`None` = port closed or table unparsable). Used to prove an
+/// adb-detected emulator is OURS before adopting it (TZ P2: port
+/// ownership verification, no new OS privilege needed).
+fn tcp_port_owner(port: u16) -> Option<u32> {
+    let out = super::silent_cmd("netstat.exe")
+        .args(["-ano", "-p", "tcp", "-n"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let needle = format!("127.0.0.1:{port}");
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        // TCP  127.0.0.1:5554  0.0.0.0:0  LISTENING  1234
+        if it.next() != Some("TCP") {
+            continue;
+        }
+        if it.next() != Some(needle.as_str()) {
+            continue;
+        }
+        let _ = it.next();
+        if it.next() != Some("LISTENING") {
+            continue;
+        }
+        return it.next().and_then(|p| p.parse().ok());
+    }
+    None
+}
+
 fn adb_device_present() -> bool {
     adb_run(&["devices"])
         .map(|d| {
@@ -1540,11 +1631,36 @@ pub fn launch_resilient(
     start_liveness_poller();
     set_stage(stage::SPAWN_EMULATOR);
     if adb_device_present() {
-        log_line("live emulator detected — attaching (no respawn)");
-        set_stage(stage::WAIT_ADBD);
-        return Ok(EmulatorHandle::Attached {
-            since: Instant::now(),
-        });
+        // TZ P2: before adopting, prove the adb/gRPC ports belong to
+        // OUR emulator (`pid_*.ini` inside our avd_home). adb exposes
+        // no auth — a foreign `emulator-*` (or any app squatting on
+        // :5554) must never become our control endpoint.
+        match tcp_port_owner(5554) {
+            Some(pid) if our_avd_live_pids().iter().any(|(p, _)| *p == pid) => {
+                log_line(&format!(
+                    "live emulator detected (ours, pid {pid}) — attaching (no respawn)"
+                ));
+                set_stage(stage::WAIT_ADBD);
+                return Ok(EmulatorHandle::Attached {
+                    since: Instant::now(),
+                });
+            }
+            Some(pid) => {
+                log_line(&format!(
+                    "SECURITY: :5554 is owned by foreign pid {pid} — refusing blind attach; \
+                     another emulator holds the adb/console ports"
+                ));
+            }
+            None => {
+                // Owner table unavailable (restricted netstat) — fall
+                // back to the pre-check behavior, still logging it.
+                log_line("live emulator detected — attaching (port owner unverifiable)");
+                set_stage(stage::WAIT_ADBD);
+                return Ok(EmulatorHandle::Attached {
+                    since: Instant::now(),
+                });
+            }
+        }
     }
     let ours = our_avd_live_pids();
     if ours.iter().any(|(_, age)| *age < BOOT_GRACE_S) {
@@ -2101,6 +2217,23 @@ fn pb_str(buf: &mut Vec<u8>, field: u32, s: &str) {
     pb_msg(buf, field, s.as_bytes());
 }
 
+/// Append `authorization: Bearer <console token>` to the HPACK block
+/// — required once `-grpc-use-token` arms the server's auth. Literal
+/// without indexing (`0x00` + name + value); the token is short
+/// ASCII so lengths always fit the one-byte HPACK integer form.
+fn hpack_authorization(hpack: &mut Vec<u8>) {
+    let Ok(tok) = console_auth_token() else {
+        return; // unauthenticated launch — server rejects if -grpc-use-token is on
+    };
+    let val = format!("Bearer {tok}");
+    const NAME: &[u8] = b"authorization";
+    hpack.push(0x00); // literal header field without indexing — new name
+    hpack.push(NAME.len() as u8);
+    hpack.extend_from_slice(NAME);
+    hpack.push(val.len() as u8);
+    hpack.extend_from_slice(val.as_bytes());
+}
+
 impl GrpcInputClient {
     const STREAM_SID: u32 = 1;
 
@@ -2133,6 +2266,7 @@ impl GrpcInputClient {
         hpack.push(CTYPE.len() as u8);
         hpack.extend_from_slice(CTYPE);
         hpack.extend_from_slice(b"\x00\x02te\x08trailers");
+        hpack_authorization(&mut hpack);
         let hlen = hpack.len() as u32;
         let sid = Self::STREAM_SID;
         let mut req = Vec::with_capacity(9 + hpack.len());
@@ -2394,6 +2528,7 @@ impl GrpcScreenshotClient {
         hpack.push(CTYPE.len() as u8);
         hpack.extend_from_slice(CTYPE);
         hpack.extend_from_slice(b"\x00\x02te\x08trailers");
+        hpack_authorization(&mut hpack);
 
         let hlen = hpack.len() as u32;
         let sid = Self::STREAM_SID;
@@ -2426,9 +2561,12 @@ impl GrpcScreenshotClient {
         })
     }
 
-    /// Pop one complete gRPC message (5-byte header + protobuf body)
-    /// from the accumulated stream buffer.
-    fn take_msg(&mut self) -> Option<Vec<u8>> {
+    /// Range `(body_start, end)` of the next complete gRPC message
+    /// inside `msg_buf` — PEEKED, not drained, so the protobuf body
+    /// parses zero-copy out of the stream buffer. `drain(..end)`
+    /// releases it AFTER parsing (TZ 2.3: kill the per-frame
+    /// multi-MB `drain(..).collect()` allocation).
+    fn peek_msg_range(&self) -> Option<(usize, usize)> {
         if self.msg_buf.len() < 5 {
             return None;
         }
@@ -2436,17 +2574,19 @@ impl GrpcScreenshotClient {
         if self.msg_buf.len() < 5 + mlen {
             return None;
         }
-        Some(self.msg_buf.drain(..5 + mlen).skip(5).collect())
+        Some((5, 5 + mlen))
     }
 
-    /// Blocks until the server pushes the next `Image` frame.
-    /// `Ok(None)` = read timeout while the guest screen is static —
-    /// the stream stays open and the caller should just call again.
-    pub fn grab_frame(&mut self) -> Result<Option<(Vec<u8>, u32, u32)>, String> {
+    /// Same as `grab_frame` but writes pixels into a caller-owned
+    /// buffer — capacity survives across frames, so steady-state
+    /// capture allocates ZERO bytes per frame.
+    pub fn grab_frame_into(&mut self, out: &mut Vec<u8>) -> Result<Option<(u32, u32)>, String> {
         use std::io::{Read, Write};
-        if let Some(msg) = self.take_msg() {
-            if let Some(f) = parse_grpc_image(&msg) {
-                return Ok(Some(f));
+        if let Some((s, e)) = self.peek_msg_range() {
+            let parsed = parse_grpc_image_into(&self.msg_buf[s..e], out);
+            self.msg_buf.drain(..e);
+            if let Some(d) = parsed {
+                return Ok(Some(d));
             }
         }
         let sid = Self::STREAM_SID;
@@ -2506,9 +2646,11 @@ impl GrpcScreenshotClient {
                         if flags & 0x01 != 0 {
                             return Err("grpc stream END_STREAM".into());
                         }
-                        while let Some(msg) = self.take_msg() {
-                            if let Some(f) = parse_grpc_image(&msg) {
-                                return Ok(Some(f));
+                        while let Some((s, e)) = self.peek_msg_range() {
+                            let parsed = parse_grpc_image_into(&self.msg_buf[s..e], out);
+                            self.msg_buf.drain(..e);
+                            if let Some(d) = parsed {
+                                return Ok(Some(d));
                             }
                         }
                     }
@@ -2548,6 +2690,60 @@ impl GrpcScreenshotClient {
     }
 }
 
+/// Latest-frame mailbox between the capture pump and the UI render
+/// thread — TZ 2.3's "bounded channel, keep the NEWEST frame".
+///
+/// `mpsc::channel()` was unbounded: a pump delivering faster than the
+/// UI drains queued frames into a latency spiral (display lag grows
+/// forever). Here a posted frame OVERWRITES the slot — the consumer
+/// always renders the freshest capture.
+///
+/// `post` also returns the evicted frame's pixel `Vec` so the
+/// producer can reuse its capacity — the steady-state steady loop
+/// then allocates zero bytes per frame (TZ 2.3 buffer pool).
+/// `(pixels, width, height)` shared between mailbox slot, render
+/// loop and the SCR save path without copying.
+type GuestFrame = Arc<(Vec<u8>, u32, u32)>;
+
+pub struct FrameMail {
+    slot: Mutex<Option<GuestFrame>>,
+}
+
+impl Default for FrameMail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameMail {
+    pub fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// Publish a frame, evicting any unconsumed one. Returns the
+    /// evicted buffer for reuse (`None` if the UI still holds a
+    /// reference — e.g. the SCR snapshot keeps it alive one frame
+    /// longer, then it frees normally).
+    pub fn post(&self, f: (Vec<u8>, u32, u32)) -> Option<Vec<u8>> {
+        let mut s = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        s.replace(Arc::new(f))
+            .and_then(|old| Arc::try_unwrap(old).ok().map(|(px, _, _)| px))
+    }
+
+    /// Remove-and-take the newest frame (`None` when nothing new).
+    pub fn take(&self) -> Option<GuestFrame> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Peek without consuming — SCR screenshot reads the last shown
+    /// frame without stealing it from the render loop.
+    pub fn latest(&self) -> Option<GuestFrame> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 fn read_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
     let mut val = 0u64;
     let mut shift = 0u32;
@@ -2563,12 +2759,13 @@ fn read_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
     None
 }
 
-/// Parse one protobuf `Image` message (gRPC prefix already stripped).
+/// Parse one protobuf `Image` message (gRPC prefix already stripped)
+/// writing top-down RGBA into `out` (capacity reused across frames).
 /// Returns `None` for the empty "display inactive" marker frames the
 /// stream emits when the guest screen is off (w=0/h=0, no pixels).
 /// Pixel order is RGBA8888 **bottom-up** — rows are flipped to the
 /// top-down layout the DX12 uploader expects.
-fn parse_grpc_image(msg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+fn parse_grpc_image_into(msg: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
     let mut pos = 0usize;
     let mut w = 0u32;
     let mut h = 0u32;
@@ -2668,19 +2865,22 @@ fn parse_grpc_image(msg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         ));
         return None;
     }
-    // Bottom-up RGBA → top-down with alpha forced opaque.
-    let mut rgba = vec![0u8; expected];
+    // Bottom-up RGBA → top-down with alpha forced opaque. `out`
+    // keeps its capacity between frames — steady state costs one
+    // `extend` copy per row and zero allocator traffic.
+    out.clear();
+    out.reserve(expected);
     for y in 0..h as usize {
         let src = &raw[(h as usize - 1 - y) * row..(h as usize - y) * row];
-        rgba[y * row..(y + 1) * row].copy_from_slice(src);
+        out.extend_from_slice(src);
     }
-    for c in rgba.as_chunks_mut::<4>().0 {
+    for c in out.as_chunks_mut::<4>().0 {
         c[3] = 255;
     }
-    if !frame_is_visible(&rgba) {
+    if !frame_is_visible(out) {
         return None;
     }
-    Some((rgba, w, h))
+    Some((w, h))
 }
 
 /// PNG bytes → RGBA via GDI+ (fallback path only).
@@ -2952,14 +3152,10 @@ impl Drop for FrameStream {
 // Low-latency input — sendevent (eng builds) > persistent `input`
 // ---------------------------------------------------------------------------
 
-/// QEMU human monitor on 127.0.0.1:4444 — wired by
-/// `-qemu -monitor tcp:…,server,nowait`. Used ONLY for `quit`
-/// (graceful shutdown → QuickBoot snapshot save); the HMP
-/// `mouse_*`/`sendkey` family was verified not to reach the ranchu
-/// guest (no PS/2-class device behind the handlers in this build).
-pub struct QemuMonitor {
-    stream: std::net::TcpStream,
-}
+// The QEMU human monitor (`-qemu -monitor tcp:127.0.0.1:4444`) was
+// REMOVED (TZ P2): an unauthenticated TCP control port any local
+// process could `quit`/HMP. Graceful exit goes through console
+// `kill` on :5554, which requires `.emulator_console_auth_token`.
 
 fn console_auth_token() -> Result<String, String> {
     let token = [
@@ -3285,47 +3481,6 @@ pub fn console_tap(x: u32, y: u32) -> Result<(), String> {
     c.down(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(25));
     c.up()
-}
-
-impl QemuMonitor {
-    pub const PORT: u16 = 4444;
-
-    pub fn connect() -> Result<Self, String> {
-        let stream = std::net::TcpStream::connect(("127.0.0.1", Self::PORT))
-            .map_err(|e| format!("qemu monitor :{}: {e}", Self::PORT))?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
-            .ok();
-        stream
-            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
-            .ok();
-        let mut m = QemuMonitor { stream };
-        m.drain(); // "(qemu) " banner
-        Ok(m)
-    }
-
-    /// Read-and-discard whatever the monitor emitted (banner, echoes)
-    /// without blocking.
-    fn drain(&mut self) {
-        use std::io::Read;
-        self.stream.set_nonblocking(true).ok();
-        let mut buf = [0u8; 4096];
-        for _ in 0..8 {
-            match self.stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            }
-        }
-        self.stream.set_nonblocking(false).ok();
-    }
-
-    /// Clean qemu exit — saves the QuickBoot snapshot, unlike kill().
-    pub fn quit(&mut self) -> Result<(), String> {
-        use std::io::Write;
-        writeln!(self.stream, "quit")
-            .and_then(|_| self.stream.flush())
-            .map_err(|e| e.to_string())
-    }
 }
 
 /// Locate the guest touchscreen input node (`/dev/input/eventN`)
@@ -3719,7 +3874,7 @@ impl FastInput {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_frame, parse_screencap_header};
+    use super::{parse_frame, parse_grpc_image_into, parse_screencap_header, FrameMail};
 
     fn cap(w: u32, h: u32, hdr: usize, dataspace: u32) -> Vec<u8> {
         let mut b = Vec::new();
@@ -3833,5 +3988,65 @@ mod tests {
             eprintln!("live frame {i}: {w}x{h} ({} bytes)", px.len());
         }
         eprintln!("5 live frames in {:?}", t0.elapsed());
+    }
+
+    /// Protobuf fixture: `Image{width,height,image}` →
+    /// `parse_grpc_image_into` must flip bottom-up→top-down, force
+    /// alpha, reuse buffer capacity, and skip empty/black frames.
+    /// Covers the hand-rolled h2c/protobuf path (TZ 4 fixtures).
+    #[test]
+    fn grpc_image_parse_flips_and_reuses() {
+        // 8x8 frame (≥64 bright px required by frame_is_visible),
+        // bottom-up rows (b,g,r,a): bottom 4 rows = green [0,255,0],
+        // top 4 rows = red [0,0,255].
+        let mut img = Vec::new();
+        img.extend_from_slice(&[0x10, 0x08]); // field2 varint: w=8
+        img.extend_from_slice(&[0x18, 0x08]); // field3 varint: h=8
+        img.extend_from_slice(&[0x22, 0x80, 0x02]); // field4 LEN, varint(256)
+        for _ in 0..32 {
+            img.extend_from_slice(&[0, 255, 0, 0]); // bottom rows first
+        }
+        for _ in 0..32 {
+            img.extend_from_slice(&[0, 0, 255, 0]); // top rows last
+        }
+        let mut out = Vec::with_capacity(512); // pre-existing capacity
+        let cap_before = out.capacity();
+        let (w, h) = parse_grpc_image_into(&img, &mut out).expect("frame must parse");
+        assert_eq!((w, h), (8, 8));
+        // Top-down: row0 = red, last row = green.
+        assert_eq!(&out[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&out[252..256], &[0, 255, 0, 255]);
+        assert!(out.capacity() >= cap_before, "buffer must be reused");
+
+        // Empty marker frame (no image field) → None.
+        assert!(parse_grpc_image_into(&[0x10, 0x08, 0x18, 0x08], &mut out).is_none());
+        // All-black → None (frame_is_visible rejects).
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&[0x10, 0x08, 0x18, 0x08, 0x22, 0x80, 0x02]);
+        blk.resize(7 + 256, 0);
+        assert!(parse_grpc_image_into(&blk, &mut out).is_none());
+    }
+
+    /// FrameMail: newest-wins bounded semantics + evicted buffer
+    /// recycling (TZ 2.3 acceptance).
+    #[test]
+    fn frame_mail_latest_wins_and_recycles() {
+        let mail = FrameMail::new();
+        let f = |tag: u8| (vec![tag; 8], 2u32, 1u32);
+        assert!(mail.post(f(1)).is_none()); // empty slot → nothing evicted
+                                            // Second post evicts frame 1 — its buffer comes back.
+        let evicted = mail.post(f(2)).expect("evicted buffer must return");
+        assert_eq!(evicted, vec![1; 8]);
+        // Still unconsumed — post #3 recycles again.
+        let evicted = mail.post(f(3)).expect("evicted buffer must return");
+        assert_eq!(evicted, vec![2; 8]);
+        // take() returns ONLY the newest.
+        let got = mail.take().expect("frame must be present");
+        assert_eq!(got.0, vec![3; 8]);
+        assert!(mail.take().is_none(), "mailbox must be empty after take");
+        // latest() peeks without consuming.
+        assert!(mail.post(f(9)).is_none());
+        assert_eq!(mail.latest().unwrap().0, vec![9; 8]);
+        assert!(mail.take().is_some(), "latest() must not consume");
     }
 }

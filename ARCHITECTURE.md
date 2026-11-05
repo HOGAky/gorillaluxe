@@ -101,19 +101,24 @@ Zero CPU pixel copies in steady state
   Парсер манифестов репозитория Google → прямые ссылки на zip.
 - **`android_runtime.rs`** — real Android bootstrapper/engine bridge:
   install-state probe under `%LOCALAPPDATA%\GorillaLuxe\runtime\`,
-  native resumable `DownloadJob`, AVD writer, headless
-  `emulator.exe -no-window -accel on|auto -gpu auto|host|swiftshader`
-  spawn (gfxstream, no Qt window; emulator ≥35 removed the `*_indirect`
-  GPU names and accepts `-accel on|off|auto` only — "whpx" is mapped
-  to `on`), attach-or-spawn arbitration keyed by
-  `%TEMP%\avd\running\pid_*.ini` records (`avd.id=GorillaLuxe`,
-  pid-liveness + boot-grace — never an image-name `taskkill`), Job
-  Object `KILL_ON_JOB_CLOSE`, adb bridge (`install -r`,
-  `input tap/swipe`, `setprop persist.sys.locale`), persistent
-  `adb exec-out` screencap pipe (12B/16B raw header → RGBA8888 —
-  CPU-bound frame bridge, NOT zero-copy) with per-frame `grab_frame`
-  fallback, and TCP `EmuConsole`/`sendevent` fast input.
-  Загрузчик и мост к headless-движку Google; attach по pid-файлам AVD.
+  native resumable `DownloadJob` (`runtime.lock.toml` pin-first
+  artifact resolution), AVD writer, headless
+  `emulator.exe -qt-hide-window -accel on|auto -gpu auto|host|swiftshader
+  -feature -Vulkan -grpc-use-token` spawn (hidden Qt window keeps the
+  gfxstream scanout alive; `-Vulkan` quarantines the Intel host-
+  Vulkan path that crashed Chrome/WebView), attach-or-spawn
+  arbitration keyed by `%TEMP%\avd\running\pid_*.ini` records
+  (`avd.id=GorillaLuxe`, pid-liveness + boot-grace + `netstat -ano`
+  port-ownership proof — never a blind `adb devices` adopt, never an
+  image-name `taskkill`), Job Object `KILL_ON_JOB_CLOSE`, adb bridge
+  (`install -r`, `input tap/swipe`, `setprop persist.sys.locale`),
+  gRPC `streamScreenshot` capture (token-authenticated) + adb
+  screencap fallback, `FrameMail` bounded/latest frame mailbox with
+  buffer recycling, and TCP `EmuConsole`/`sendevent` fast input.
+  The unauthenticated `:4444` QEMU HMP monitor was REMOVED; shutdown
+  goes through token-authed console `kill`.
+  Загрузчик и мост к headless-движку Google; attach по pid-файлам AVD
+  с проверкой владельца порта.
 - **`device_profile.rs`** — S23 Ultra / ROG Phone 7 / Pixel 8 Pro
   presets (`model/brand/board/dpi/mac`), `setprop` script +
   kernel-cmdline fragment, `binfmt_misc` AArch64/ARMv7 descriptors for
@@ -143,6 +148,17 @@ Zero CPU pixel copies in steady state
 - **`logger.rs`** — leveled runtime log at
   `%LOCALAPPDATA%\GorillaLuxe\logs\gorillaluxe.log`, 5 MiB rotation.
   Логирование с ротацией.
+- **`crash_guard.rs`** — process-wide panic hook: panic + backtrace →
+  `gorillaluxe.log` (lock-free `CreateFile` append — the panicking
+  thread may hold the logger's Mutex) + `crash\crash.log` + a
+  `MiniDumpWriteDump` minidump under
+  `%LOCALAPPDATA%\GorillaLuxe\crash\` (dbghelp bound via
+  `GetProcAddress`). Zero crashes leave no diagnostics.
+  Паника + бэктрейс + минидамп — краш не проходит бесследно.
+- **`perf_debug.rs`** — structured performance forensics at
+  `logs\perf_debug.log`: host adapters, WHPX state, accel/GPU chain,
+  guest GLES/headless renderer, per-capture latency and delivered-FPS
+  rollups feeding the HUD. Структурный перф-лог для диагностики.
 - **`selftest.rs`** — Automated Verification Test 4 runner/report.
 
 ### `vmm/long_mode.rs` (Phase 4 / Фаза 4)
@@ -163,18 +179,27 @@ bootstrapper was removed; `emulator.exe` runs inside a Job Object with
 console `event send` (~0.1-2 ms measured RTT, auth token verified)
 with `sendevent` batches on the persistent `adb shell` pipe as
 fallback and one-shot `input tap/swipe` as last resort.
-Frames arrive through a persistent `adb exec-out "while true;
-screencap"` pipe — raw `[w,h,fmt,(dataspace)]` + RGBA8888 (12-byte
-header on Android ≤11, 16-byte on Android 12/13 — auto-detected once
-by a lookahead sniff, per-frame `grab_frame` as fallback, PNG decode
-only for `-p` output). The Android frame bridge is a **CPU copy
-path** (guest → adb pipe → `Vec<u8>` → `FrameUploader` staging → GPU
-texture); "zero-copy" applies to the DX12 selftest pipeline and
-shared-texture/fence handles, NOT to screencap frames.
-Measured on i3-1115G4 (WHPX, `-gpu auto` → gfxstream): guest-side
-`screencap` costs ~0.5-1 s/frame → ~1-2 FPS sustained frame bridge;
-one-shot `adb exec-out screencap` ~1.2-4.7 s; console `event send`
-RTT ~0.1-2 ms vs `input tap` ~215-325 ms per spawn.
+Frames arrive primarily through the emulator gRPC endpoint
+`:8554/android.emulation.control.EmulatorController/streamScreenshot`
+(`GrpcScreenshotClient` — a minimal hand-rolled h2c client; the
+server pushes host-ColorBuffer frames at the guest's own cadence,
+0% guest CPU). Fallback chain: `adb exec-out screencap` raw
+(12-byte header on Android ≤11, 16-byte on 12/13 — auto-detected)
+then `screencap -p` + GDI+ decode. The pump posts frames into a
+`FrameMail` bounded mailbox — ONE queued frame max, newest wins —
+and `post` hands the evicted pixel `Vec` back for reuse
+(`grab_frame_into` writes into the recycled buffer: zero allocator
+traffic per steady-state frame). The Android frame bridge is still
+a **CPU copy path** (guest → socket → `Vec<u8>` → `FrameUploader`
+staging → GPU texture); "zero-copy" applies to the DX12 selftest
+pipeline and shared-texture/fence handles, NOT to captured frames.
+A D3D11-shared-surface / Vulkan-external-memory path is tracked in
+`docs/audit/` as future work.
+Measured on i3-1115G4 (WHPX, `-gpu host` → gfxstream→Intel GL):
+guest-side `screencap` costs ~0.5-1 s/frame → ~1-2 FPS adb bridge;
+`streamScreenshot` varies 1-11 FPS under guest load; console
+`event send` RTT ~0.1-2 ms vs `input tap` ~215-325 ms per spawn.
+Structured timings land in `logs/perf_debug.log` (`perf_debug.rs`).
 
 ### `i18n` + `config`
 - **`i18n.rs`** — atomic `set_lang`/`current_lang`, `tr()` table for
@@ -206,12 +231,14 @@ wnd_proc ──► App (Mutex) ──► build_frame(state) ──► Frame{inst
   sync), F5 WHPX setup, F6 FPS aim (adb swipe forward), ESC quit.
 - Zone D onboarding: `install_state()` → Download (native ureq+zip
   with SHA-256 + step labels) / Launch Android → attach to a live
-  AVD-holder OR Job-bound headless emulator spawn → persistent raw
-  `screencap` stream (12B/16B header auto-detect) → `android_tex`
-  (`FrameUploader`, `NON_PIXEL_SHADER_RESOURCE`) → CAS → swapchain.
-  Input: `EmuConsole event send` TCP path, `sendevent`/`input`
-  fallbacks. `-grpc 8554` is opened for future gRPC control — no
-  client consumes it yet.
+  AVD-holder (port-ownership verified) OR Job-bound headless emulator
+  spawn → gRPC `streamScreenshot` (adb screencap fallback) →
+  `FrameMail` latest-frame mailbox → `android_tex` (`FrameUploader`,
+  `NON_PIXEL_SHADER_RESOURCE`) → CAS → swapchain.
+  Input: `EmuConsole event send` TCP path (token-auth), gRPC
+  `streamInputEvent`, `sendevent`/`input` fallbacks. `:8554` requires
+  `authorization: Bearer` under `-grpc-use-token`; the `:4444` HMP
+  monitor was removed. All emulator ports bind `127.0.0.1` only.
 
 ## CI pipeline / Конвейер CI
 

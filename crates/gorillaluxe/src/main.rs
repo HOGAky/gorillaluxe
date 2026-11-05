@@ -8,8 +8,17 @@
 //! Luxe Dark backdrop.
 #![windows_subsystem = "windows"]
 
+// NVIDIA Optimus / AMD PowerXpress discrete-GPU preference hints.
+// build.rs `/EXPORT:`s them so the driver sees them on gorillaluxe.exe.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static NvOptimusEnablement: u32 = 0x0000_0001;
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
+
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use gorillaluxe_core::config::Config;
@@ -129,8 +138,10 @@ struct App {
     auto_restarts: u32,
     /// Low-latency input injector (console :5554 or sendevent pipe).
     fast_input: Option<android_runtime::FastInput>,
-    /// Frame channel fed by the screencap capture thread.
-    frame_rx: Option<mpsc::Receiver<(Vec<u8>, u32, u32)>>,
+    /// Latest-frame mailbox fed by the capture thread — bounded to
+    /// ONE queued frame so a fast pump can never lag the display
+    /// (evicted pixel buffers recycle back to the producer).
+    frame_mail: Option<Arc<android_runtime::FrameMail>>,
     /// Live guest display dims (from the last captured frame).
     android_dims: Option<(u32, u32)>,
     /// Last Infinite-Swipe position forwarded via adb.
@@ -146,7 +157,7 @@ struct App {
     /// WHPX readiness for the Zone B status pill.
     whpx_ok: bool,
     /// Newest guest frame kept for the SCR dock button save.
-    last_frame: Option<(Vec<u8>, u32, u32)>,
+    last_frame: Option<Arc<(Vec<u8>, u32, u32)>>,
     /// Pending UTF-16 high surrogate from WM_CHAR (surrogate pairs).
     high_surrogate: Option<u16>,
 }
@@ -196,12 +207,12 @@ fn start_android_download(a: &mut App) {
         return;
     }
     let slot = dl_slot();
-    *slot.lock().unwrap() = None;
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     a.ui.onboard = Onboard::CheckingEnvironment;
     std::thread::spawn(move || {
         let r = android_runtime::resolve_runtime_urls()
             .and_then(|urls| android_runtime::DownloadJob::start(&urls));
-        *dl_slot().lock().unwrap() = Some(r);
+        *dl_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
     });
 }
 
@@ -270,7 +281,7 @@ fn start_android(a: &mut App) {
         match res {
             Ok(emu) => {
                 {
-                    let mut a = app().lock().unwrap();
+                    let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
                     a.emu = Some(emu);
                     a.ui.booted = false;
                     a.ui.onboard = Onboard::WaitingForBoot {
@@ -278,8 +289,8 @@ fn start_android(a: &mut App) {
                         log: "engine spawned — waiting for guest framebuffer".to_string(),
                     };
                 }
-                let (tx, rx) = mpsc::channel();
-                app().lock().unwrap().frame_rx = Some(rx);
+                let mail = Arc::new(android_runtime::FrameMail::new());
+                app().lock().unwrap_or_else(|e| e.into_inner()).frame_mail = Some(mail.clone());
                 // Frame pump: one clean `adb -e exec-out screencap`
                 // per frame with a hard deadline — the child is killed
                 // on timeout, never blocking the pipeline. Raw RGBA is
@@ -306,6 +317,11 @@ fn start_android(a: &mut App) {
                     let mut delivered = 0u32;
                     let mut stats_tick = std::time::Instant::now();
                     let mut perf_tick = std::time::Instant::now();
+                    // Reusable pixel buffer — `grab_frame_into` writes
+                    // into it and `mail.post` returns the evicted
+                    // frame's Vec, so the steady-state loop allocates
+                    // ZERO bytes per frame (TZ 2.3 buffer pool).
+                    let mut scratch: Vec<u8> = Vec::new();
                     loop {
                         if grpc.is_none() && std::time::Instant::now() >= grpc_next_try {
                             match android_runtime::GrpcScreenshotClient::connect() {
@@ -352,8 +368,8 @@ fn start_android(a: &mut App) {
                         // of every grab feeds perf_debug.log + the HUD.
                         let cap_start = std::time::Instant::now();
                         let r = if let Some(g) = grpc.as_mut() {
-                            match g.grab_frame() {
-                                Ok(Some(f)) => Ok(f),
+                            match g.grab_frame_into(&mut scratch) {
+                                Ok(Some((w, h))) => Ok((std::mem::take(&mut scratch), w, h)),
                                 Ok(None) => {
                                     // "Guest has not posted new frame"
                                     // — keep the connection, retry on
@@ -418,8 +434,13 @@ fn start_android(a: &mut App) {
                                 if n == 1 {
                                     android_runtime::set_stage(android_runtime::stage::WAIT_FRAMES);
                                 }
-                                if tx.send((px, w, h)).is_err() {
-                                    return;
+                                // Bounded latest-frame post: the
+                                // mailbox holds at most ONE queued
+                                // frame and hands the evicted buffer
+                                // back for reuse — no queue spiral,
+                                // no per-frame alloc.
+                                if let Some(recycled) = mail.post((px, w, h)) {
+                                    scratch = recycled;
                                 }
                             }
                             Err(e) => {
@@ -473,7 +494,8 @@ fn start_android(a: &mut App) {
                             match android_runtime::AdbShell::open() {
                                 Ok(sh) => {
                                     android_runtime::log_line("persistent adb shell attached");
-                                    *shell_slot().lock().unwrap() = Some(sh);
+                                    *shell_slot().lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(sh);
                                     opened = true;
                                     break;
                                 }
@@ -498,7 +520,8 @@ fn start_android(a: &mut App) {
                         for _ in 0..12 {
                             match android_runtime::FastInput::connect() {
                                 Ok(fi) => {
-                                    *input_slot().lock().unwrap() = Some(fi);
+                                    *input_slot().lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(fi);
                                     return;
                                 }
                                 Err(e) => {
@@ -516,7 +539,7 @@ fn start_android(a: &mut App) {
             }
             Err(e) => {
                 android_runtime::log_line(&format!("emulator launch failed: {e}"));
-                app().lock().unwrap().ui.onboard = Onboard::failed(e);
+                app().lock().unwrap_or_else(|e| e.into_inner()).ui.onboard = Onboard::failed(e);
             }
         }
     });
@@ -526,7 +549,11 @@ fn start_android(a: &mut App) {
 /// `:5554` on demand if it wasn't ready at early boot or was dropped.
 fn ensure_fast_input(a: &mut App) {
     if a.fast_input.is_none() {
-        if let Some(fi) = input_slot().lock().unwrap().take() {
+        if let Some(fi) = input_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             a.fast_input = Some(fi);
         } else if let Ok(c) = android_runtime::EmuConsole::connect() {
             android_runtime::log_line("fast input connected on demand (:5554 `event mouse`)");
@@ -534,7 +561,11 @@ fn ensure_fast_input(a: &mut App) {
         }
     }
     if a.shell.is_none() {
-        if let Some(sh) = shell_slot().lock().unwrap().take() {
+        if let Some(sh) = shell_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             a.shell = Some(sh);
         }
     }
@@ -545,7 +576,11 @@ fn ensure_fast_input(a: &mut App) {
 /// one-shot adb process.
 fn shell_cmd(a: &mut App, cmd: &str) -> bool {
     if a.shell.is_none() {
-        if let Some(sh) = shell_slot().lock().unwrap().take() {
+        if let Some(sh) = shell_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             a.shell = Some(sh);
         } else if let Ok(sh) = android_runtime::AdbShell::open() {
             a.shell = Some(sh);
@@ -700,6 +735,9 @@ fn main() {
     // Fresh `gorillaluxe_boot.log` beside the exe — every launch owns
     // its diagnostics (spec: overwrite, never append to a stale boot).
     gorillaluxe_core::system::logger::boot_log_reset();
+    // Panic → gorillaluxe.log + crash\panic-*.dmp BEFORE anything
+    // else can go wrong (spec: zero crashes without diagnostics).
+    gorillaluxe_core::system::crash_guard::install();
     gorillaluxe_core::system::logger::info("gorillaluxe starting");
     let mut cfg = Config::load();
     let mut args = std::env::args().skip(1);
@@ -798,7 +836,7 @@ unsafe fn run_app(cfg: Config) {
         emu: None,
         auto_restarts: 0,
         fast_input: None,
-        frame_rx: None,
+        frame_mail: None,
         android_dims: None,
         last_swipe_pos: None,
         last_swipe_tick: 0,
@@ -888,7 +926,7 @@ unsafe fn run_app(cfg: Config) {
     // env_doctor: non-blocking WHPX diagnosis -> banner in the UI.
     {
         let report = env_doctor::diagnose_host();
-        let mut a = app().lock().unwrap();
+        let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
         a.whpx_ok = report.whpx_ok;
         a.ui.banner = if report.whpx_ok {
             WhpxBanner::Hidden
@@ -977,7 +1015,7 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
     let mut dx = Dx12::new(cfg.ci_software_gpu)?;
     let (mut win_w, mut win_h) = client_size(hwnd);
-    app().lock().unwrap().win = (win_w as f32, win_h as f32);
+    app().lock().unwrap_or_else(|e| e.into_inner()).win = (win_w as f32, win_h as f32);
     let mut swap = SwapChain::new(&dx, hwnd, win_w, win_h)?;
     let mut comp = Composite::new(&dx)?;
     let atlas = atlas::build_ui_atlases()?;
@@ -1039,7 +1077,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
             // ---- Consume interactive state --------------------------------
             let (sw, sh);
             {
-                let mut a = app().lock().unwrap();
+                let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
                 a.tick = t0.elapsed().as_millis() as u64;
                 a.ui.toasts.tick();
                 a.ui.lang = current_lang();
@@ -1083,7 +1121,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     a.ui.banner = WhpxBanner::RestartReady;
                 }
                 // ---- Android runtime state machine (spec §5.1) ------
-                if let Some(r) = dl_slot().lock().unwrap().take() {
+                if let Some(r) = dl_slot().lock().unwrap_or_else(|e| e.into_inner()).take() {
                     match r {
                         Ok(job) => {
                             a.dl = Some(job);
@@ -1213,7 +1251,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                         }
                     }
                     a.emu = None;
-                    a.frame_rx = None;
+                    a.frame_mail = None;
                     a.android_dims = None;
                     a.last_frame = None;
                     a.shell = None;
@@ -1238,12 +1276,20 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 }
                 // Attach the persistent shell when the waiter delivers it.
                 if a.shell.is_none() {
-                    if let Some(sh) = shell_slot().lock().unwrap().take() {
+                    if let Some(sh) = shell_slot()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
                         a.shell = Some(sh);
                     }
                 }
                 if a.fast_input.is_none() {
-                    if let Some(fi) = input_slot().lock().unwrap().take() {
+                    if let Some(fi) = input_slot()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
                         a.fast_input = Some(fi);
                     }
                 }
@@ -1257,14 +1303,14 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 sh = a.win.1;
             }
 
-            // Latest live guest frame (drain to the newest).
-            let mut latest: Option<(Vec<u8>, u32, u32)> = None;
+            // Latest live guest frame — the mailbox holds at most
+            // one; `take` swaps it out and the Arc shares pixels with
+            // `last_frame` at zero copy (SCR save needs no clone).
+            let mut latest: Option<Arc<(Vec<u8>, u32, u32)>> = None;
             {
-                let mut a = app().lock().unwrap();
-                if let Some(rx) = &a.frame_rx {
-                    while let Ok(f) = rx.try_recv() {
-                        latest = Some(f);
-                    }
+                let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mail) = &a.frame_mail {
+                    latest = mail.take();
                 }
                 if let Some(f) = &latest {
                     a.android_dims = Some((f.1, f.2));
@@ -1289,8 +1335,9 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
             }
 
             // FPS cap pacing (plus the swapchain latency waitable).
-            let frame_target =
-                std::time::Duration::from_secs_f64(1.0 / app().lock().unwrap().fps_cap as f64);
+            let frame_target = std::time::Duration::from_secs_f64(
+                1.0 / app().lock().unwrap_or_else(|e| e.into_inner()).fps_cap as f64,
+            );
             let _ = WaitForSingleObject(swap.latency_event, 500);
             let now = std::time::Instant::now();
             if now < frame_deadline {
@@ -1304,7 +1351,8 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 // `android_src` is latched via `has_guest_frame` — the
                 // texture holds the last good frame between captures.
                 let mut android_src = has_guest_frame && android_tex.is_some();
-                if let Some((rgba, w, h)) = latest {
+                if let Some(f) = latest {
+                    let (rgba, w, h) = (f.0.as_slice(), f.1, f.2);
                     if android_tex.is_none() || android_tex_dims != (w, h) {
                         dx.wait_idle()?;
                         android_tex = Some(create_texture_rgba(
@@ -1325,7 +1373,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                         w,
                         h,
                         DXGI_FORMAT_R8G8B8A8_UNORM,
-                        &rgba,
+                        rgba,
                         4,
                         android_tex_state,
                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1336,7 +1384,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                 }
 
                 let (_alloc, list) = dx.cmd()?;
-                let sharpness = app().lock().unwrap().ui.sharpness;
+                let sharpness = app().lock().unwrap_or_else(|e| e.into_inner()).ui.sharpness;
                 // CAS source: the real Android framebuffer when a guest
                 // is attached, else the Luxe Dark ambient backdrop.
                 let src_res;
@@ -1377,11 +1425,11 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
                     backend: gorillaluxe_core::system::perf_debug::hud_backend(dx.is_warp),
                 };
                 let frame: Frame = {
-                    let a = app().lock().unwrap();
+                    let a = app().lock().unwrap_or_else(|e| e.into_inner());
                     build_frame(sw, sh, &a.ui, &atlas, &stats)
                 };
                 {
-                    let mut a = app().lock().unwrap();
+                    let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
                     a.regions = frame.regions;
                 }
                 comp.present_frame(
@@ -1461,7 +1509,7 @@ fn run_dx12(hwnd: HWND, cfg: &Config) -> Result<(), String> {
 
     // Graceful engine teardown + persist UI choices on clean exit.
     {
-        let mut a = app().lock().unwrap();
+        let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
         a.emu = None; // Drop → child.kill() + Job close (no orphans)
         a.shell = None;
         a.cfg.lang = current_lang();
@@ -1537,16 +1585,16 @@ fn on_lbutton_down(a: &mut App, x: f32, y: f32, hwnd: HWND) {
         }
         Some(RegionId::DockShot) => {
             a.drag = Drag::UiButton;
-            if let Some((px, w, h)) = a.last_frame.clone() {
-                std::thread::spawn(
-                    move || match android_runtime::save_screenshot_bmp(&px, w, h) {
+            if let Some(f) = a.last_frame.clone() {
+                std::thread::spawn(move || {
+                    match android_runtime::save_screenshot_bmp(&f.0, f.1, f.2) {
                         Ok(path) => android_runtime::log_line(&format!(
                             "screenshot saved: {}",
                             path.display()
                         )),
                         Err(e) => android_runtime::log_line(&format!("screenshot failed: {e}")),
-                    },
-                );
+                    }
+                });
                 toast(a, tr(a.ui.lang, "ui.shot.saved").to_string());
             } else {
                 toast(a, "no guest frame yet".into());
@@ -2127,12 +2175,32 @@ fn on_drop_files(a: &mut App, lparam: LPARAM) {
 
 // ---------------------------------------------------------------------------
 
+/// A panic crossing the `extern "system"` boundary is UB — and
+/// historically produced a crash with ZERO log output. The FFI-safe
+/// wrapper catches every unwind, the panic hook (crash_guard) has
+/// already written log + minidump, and we answer the message
+/// politely instead of aborting the process.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wnd_proc_inner(hwnd, msg, wparam, lparam)
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => {
+            gorillaluxe_core::system::logger::error(&format!(
+                "wnd_proc panic caught (msg=0x{msg:04X}) — see crash\\panic-*.dmp"
+            ));
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
+unsafe fn wnd_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
             let cs = lparam.0 as *const CREATESTRUCTW;
@@ -2152,44 +2220,44 @@ unsafe extern "system" fn wnd_proc(
         WM_SIZE => {
             let w = (lparam.0 & 0xFFFF) as u32;
             let h = ((lparam.0 >> 16) & 0xFFFF) as u32;
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             a.win = (w as f32, h as f32);
             a.pending_resize = Some((w, h));
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             let (x, y) = lparam_xy(lparam);
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_mouse_move(&mut a, x, y);
             LRESULT(0)
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let (x, y) = lparam_xy(lparam);
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_lbutton_down(&mut a, x, y, hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let (x, y) = lparam_xy(lparam);
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_lbutton_up(&mut a, x, y);
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
             let (x, y) = lparam_xy(lparam);
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_rbutton_down(&mut a, x, y);
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_mouse_wheel(&mut a, delta);
             LRESULT(0)
         }
         WM_INPUT_MSG => {
             if let Some((dx, dy)) = raw::mouse_delta(lparam) {
-                let mut a = app().lock().unwrap();
+                let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
                 let tick = a.tick;
                 if a.ui.fps_mode {
                     a.swipe.feed(dx as f32, dy as f32, tick);
@@ -2219,22 +2287,22 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DROPFILES_MSG => {
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_drop_files(&mut a, lparam);
             LRESULT(0)
         }
         WM_CHAR => {
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_char(&mut a, wparam.0 as u16);
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_key(&mut a, wparam.0 as u16);
             LRESULT(0)
         }
         WM_KEYUP => {
-            let mut a = app().lock().unwrap();
+            let mut a = app().lock().unwrap_or_else(|e| e.into_inner());
             on_key_up(&mut a, wparam.0 as u16);
             LRESULT(0)
         }

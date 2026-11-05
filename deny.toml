@@ -1,0 +1,32 @@
+# cargo-deny policy (TZ 6: dependency hygiene).
+# `cargo deny check` runs advisories + bans + licenses + sources.
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+# Fail CI on any known vulnerability in the tree.
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

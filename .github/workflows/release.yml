@@ -1,0 +1,69 @@
+name: GorillaLuxe Release
+
+# Tag-triggered release build (TZ stage 6). Push `vX.Y.Z` → full CI
+# gates → `GorillaLuxe-Win64.zip` attached to a GitHub Release.
+# NOTE: binaries are currently UNSIGNED — no code-signing certificate
+# is provisioned. If/when a cert exists (signpath.io OSS program is
+# the planned route), add a `signtool`/`osslsigncode` step here.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release ${GITHUB_REF_NAME}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt gate
+        run: cargo fmt --all -- --check
+
+      - name: clippy gate (zero warnings)
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - name: Self-tests
+        shell: pwsh
+        run: |
+          .\target\release\gorillaluxe-cli.exe --self-test --lang en
+          .\target\release\gorillaluxe-cli.exe --self-test-gfx --ci-software-gpu --lang en
+          .\target\release\gorillaluxe-cli.exe --self-test-input --lang en
+          .\target\release\gorillaluxe-cli.exe --self-test-phase4 --lang en
+
+      - name: Package GorillaLuxe-Win64.zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\gorillaluxe.exe, target\release\gorillaluxe-cli.exe dist\
+          Copy-Item README.md, SPECIFICATION.txt, ARCHITECTURE.md, SECURITY.md dist\
+          Get-FileHash dist\gorillaluxe.exe, dist\gorillaluxe-cli.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Out-File dist\SHA256SUMS.txt -Encoding ascii
+          Compress-Archive -Path dist\* -DestinationPath GorillaLuxe-Win64.zip
+          Write-Host ("Zip size: {0:N1} MB" -f ((Get-Item GorillaLuxe-Win64.zip).Length / 1MB))
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: GorillaLuxe-Win64.zip
+          generate_release_notes: true

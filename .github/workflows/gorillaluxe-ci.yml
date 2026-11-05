@@ -3,6 +3,8 @@ name: GorillaLuxe CI
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -123,3 +125,10 @@ jobs:
           path: GorillaLuxe-Win64.zip
           if-no-files-found: error
           retention-days: 30
+
+  supply-chain:
+    name: cargo-deny (advisories + licenses + sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
